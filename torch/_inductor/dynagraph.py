@@ -31,6 +31,7 @@ Two properties of the surrounding system shape the design:
 from __future__ import annotations
 
 import ast
+import contextlib
 import ctypes
 import logging
 import os
@@ -38,6 +39,9 @@ import re
 import subprocess
 import tempfile
 from typing import Any
+
+from torch.utils._ordered_set import OrderedSet
+
 
 log = logging.getLogger(__name__)
 
@@ -54,8 +58,11 @@ def _cuda() -> Any:
 def _param_info(func: int, index: int) -> tuple[int, int] | None:
     off, size = ctypes.c_size_t(), ctypes.c_size_t()
     rc = _cuda().cuFuncGetParamInfo(
-        ctypes.c_void_p(func), ctypes.c_size_t(index),
-        ctypes.byref(off), ctypes.byref(size))
+        ctypes.c_void_p(func),
+        ctypes.c_size_t(index),
+        ctypes.byref(off),
+        ctypes.byref(size),
+    )
     return None if rc != 0 else (off.value, size.value)
 
 
@@ -132,6 +139,15 @@ def _parse_run_calls(src: str) -> dict[str, list[str]]:
     return calls
 
 
+class Unsupported(Exception):
+    """Something in the wrapper this pass does not model.
+
+    Raised instead of skipping the construct: a kernel argument left unpatched
+    keeps pointing at whatever the capture happened to allocate, which produces
+    a plausible-looking wrong answer rather than an error.
+    """
+
+
 def _resolve(expr: str, src: str, symbols: frozenset[str], depth: int = 8) -> str:
     """Expand a named intermediate to its definition, stopping at symbols.
 
@@ -154,7 +170,7 @@ def _resolve(expr: str, src: str, symbols: frozenset[str], depth: int = 8) -> st
             return expr
         if e in symbols:
             return e
-        m = re.search(rf"^\s*{re.escape(e)}\s*=\s*(.+?)\s*$", src, re.M)
+        m = re.search(rf"^\s*{re.escape(e)}\s*=\s*(.+?)\s*$", src, re.MULTILINE)
         if not m:
             return expr
         expr = m.group(1)
@@ -163,6 +179,28 @@ def _resolve(expr: str, src: str, symbols: frozenset[str], depth: int = 8) -> st
 
 def _is_symbolic(expr: Any) -> bool:
     return bool(expr) and bool(re.search(r"\bs\d+\b", str(expr)))
+
+
+def settled_blocks(obj: Any) -> dict[str, int] | None:
+    """Block sizes of the one config a kernel will launch with, or None.
+
+    ``CachingAutotuner.run`` narrows ``launchers`` to a single config on its
+    first real call; before that the kernel still carries every candidate, and
+    they disagree -- a reduction here offers XBLOCK 1, 8 and 32. Picking the
+    wrong one is not a visible error: the grid formula simply launches too few
+    blocks and the tail of the output keeps whatever was already in the arena.
+    So the answer is only meaningful after the warmup, and a kernel that has not
+    settled reports None so the graph can be refused.
+    """
+    launchers = getattr(obj, "launchers", None) or []
+    if len(launchers) != 1:
+        return None
+    kwargs = getattr(getattr(launchers[0], "config", None), "kwargs", None) or {}
+    return {
+        bk: kwargs[bk]
+        for bk in ("XBLOCK", "YBLOCK", "ZBLOCK", "R0_BLOCK")
+        if bk in kwargs
+    }
 
 
 def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
@@ -187,21 +225,18 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
         # Only integer scalars are patched. Pointers live at fixed addresses in
         # the graph's private pool; expanding their names would yield an
         # empty_strided_cuda(...) expression that merely looks shape-dependent.
-        scalar = {k: isinstance(sig.get(k), str) and not sig[k].startswith("*")
-                  for k in args}
+        scalar = {
+            k: isinstance(sig.get(k), str) and not sig[k].startswith("*") for k in args
+        }
 
-        blocks = {}
-        for lr in getattr(obj, "launchers", []) or []:
-            cfg = getattr(lr, "config", None)
-            for bk in ("XBLOCK", "YBLOCK", "R0_BLOCK"):
-                if cfg is not None and bk in getattr(cfg, "kwargs", {}):
-                    blocks[bk] = cfg.kwargs[bk]
+        blocks = settled_blocks(obj)
 
         func = None
         for cr in getattr(obj, "compile_results", []) or []:
             k = getattr(cr, "kernel", None)
             func = getattr(k, "function", None) or next(
-                iter(getattr(k, "functions", {}).values()), None)
+                iter(getattr(k, "functions", {}).values()), None
+            )
             if func:
                 break
         if not func:
@@ -222,21 +257,33 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
             for i, nm in enumerate(args)
             if not scalar.get(nm) and i < len(pos)
         }
-        offsets = {nm: _param_info(func, args.index(nm))
-                   for nm in list(exprs) + list(ptrs)}
+        offsets = {
+            nm: _param_info(func, args.index(nm)) for nm in list(exprs) + list(ptrs)
+        }
         if any(v is None for v in offsets.values()):
             return None, None
 
         grid = None
         if meta.get("grid_type") == "FixedGrid":
-            grid = [_resolve(e, source_code, symbols)
-                    for e in pos[len(args) : len(args) + 3]]
+            grid = [
+                _resolve(e, source_code, symbols)
+                for e in pos[len(args) : len(args) + 3]
+            ]
             if len(grid) != 3:
                 return None, None
 
-        kernels.append(dict(gname=gname, name=meta.get("kernel_name", gname),
-                            exprs=exprs, ptrs=ptrs, offsets=offsets,
-                            blocks=blocks, grid=grid))
+        kernels.append(
+            dict(
+                gname=gname,
+                name=meta.get("kernel_name", gname),
+                exprs=exprs,
+                ptrs=ptrs,
+                offsets=offsets,
+                blocks=blocks,
+                grid=grid,
+                grid_type=meta.get("grid_type"),
+            )
+        )
 
     # launch order == order of the .run( call sites in the wrapper
     order = {k["gname"]: source_code.find(f"{k['gname']}.run(") for k in kernels}
@@ -257,7 +304,9 @@ def _expr_to_c(expr: str, sym_index: dict[str, int]) -> str:
         if isinstance(n, ast.Expression):
             return go(n.body)
         if isinstance(n, ast.Constant):
-            return f"(int64_t){int(n.value)}"
+            if not isinstance(n.value, int):
+                raise Unsupported(f"non-integer constant {n.value!r}")
+            return f"(int64_t){n.value}"
         if isinstance(n, ast.Name):
             if n.id not in sym_index:
                 raise KeyError(f"unknown symbol {n.id}")
@@ -359,8 +408,22 @@ extern "C" __global__ void dynagraph_planner(
 """
 
 
-def generate_planner(kernels: list[dict[str, Any]], symbols: list[str],
-                     slot_of: dict[str, int] | None = None) -> str:
+# Grid shapes that are a ceil-divide per axis. The other GridExpr subclasses in
+# triton_heuristics -- cooperative reductions, split scans, combo kernels --
+# derive their grid differently and are refused rather than approximated.
+_GRID_AXES = {
+    "Grid1D": (("xnumel", "XBLOCK"),),
+    "Grid2D": (("xnumel", "XBLOCK"), ("ynumel", "YBLOCK")),
+    "Grid3D": (("xnumel", "XBLOCK"), ("ynumel", "YBLOCK"), ("znumel", "ZBLOCK")),
+}
+
+
+def generate_planner(
+    kernels: list[dict[str, Any]],
+    symbols: list[str],
+    slot_of: dict[str, int] | None = None,
+    alias: dict[str, str] | None = None,
+) -> str:
     sym_index = {s: i for i, s in enumerate(symbols)}
     exprs: list[str] = []
 
@@ -376,15 +439,29 @@ def generate_planner(kernels: list[dict[str, Any]], symbols: list[str],
             gx, gy, gz = (idx(e) for e in k["grid"])
             grid_cases.append(
                 f"    case {i}: gx=dg_eval({gx},ctx); gy=dg_eval({gy},ctx); "
-                f"gz=dg_eval({gz},ctx); break;  // {k['name']}")
+                f"gz=dg_eval({gz},ctx); break;  // {k['name']}"
+            )
         else:
-            xn = k["exprs"].get("xnumel")
-            if xn is None:
-                raise RuntimeError(f"{k['name']}: neither explicit grid nor xnumel")
-            blk = k["blocks"].get("XBLOCK", 1)
+            axes = _GRID_AXES.get(k.get("grid_type") or "")
+            if axes is None:
+                raise Unsupported(
+                    f"{k['name']}: grid type {k.get('grid_type')} is not modelled"
+                )
+            blocks = k["blocks"]
+            if blocks is None:
+                raise Unsupported(f"{k['name']}: launch config has not settled")
+            parts = []
+            for axis, (numel, bk) in zip(("gx", "gy", "gz"), axes):
+                e = k["exprs"].get(numel)
+                if e is None or bk not in blocks:
+                    raise Unsupported(f"{k['name']}: no {numel}/{bk} to size a grid")
+                blk = blocks[bk]
+                parts.append(
+                    f"{axis}=dg_floordiv(dg_eval({idx(e)},ctx) + {blk} - 1, {blk});"
+                )
             grid_cases.append(
-                f"    case {i}: gx=dg_floordiv(dg_eval({idx(xn)},ctx) + {blk} - 1,"
-                f" {blk}); break;  // {k['name']}")
+                f"    case {i}: " + " ".join(parts) + f" break;  // {k['name']}"
+            )
 
         patches = []
         for nm, e in k["exprs"].items():
@@ -395,20 +472,25 @@ def generate_planner(kernels: list[dict[str, Any]], symbols: list[str],
             patches.append(
                 f"      {{ {ct} v = ({ct})dg_eval({idx(e)},ctx); "
                 f"cudaGraphKernelNodeSetParam(handles[i], {off}, &v, {size}); }}"
-                f"  // {nm} = {e}")
+                f"  // {nm} = {e}"
+            )
         if patches:
-            param_cases.append(f"    case {i}:\n" + "\n".join(patches) + "\n      break;")
+            param_cases.append(
+                f"    case {i}:\n" + "\n".join(patches) + "\n      break;"
+            )
 
     out = _PLANNER_TEMPLATE
     # Substituted rather than %-formatted: the generated C contains the modulo
     # operator, which collides with %-format placeholders.
     for tag, val in (
-        ("/*@EXPRS@*/", "\n".join(f"    case {i}: return {c};"
-                                  for i, c in enumerate(exprs))),
+        (
+            "/*@EXPRS@*/",
+            "\n".join(f"    case {i}: return {c};" for i, c in enumerate(exprs)),
+        ),
         ("/*@N@*/", str(len(kernels))),
         ("/*@GRID@*/", "\n".join(grid_cases)),
         ("/*@PARAMS@*/", "\n".join(param_cases)),
-        ("/*@PTRS@*/", generate_pointer_patches(kernels, slot_of or {})),
+        ("/*@PTRS@*/", generate_pointer_patches(kernels, slot_of, alias)),
     ):
         out = out.replace(tag, val)
     return out
@@ -432,8 +514,11 @@ def compile_planner(src: str, arch: str | None = None) -> int | None:
         cubin = os.path.join(wd, "planner.cubin")
         with open(cu, "w") as fh:
             fh.write(src)
-        r = subprocess.run(["nvcc", f"-arch={arch}", "-cubin", "-o", cubin, cu],
-                           capture_output=True, text=True)
+        r = subprocess.run(
+            ["nvcc", f"-arch={arch}", "-cubin", "-o", cubin, cu],
+            capture_output=True,
+            text=True,
+        )
         if r.returncode != 0:
             log.warning("DynaGraph planner failed to compile: %s", r.stderr[-800:])
             return None
@@ -442,25 +527,33 @@ def compile_planner(src: str, arch: str | None = None) -> int | None:
             log.warning("DynaGraph planner cuModuleLoad failed")
             return None
     fn = ctypes.c_void_p()
-    if _cuda().cuModuleGetFunction(
-            ctypes.byref(fn), mod, b"dynagraph_planner") != 0:
+    if _cuda().cuModuleGetFunction(ctypes.byref(fn), mod, b"dynagraph_planner") != 0:
         log.warning("DynaGraph planner cuModuleGetFunction failed")
         return None
     return fn.value
 
 
-def launch_planner(func: int, n_nodes: int, handles_ptr: int, ctx_ptr: int,
-                   stream: int) -> None:
-    a0, a1 = ctypes.c_void_p(handles_ptr), ctypes.c_void_p(ctx_ptr)
-    params = (ctypes.c_void_p * 2)(
-        ctypes.cast(ctypes.byref(a0), ctypes.c_void_p),
-        ctypes.cast(ctypes.byref(a1), ctypes.c_void_p))
-    block = 128
-    rc = _cuda().cuLaunchKernel(
-        ctypes.c_void_p(func), (n_nodes + block - 1) // block, 1, 1,
-        block, 1, 1, 0, ctypes.c_void_p(stream), params, None)
-    if rc != 0:
-        raise RuntimeError(f"DynaGraph planner launch failed: {rc}")
+def launch_planner(
+    func: int,
+    n_nodes: int,
+    handles_ptr: int,
+    ctx_ptr: int,
+    stream: int,
+    arena_ptr: int = 0,
+    slot_off_ptr: int = 0,
+) -> None:
+    """Launch the planner, one thread per graph node.
+
+    A null arena means shapes only: the generated code skips the pointer patches
+    and every buffer keeps the address the capture gave it.
+    """
+    _launch(
+        func,
+        [handles_ptr, ctx_ptr, arena_ptr, slot_off_ptr],
+        (n_nodes + 127) // 128,
+        128,
+        stream,
+    )
 
 
 # --------------------------------------------------------------- safety check
@@ -498,8 +591,11 @@ def _eval_int(expr: str, env: dict[str, int]) -> int | None:
         if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub):
             v = go(n.operand)
             return None if v is None else -v
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in (
-                "min", "max"):
+        if (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id in ("min", "max")
+        ):
             vs = [go(a) for a in n.args]
             if any(v is None for v in vs):
                 return None
@@ -523,9 +619,11 @@ def _find_allocations(src: str) -> list[tuple[str, list[str], list[str], str]]:
         args = _split_args(src[i : j - 1])
         if len(args) < 2:
             continue
+
         def tup(a: str) -> list[str]:
             a = a.strip()
             return _split_args(a[1:-1]) if a.startswith("(") else []
+
         dtype = args[2].strip() if len(args) > 2 else "torch.float32"
         out.append((name, tup(args[0]), tup(args[1]), dtype))
     return out
@@ -559,11 +657,15 @@ def buffer_dominates(
         return True, ""
 
     for name, sizes, strides, _dtype in allocs:
+
         def span(env: dict[str, int]) -> int | None:
-            sz = [_eval_int(e, env) for e in sizes]
-            st = [_eval_int(e, env) for e in strides]
-            if any(v is None for v in sz) or any(v is None for v in st):
-                return None
+            sz, st = [], []
+            for e, out in ((sizes, sz), (strides, st)):
+                for x in e:
+                    v = _eval_int(x, env)
+                    if v is None:
+                        return None
+                    out.append(v)
             return 1 + sum((a - 1) * b for a, b in zip(sz, st))
 
         at_record = span(record_shape)
@@ -574,7 +676,8 @@ def buffer_dominates(
             if here is not None and here > at_record:
                 return False, (
                     f"buffer {name} needs {here} elements at {env} but only "
-                    f"{at_record} would be allocated at {record_shape}")
+                    f"{at_record} would be allocated at {record_shape}"
+                )
     return True, ""
 
 
@@ -590,8 +693,10 @@ def buffers_are_monotonic(
     if record_at <= 1:
         return True, ""
     step = max(1, record_at // probes)
-    samples = [dict.fromkeys(symbols, m)
-               for m in sorted({record_at, 1, *range(1, record_at, step)})]
+    samples = [
+        dict.fromkeys(symbols, m)
+        for m in sorted(OrderedSet([record_at, 1, *range(1, record_at, step)]))
+    ]
     return buffer_dominates(source_code, dict.fromkeys(symbols, record_at), samples)
 
 
@@ -613,14 +718,15 @@ def plan_slots(
 
     Returns (slot index per buffer in ``allocated`` order, slot count).
     """
-    order = sorted(range(len(allocated)),
-                   key=lambda i: lifetimes.get(allocated[i], (0, 0))[0])
-    slot_free_at: list[int] = []   # step at which each slot becomes reusable
+    order = sorted(
+        range(len(allocated)), key=lambda i: lifetimes.get(allocated[i], (0, 0))[0]
+    )
+    slot_free_at: list[int] = []  # step at which each slot becomes reusable
     assign = [0] * len(allocated)
     for i in order:
         start, end = lifetimes.get(allocated[i], (0, -1))
         if end < 0:
-            end = 1 << 30          # graph output: lives past the whole schedule
+            end = 1 << 30  # graph output: lives past the whole schedule
         placed = False
         for s, free_at in enumerate(slot_free_at):
             if free_at <= start:
@@ -634,7 +740,7 @@ def plan_slots(
     return assign, len(slot_free_at)
 
 
-def buffer_size_exprs(source_code: str) -> dict[str, str]:
+def buffer_size_exprs(source_code: str) -> dict[str, tuple[str, int]]:
     """Symbolic element-span of every ``empty_strided_cuda`` buffer, by name.
 
     Sizes have to come from the wrapper rather than from Inductor's memory
@@ -656,13 +762,38 @@ def buffer_size_exprs(source_code: str) -> dict[str, str]:
     return out
 
 
+def buffer_layouts(source_code: str) -> dict[str, tuple[list[str], list[str], str]]:
+    """Size/stride expressions and dtype of every allocated buffer, by name.
+
+    The element span buffer_size_exprs returns is all the arena layout needs, but
+    a buffer the graph returns has to reach the caller with the shape it was
+    declared with, which only the allocation call carries.
+    """
+    return {
+        name: (sizes, strides, dtype)
+        for name, sizes, strides, dtype in _find_allocations(source_code)
+    }
+
+
 # Element sizes for the dtypes Inductor emits in empty_strided_cuda calls.
 _ITEMSIZE = {
-    "torch.float32": 4, "torch.float": 4, "torch.float64": 8, "torch.double": 8,
-    "torch.float16": 2, "torch.half": 2, "torch.bfloat16": 2,
-    "torch.int64": 8, "torch.long": 8, "torch.int32": 4, "torch.int": 4,
-    "torch.int16": 2, "torch.int8": 1, "torch.uint8": 1, "torch.bool": 1,
-    "torch.float8_e4m3fn": 1, "torch.float8_e5m2": 1,
+    "torch.float32": 4,
+    "torch.float": 4,
+    "torch.float64": 8,
+    "torch.double": 8,
+    "torch.float16": 2,
+    "torch.half": 2,
+    "torch.bfloat16": 2,
+    "torch.int64": 8,
+    "torch.long": 8,
+    "torch.int32": 4,
+    "torch.int": 4,
+    "torch.int16": 2,
+    "torch.int8": 1,
+    "torch.uint8": 1,
+    "torch.bool": 1,
+    "torch.float8_e4m3fn": 1,
+    "torch.float8_e5m2": 1,
 }
 
 
@@ -710,31 +841,487 @@ def generate_layout(
         lines.append(
             f"  {{ int64_t b = ({c}) * {itemsize}; "
             f"if (b > sz[{slot_of[name]}]) sz[{slot_of[name]}] = b; }}"
-            f"  // {name}")
+            f"  // {name}"
+        )
     out = _LAYOUT_TEMPLATE
-    for tag, val in (("/*@NSLOTS@*/", str(n_slots)),
-                     ("/*@SLOTSIZES@*/", "\n".join(lines))):
+    for tag, val in (
+        ("/*@NSLOTS@*/", str(n_slots)),
+        ("/*@SLOTSIZES@*/", "\n".join(lines)),
+    ):
         out = out.replace(tag, val)
     return out
 
 
 def generate_pointer_patches(
-    kernels: list[dict[str, Any]], slot_of: dict[str, int]
+    kernels: list[dict[str, Any]],
+    slot_of: dict[str, int] | None,
+    alias: dict[str, str] | None = None,
 ) -> str:
-    """Per-node ``case`` bodies that repoint each buffer argument into the arena."""
+    """Per-node ``case`` bodies that repoint each buffer argument into the arena.
+
+    ``slot_of`` of None means no arena: the planner is only patching shapes and
+    every buffer keeps the address the capture gave it. That is different from an
+    empty assignment, which would mean an arena exists but owns nothing.
+
+    Call sites name the buffer Inductor renamed to, not the one that owns the
+    allocation -- ``buf2 = buf0  # reuse`` means ``buf2`` never appears in the
+    slot assignment -- so the alias map has to be applied before the lookup.
+    Anything still unaccounted for is refused: an unpatched pointer keeps the
+    address the capture gave it, and the graph would quietly return whichever
+    kernel last wrote there.
+    """
+    if slot_of is None:
+        return ""
+    alias = alias or {}
     cases = []
     for i, k in enumerate(kernels):
         body = []
-        for nm, buf in (k.get("ptrs") or {}).items():
+        for nm, raw in (k.get("ptrs") or {}).items():
+            buf = alias.get(raw, raw)
+            if not re.fullmatch(r"buf\d+", buf):
+                continue  # a graph input, which keeps its own fixed address
             if buf not in slot_of:
-                continue  # an input or a graph output, not arena-managed
+                raise Unsupported(
+                    f"{k['name']} argument {nm} is {raw}, which no allocation owns"
+                )
             off, size = k["offsets"][nm]
             if size != 8:
-                continue
+                raise Unsupported(f"{k['name']} pointer {nm} is {size} bytes")
             body.append(
                 f"      {{ char* p = arena + slot_off[{slot_of[buf]}]; "
                 f"cudaGraphKernelNodeSetParam(handles[i], {off}, &p, 8); }}"
-                f"  // {nm} = {buf}")
+                f"  // {nm} = {buf}"
+            )
         if body:
             cases.append(f"    case {i}:\n" + "\n".join(body) + "\n      break;")
     return "\n".join(cases)
+
+
+# --------------------------------------------------------------- runner
+def _wrapper_source(model: Any) -> str | None:
+    g = getattr(model, "__globals__", None)
+    path = (g or {}).get("__file__")
+    if not path:
+        return None
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def _graph_outputs(src: str) -> list[str]:
+    """Buffer names the wrapper returns, in order."""
+    m = re.search(r"^\s*return\s*\(([^)]*)\)", src, re.MULTILINE)
+    if not m:
+        return []
+    return [
+        a.strip() for a in _split_args(m.group(1)) if re.fullmatch(r"buf\d+", a.strip())
+    ]
+
+
+def _entry_source(src: str) -> str | None:
+    """Body of the function cudagraphify is actually handed.
+
+    Under graph partitioning compile_fx cudagraphifies each `partition_N` on its
+    own through `recursively_apply_fns`, so the runtime argument order is that
+    function's rather than `Runner.call`'s. The two genuinely differ -- call
+    takes (weight, bias, symbol, activation) and hands the partition
+    (activation, weight, bias, symbol) -- and the partition receives the symbol
+    as a named entry instead of through an assignment.
+
+    More than one partition means the kernels read off this file belong to
+    several graphs, which nothing here separates, so that bails.
+    """
+    bodies = re.findall(
+        r"^def partition_\d+\(args\):\n(.*?)(?=^\S)", src, re.MULTILINE | re.DOTALL
+    )
+    if not bodies:
+        return src
+    if len(bodies) != 1:
+        return None
+    return bodies[0]
+
+
+def _input_symbol_map(src: str) -> dict[str, int]:
+    """Symbol -> index in the argument list.
+
+    A symbol is an argument of its own rather than something read back off a
+    tensor, and the unpacking line is where it enters::
+
+        arg3_1, arg0_1, arg1_1, s77 = args  # partition: named directly
+        arg0_1, arg1_1, arg2_1, arg3_1 = args  # unpartitioned: via an alias
+        s77 = arg2_1
+
+    Reading it here rather than inferring it from a size assertion matters
+    because an assertion only constrains a tensor whose shape happens to mention
+    the symbol, while this is where the value itself arrives.
+    """
+    body = _entry_source(src)
+    if body is None:
+        return {}
+    unpack = re.search(r"^\s*((?:\w+\s*,\s*)+\w+)\s*=\s*args\s*$", body, re.MULTILINE)
+    if not unpack:
+        return {}
+    names = [n.strip() for n in unpack.group(1).split(",")]
+    if not all(re.fullmatch(r"arg\d+_1|s\d+", n) for n in names):
+        return {}
+    pos = {n: i for i, n in enumerate(names)}
+    out = {n: i for n, i in pos.items() if n.startswith("s")}
+    for m in re.finditer(r"^\s*(s\d+)\s*=\s*(arg\d+_1)\s*$", body, re.MULTILINE):
+        if m.group(2) in pos:
+            out[m.group(1)] = pos[m.group(2)]
+    return out
+
+
+def _buffer_aliases(src: str) -> dict[str, str]:
+    """Buffers that are another buffer under a new name.
+
+    Inductor renames a buffer when it reuses the storage::
+
+        buf2 = buf0
+        del buf0  # reuse
+
+    so a returned buffer often has no allocation of its own and has to be
+    resolved back to the one that does.
+    """
+    alias: dict[str, str] = {}
+    for m in re.finditer(r"^\s*(buf\d+)\s*=\s*(buf\d+)\s*(?:;|$)", src, re.MULTILINE):
+        alias[m.group(1)] = m.group(2)
+    for k in list(alias):
+        seen, v = OrderedSet(), alias[k]
+        while v in alias and v not in seen:
+            seen.add(v)
+            v = alias[v]
+        alias[k] = v
+    return alias
+
+
+def lifetimes_from_source(src: str) -> dict[str, tuple[int, int]]:
+    """Read buffer lifetimes off the wrapper, using its own del statements.
+
+    Inductor emits `del bufN` at the point a buffer dies, so the source already
+    carries the liveness the slot assignment needs, which avoids reaching into
+    the compile-time memory planning pass. Buffers the wrapper returns never get
+    a del and so live past the schedule, marked here with an end of -1 as
+    compute_memory_timeline does.
+
+    A renamed buffer keeps the storage alive under the new name: `buf2 = buf0;
+    del buf0  # reuse` deletes buf0 on the spot but buf2 goes on using that
+    memory. Lifetimes are keyed on the buffer that owns the allocation, so each
+    one has to die no earlier than the last name pointing at it -- otherwise the
+    slot gets handed to another buffer while it is still being read.
+    """
+    steps = [ln.strip() for ln in src.splitlines()]
+    born: dict[str, int] = {}
+    died: dict[str, int] = {}
+    for i, ln in enumerate(steps):
+        m = re.match(r"(buf\d+)\s*=\s*empty_strided_cuda\(", ln)
+        if m and m.group(1) not in born:
+            born[m.group(1)] = i
+        for name in re.findall(r"\bdel\s+([\w\s,]+)", ln):
+            for nm in (x.strip() for x in name.split(",")):
+                if re.fullmatch(r"buf\d+", nm) and nm not in died:
+                    died[nm] = i
+    alias = _buffer_aliases(src)
+    returned = OrderedSet(_graph_outputs(src))
+    out: dict[str, tuple[int, int]] = {}
+    for nm, b in born.items():
+        names = [nm] + [k for k, v in alias.items() if v == nm]
+        end = (
+            -1
+            if any(x in returned for x in names)
+            else max(died.get(x, len(steps)) for x in names)
+        )
+        out[nm] = (b, end)
+    return out
+
+
+class DynaGraphRunner:
+    """One captured graph serving a whole shape space, re-laid-out on every call.
+
+    This bypasses CUDAGraphTreeManager rather than extending it. The tree
+    machinery exists to share one memory pool between graphs and to checkpoint the
+    allocator so that recording can resume after a replay; neither applies when
+    there is a single graph whose buffers live in an arena owned here. What is
+    given up is pool sharing with other compiled regions.
+
+    Returns None from :meth:`build` whenever anything about the graph is not
+    understood, so the caller falls back to the ordinary path.
+    """
+
+    def __init__(self, model: Any, src: str, device: Any) -> None:
+        self.model = model
+        self.src = src
+        self.device = device
+        self.graph: Any = None
+        self.kernels, self.symbols = extract_kernel_table(
+            src, getattr(model, "__globals__", {})
+        )
+        self.sizes = buffer_size_exprs(src)
+        self.layouts = buffer_layouts(src)
+        self.alias = _buffer_aliases(src)
+        # A returned buffer is often a rename of one that owns the allocation.
+        self.outputs = [self.alias.get(b, b) for b in _graph_outputs(src)]
+        self.outputs = [b for b in self.outputs if b in self.sizes]
+        self.sym_from_input = _input_symbol_map(src)
+        self.sym_index = {s: i for i, s in enumerate(self.symbols or [])}
+
+    def usable(self) -> bool:
+        return bool(
+            self.kernels and self.symbols and self.outputs and self.sym_from_input
+        )
+
+    def build(
+        self,
+        inputs: list[Any],
+        lifetimes: dict[str, tuple[int, int]],
+        env: dict[str, int],
+        headroom: float = 2.0,
+    ) -> bool:
+        import torch
+
+        allocated = sorted(self.sizes)
+        assign, n_slots = plan_slots(lifetimes, allocated)
+        self.slot_of = dict(zip(allocated, assign))
+        self.n_slots = n_slots
+
+        # Inputs must sit at fixed addresses for a graph, so they are copied into
+        # buffers owned here and the recorded graph reads only from those.
+        self.static_inputs = [
+            x.clone() if isinstance(x, torch.Tensor) else x for x in inputs
+        ]
+
+        # The warmup has to come before the planner is generated, not just before
+        # the capture: it is what makes each autotuner commit to the single
+        # config the graph will bake in, and the grid formula is built from that
+        # config's block sizes.
+        self._warmup()
+        for k in self.kernels:
+            k["blocks"] = settled_blocks(self.model.__globals__.get(k["gname"]))
+            if k["blocks"] is None:
+                log.info(
+                    "DynaGraph: %s did not settle on one config, falling back",
+                    k["name"],
+                )
+                return False
+
+        layout_src = generate_layout(self.sizes, self.slot_of, n_slots, self.symbols)
+        try:
+            planner_src = generate_planner(
+                self.kernels, self.symbols, self.slot_of, self.alias
+            )
+        except Unsupported as exc:
+            log.info("DynaGraph cannot plan this graph, falling back: %s", exc)
+            return False
+        if os.environ.get("TORCHINDUCTOR_DYNAGRAPH_DUMP"):
+            with open(os.environ["TORCHINDUCTOR_DYNAGRAPH_DUMP"], "w") as fh:
+                fh.write(
+                    f"// kernels: {self.kernels}\n// slots: {self.slot_of}\n"
+                    f"// alias: {self.alias}\n// sizes: {self.sizes}\n\n"
+                )
+                fh.write(layout_src + planner_src)
+        funcs = _compile_module(
+            layout_src + planner_src, ["dynagraph_layout", "dynagraph_planner"]
+        )
+        if funcs is None:
+            return False
+        self.f_layout, self.f_planner = funcs
+
+        total = 0
+        for span, itemsize in self.sizes.values():
+            v = _eval_int(span, env)
+            if v is None:
+                return False
+            total += ((v * itemsize + 255) // 256) * 256
+        self.arena = torch.empty(
+            max(int(total * headroom), 1024), dtype=torch.uint8, device=self.device
+        )
+        self.slot_off = torch.zeros(n_slots + 1, dtype=torch.int64, device=self.device)
+        self.ctx = torch.zeros(
+            max(1, len(self.symbols)), dtype=torch.int64, device=self.device
+        )
+        self.handles = torch.zeros(
+            len(self.kernels), dtype=torch.int64, device=self.device
+        )
+
+        return self._capture() and self._replays_match(env)
+
+    def _warmup(self) -> None:
+        import torch
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                self.model(list(self.static_inputs))
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+
+    def _replays_match(self, env: dict[str, int]) -> bool:
+        """Replay once at the shape that was recorded and check the arena.
+
+        Everything the planner does is derived by reading the wrapper, and a
+        formula that is wrong in a way the source does not reveal -- a grid built
+        from the wrong autotuner config, say -- produces no error at all, just an
+        output whose tail was never written. One replay compared against running
+        the same partition eagerly costs nothing next to compiling the graph and
+        turns that whole class of mistake into a fallback.
+        """
+        import torch
+
+        ref = self.model(list(self.static_inputs))
+        got = self(list(self.static_inputs))
+        if len(got) != len(ref):
+            return False
+        for g, r in zip(got, ref):
+            if not torch.equal(g.reshape(-1), r.reshape(-1)):
+                log.info(
+                    "DynaGraph replay disagrees with eager at the recorded "
+                    "shape %s, falling back",
+                    env,
+                )
+                return False
+        return True
+
+    def _capture(self) -> bool:
+        import torch
+
+        launcher = torch._C._StaticCudaLauncher
+        graph = torch.cuda.CUDAGraph()
+        launcher._begin_device_node_collection()
+        try:
+            with torch.cuda.graph(graph):
+                raw = torch.cuda.current_stream().cuda_stream
+                _launch(
+                    self.f_layout,
+                    [self.ctx.data_ptr(), self.slot_off.data_ptr()],
+                    1,
+                    1,
+                    raw,
+                )
+                launch_planner(
+                    self.f_planner,
+                    len(self.kernels),
+                    self.handles.data_ptr(),
+                    self.ctx.data_ptr(),
+                    raw,
+                    self.arena.data_ptr(),
+                    self.slot_off.data_ptr(),
+                )
+                self.model(list(self.static_inputs))
+            handles = launcher._end_device_node_collection()
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                launcher._end_device_node_collection()
+            log.info("DynaGraph capture failed, falling back: %s", exc)
+            return False
+
+        if len(handles) != len(self.kernels):
+            # A mismatch means some kernel did not go through the static launcher,
+            # so its node has no handle and the planner cannot reach it. Replaying
+            # would leave that node at the recorded shape, which is silent
+            # corruption rather than an error, so refuse the whole graph.
+            log.info(
+                "DynaGraph got %d handles for %d kernels, falling back",
+                len(handles),
+                len(self.kernels),
+            )
+            return False
+        self.handles.copy_(torch.tensor(handles, dtype=torch.int64))
+        torch.cuda.synchronize()
+        self.graph = graph
+        return True
+
+    def __call__(self, inputs: list[Any]) -> Any:
+        import torch
+
+        for dst, srcv in zip(self.static_inputs, inputs):
+            if isinstance(dst, torch.Tensor) and isinstance(srcv, torch.Tensor):
+                dst.view(-1)[: srcv.numel()].copy_(srcv.reshape(-1))
+        env = {
+            sym: int(inputs[i])
+            for sym, i in self.sym_from_input.items()
+            if i < len(inputs) and isinstance(inputs[i], int)
+        }
+        for sym, val in env.items():
+            if sym in self.sym_index:
+                self.ctx[self.sym_index[sym]] = val
+        inputs.clear()
+
+        self.graph.replay()
+
+        offsets = self.slot_off.tolist()
+        out = []
+        for name in self.outputs:
+            span, itemsize = self.sizes[name]
+            sizes_e, strides_e, dtype_name = self.layouts[name]
+            vals = [_eval_int(e, env) for e in (span, *sizes_e, *strides_e)]
+            ints = [v for v in vals if v is not None]
+            if len(ints) != len(vals):
+                raise RuntimeError(f"DynaGraph cannot size output {name}")
+            n, rest = ints[0], ints[1:]
+            sizes, strides = rest[: len(sizes_e)], rest[len(sizes_e) :]
+            base = offsets[self.slot_of[name]]
+            # The layout kernel keeps every slot 256-byte aligned, so viewing the
+            # byte arena as the buffer dtype is always legal. as_strided keeps the
+            # storage offset of the slice it is called on.
+            flat = self.arena[base : base + n * itemsize].view(
+                getattr(torch, dtype_name.split(".")[-1])
+            )
+            out.append(flat.as_strided(sizes, strides))
+
+        return out
+
+
+def _compile_module(src: str, names: list[str]) -> tuple[int, ...] | None:
+    import torch
+
+    major, minor = torch.cuda.get_device_capability()
+    arch = f"sm_{major}{minor}" + ("a" if (major, minor) >= (9, 0) else "")
+    with tempfile.TemporaryDirectory() as wd:
+        cu, cubin = os.path.join(wd, "dg.cu"), os.path.join(wd, "dg.cubin")
+        with open(cu, "w") as fh:
+            fh.write(src)
+        r = subprocess.run(
+            ["nvcc", f"-arch={arch}", "-cubin", "-o", cubin, cu],
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            log.warning("DynaGraph nvcc failed: %s", r.stderr[-600:])
+            return None
+        mod = ctypes.c_void_p()
+        if _cuda().cuModuleLoad(ctypes.byref(mod), cubin.encode()) != 0:
+            return None
+    got = []
+    for nm in names:
+        fn = ctypes.c_void_p()
+        if _cuda().cuModuleGetFunction(ctypes.byref(fn), mod, nm.encode()) != 0:
+            return None
+        if fn.value is None:
+            return None
+        got.append(fn.value)
+    return tuple(got)
+
+
+def _launch(func: int, args: list[int], grid: int, block: int, stream: int) -> None:
+    holders = [ctypes.c_void_p(a) for a in args]
+    arr = (ctypes.c_void_p * len(holders))(
+        *[ctypes.cast(ctypes.byref(h), ctypes.c_void_p) for h in holders]
+    )
+    rc = _cuda().cuLaunchKernel(
+        ctypes.c_void_p(func),
+        grid,
+        1,
+        1,
+        block,
+        1,
+        1,
+        0,
+        ctypes.c_void_p(stream),
+        arr,
+        None,
+    )
+    if rc != 0:
+        raise RuntimeError(f"DynaGraph kernel launch failed: {rc}")
