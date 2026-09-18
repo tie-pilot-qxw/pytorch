@@ -472,7 +472,12 @@ def cudagraphify_impl(
             if dynagraph_runner is None:
                 dynagraph_runner = _maybe_build_dynagraph(model, inputs, kwargs)
             if dynagraph_runner is not False:
-                return dynagraph_runner(inputs)
+                out = dynagraph_runner(inputs)
+                if out is not None:
+                    return out
+                # A replay stopped matching eager, so the region retires and
+                # recording takes over from here. `inputs` is untouched.
+                dynagraph_runner = False
 
         fn = fn_cache.get(int_key)
         if fn is not None:
@@ -549,24 +554,26 @@ def _maybe_build_dynagraph(
     try:
         src = dg._wrapper_source(model)
         if not src:
-            return False
+            return dg._fallback("no-wrapper-source")
         runner = dg.DynaGraphRunner(model, src, _inputs_device(inputs))
-        if not runner.usable():
-            return False
+        reason = runner.unusable_reason()
+        if reason:
+            return dg._fallback(reason)
         env = {}
         for sym, i in runner.sym_from_input.items():
             v = inputs[i] if i < len(inputs) else None
             if isinstance(v, int):
                 env[sym] = v
         if len(env) != len(runner.symbols):
-            return False
+            return dg._fallback(
+                "symbol-not-an-argument", f"resolved {sorted(env)} of {runner.symbols}"
+            )
         if not runner.build(inputs, dg.lifetimes_from_source(src), env):
             return False
-        log.info("DynaGraph: one graph now serves all shapes for this region")
+        log.info("DynaGraph served: one graph now covers all shapes for this region")
         return runner
     except Exception as exc:
-        log.info("DynaGraph unavailable, falling back: %s", exc)
-        return False
+        return dg._fallback("exception", f"{type(exc).__name__}: {exc}")
 
 
 def _inputs_device(inputs: list[InputType]) -> Any:
