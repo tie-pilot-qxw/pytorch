@@ -269,6 +269,16 @@ std::pair<CUmodule, CUfunction> loadKernel(
   return {mod, func};
 }
 
+// Sink for device-updatable graph node handles, set for the duration of a
+// capture. While it is non-null every kernel launched on this thread is made
+// device-updatable and its handle appended, which is how DynaGraph learns which
+// graph node corresponds to which Inductor kernel.
+//
+// A thread-local sink rather than an explicit out-parameter because capture is a
+// scoped region: the Python caller wraps the capture, it cannot thread a value
+// through each individual launch.
+static thread_local std::vector<uint64_t>* g_dev_node_sink = nullptr;
+
 inline void launchKernel(
     CUfunction func,
     uint32_t gridX,
@@ -277,15 +287,14 @@ inline void launchKernel(
     uint32_t numWarps,
     uint32_t sharedMemBytes,
     void** args,
-    cudaStream_t stream,
-    CUgraphDeviceNode* out_dev_node) {
+    cudaStream_t stream) {
   // cta_args is always 1 for inductor generated triton kernels,
   // so we don't need to figure out grid dimension here
 #if defined(USE_ROCM)
   // ROCm has no cuLaunchKernelEx equivalent, so device-updatable graph nodes
   // are unavailable. Fail loudly rather than silently ignoring the request.
   TORCH_CHECK(
-      out_dev_node == nullptr,
+      g_dev_node_sink == nullptr,
       "device-updatable kernel nodes are not supported on ROCm");
   int device = 0;
   AT_CUDA_DRIVER_CHECK(hipGetDevice(&device));
@@ -307,7 +316,7 @@ inline void launchKernel(
       nullptr));
 
 #else
-  if (out_dev_node != nullptr) {
+  if (g_dev_node_sink != nullptr) {
     // Device-updatable path. Marking the node device-updatable is only possible
     // at launch time: the handle we need comes back inside the attribute struct,
     // written by the launch itself. Doing it after capture instead would mean
@@ -333,7 +342,8 @@ inline void launchKernel(
     AT_CUDA_DRIVER_CHECK(
         nvrtc().cuLaunchKernelEx(&config, func, args, nullptr));
     // The launch fills in devNode; it is only meaningful while capturing.
-    *out_dev_node = attr.value.deviceUpdatableKernelNode.devNode;
+    g_dev_node_sink->push_back(reinterpret_cast<uint64_t>(
+        attr.value.deviceUpdatableKernelNode.devNode));
     return;
   }
 
@@ -549,8 +559,7 @@ PyObject* launch_kernel_inner(
       numWarps,
       sharedMemBytes,
       kernelArgs.data(),
-      cudaStream,
-      /*out_dev_node=*/nullptr);
+      cudaStream);
   Py_RETURN_NONE;
 }
 
@@ -579,8 +588,7 @@ PyObject* launch_kernel_slow(
       numWarps,
       sharedMemBytes,
       kernelArgs.data(),
-      cudaStream,
-      /*out_dev_node=*/nullptr);
+      cudaStream);
   Py_RETURN_NONE;
 }
 
@@ -662,8 +670,7 @@ PyObject* launch_kernel(PyObject* self, PyObject* args) {
         numWarps,
         sharedMemBytes,
         nullptr,
-        cudaStream,
-        /*out_dev_node=*/nullptr);
+        cudaStream);
     Py_RETURN_NONE;
   } else if (num_args <= MAX_ARGS) {
     return launch_kernel_inner(
@@ -710,7 +717,55 @@ PyObject* unload_kernel(PyObject* self, PyObject* args) {
   END_HANDLE_TH_ERRORS
 }
 
-std::array<PyMethodDef, 3> StaticCudaLauncherMethods = {
+// Begin collecting device-updatable graph node handles on this thread. Every
+// kernel launched until _end_device_node_collection is called is launched via
+// cuLaunchKernelEx with CU_LAUNCH_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE.
+//
+// Only meaningful inside a stream capture: outside one the attribute is ignored
+// and the returned handles are not usable.
+PyObject* begin_device_node_collection(PyObject* self, PyObject* noargs) {
+  HANDLE_TH_ERRORS
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "device-updatable kernel nodes are not supported on ROCm");
+#else
+  TORCH_CHECK(
+      g_dev_node_sink == nullptr,
+      "device node collection is already active on this thread");
+  g_dev_node_sink = new std::vector<uint64_t>();
+  Py_RETURN_NONE;
+#endif
+  END_HANDLE_TH_ERRORS
+}
+
+// Stop collecting and return the handles, in launch order. Launch order is the
+// point of this API: it is what lets the caller map handle[i] back to the i-th
+// kernel it launched, which cuGraphGetNodes cannot provide.
+PyObject* end_device_node_collection(PyObject* self, PyObject* noargs) {
+  HANDLE_TH_ERRORS
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "device-updatable kernel nodes are not supported on ROCm");
+#else
+  TORCH_CHECK(
+      g_dev_node_sink != nullptr, "device node collection is not active");
+  std::unique_ptr<std::vector<uint64_t>> sink(g_dev_node_sink);
+  g_dev_node_sink = nullptr;
+  THPObjectPtr list(PyList_New(static_cast<Py_ssize_t>(sink->size())));
+  if (!list) {
+    return nullptr;
+  }
+  for (size_t i = 0; i < sink->size(); ++i) {
+    PyObject* item = PyLong_FromUnsignedLongLong((*sink)[i]);
+    if (!item) {
+      return nullptr;
+    }
+    PyList_SET_ITEM(list.get(), static_cast<Py_ssize_t>(i), item);
+  }
+  return list.release();
+#endif
+  END_HANDLE_TH_ERRORS
+}
+
+std::array<PyMethodDef, 5> StaticCudaLauncherMethods = {
     PyMethodDef{
         "_launch_kernel",
         launch_kernel,
@@ -725,7 +780,17 @@ std::array<PyMethodDef, 3> StaticCudaLauncherMethods = {
         "_unload_kernel",
         unload_kernel,
         METH_VARARGS,
-        "Unload CUDA/HIP module loaded by _load_kernel"}};
+        "Unload CUDA/HIP module loaded by _load_kernel"},
+    PyMethodDef{
+        "_begin_device_node_collection",
+        begin_device_node_collection,
+        METH_NOARGS,
+        "Launch subsequent kernels as device-updatable graph nodes"},
+    PyMethodDef{
+        "_end_device_node_collection",
+        end_device_node_collection,
+        METH_NOARGS,
+        "Stop collecting and return the device node handles in launch order"}};
 
 // Define a minimal type for StaticCudaLauncher.
 // We don't implement __new__ or __init__ because we're using it only as a
@@ -1036,8 +1101,7 @@ static PyObject* fast_launcher_vectorcall(
       self->numWarps,
       self->sharedMemBytes,
       self->kernelArgs,
-      reinterpret_cast<cudaStream_t>(stream), // NOLINT
-      /*out_dev_node=*/nullptr);
+      reinterpret_cast<cudaStream_t>(stream)); // NOLINT
 
   Py_RETURN_NONE;
   END_HANDLE_TH_ERRORS
