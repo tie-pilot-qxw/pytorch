@@ -456,13 +456,23 @@ def cudagraphify_impl(
 
     del inputs
 
+    # DynaGraph keeps one entry here for every shape rather than one per shape.
+    # None means "not tried yet", False means "tried and not applicable".
+    dynagraph_runner: Any = None
+
     def deferred_cudagraphify(inputs: list[InputType]) -> OutputType:
-        nonlocal has_warn
+        nonlocal has_warn, dynagraph_runner
 
         int_key = get_ints(inputs)
 
         if not is_cudagraph_capture_sizes(int_key):
             return model(inputs)
+
+        if config.triton.dynagraph and int_key is not None:
+            if dynagraph_runner is None:
+                dynagraph_runner = _maybe_build_dynagraph(model, inputs, kwargs)
+            if dynagraph_runner is not False:
+                return dynagraph_runner(inputs)
 
         fn = fn_cache.get(int_key)
         if fn is not None:
@@ -520,6 +530,50 @@ def dynamo_timed_cudagraph(
         dynamo_compile_column_us="runtime_cudagraphify_time_us",
     ):
         yield
+
+
+def _maybe_build_dynagraph(
+    model: ModelType, inputs: list[InputType], kwargs: dict[str, Any]
+) -> Any:
+    """Try to serve every shape from one recorded graph; return False if not possible.
+
+    Returning False rather than raising is deliberate: everything this path needs
+    is recovered by reading the generated wrapper, and any graph whose shape
+    handling is not fully understood has to fall back to recording per shape
+    rather than be served approximately. Replaying a node the planner could not
+    reach would leave it at the recorded shape, which is silent corruption rather
+    than an error.
+    """
+    from torch._inductor import dynagraph as dg
+
+    try:
+        src = dg._wrapper_source(model)
+        if not src:
+            return False
+        runner = dg.DynaGraphRunner(model, src, _inputs_device(inputs))
+        if not runner.usable():
+            return False
+        env = {}
+        for sym, i in runner.sym_from_input.items():
+            v = inputs[i] if i < len(inputs) else None
+            if isinstance(v, int):
+                env[sym] = v
+        if len(env) != len(runner.symbols):
+            return False
+        if not runner.build(inputs, dg.lifetimes_from_source(src), env):
+            return False
+        log.info("DynaGraph: one graph now serves all shapes for this region")
+        return runner
+    except Exception as exc:
+        log.info("DynaGraph unavailable, falling back: %s", exc)
+        return False
+
+
+def _inputs_device(inputs: list[InputType]) -> Any:
+    for x in inputs:
+        if isinstance(x, torch.Tensor) and x.is_cuda:
+            return x.device
+    return torch.device("cuda")
 
 
 def cudagraphify(
