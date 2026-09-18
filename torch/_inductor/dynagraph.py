@@ -531,54 +531,68 @@ def _find_allocations(src: str) -> list[tuple[str, list[str], list[str], str]]:
     return out
 
 
-def buffers_are_monotonic(
-    source_code: str, symbols: list[str], record_at: int, probes: int = 24
+def buffer_dominates(
+    source_code: str,
+    record_shape: dict[str, int],
+    sample_shapes: list[dict[str, int]],
 ) -> tuple[bool, str]:
-    """Check that recording at ``record_at`` allocates enough for every smaller shape.
+    """Check that recording at ``record_shape`` allocates enough for every sample.
 
-    Recording one graph for a whole interval rests on an assumption that is easy
-    to leave unstated: every buffer's footprint must be non-decreasing in the
-    symints. If some buffer were larger at a *smaller* shape it would run past the
-    extent fixed for it at capture time and quietly corrupt its neighbour, with no
-    error raised.
+    Serving one recorded graph across a set of shapes rests on an assumption that
+    is easy to leave unstated: the recording shape's allocation must dominate every
+    other shape's, buffer by buffer. If some buffer were larger elsewhere it would
+    run past the extent fixed for it at capture time and quietly corrupt its
+    neighbour, with no error raised.
 
-    Most size expressions are sums and products with positive coefficients and are
-    monotonic for that reason, but floor division and min/max can break it, so this
-    is checked rather than assumed. A negative result is not fatal: the caller
-    falls back to recording per shape, which is what PyTorch does today, so a
-    violated assumption costs performance and not correctness.
+    ``sample_shapes`` must describe the shape space as it will actually be used,
+    with each symbol given independently. An earlier version of this check varied
+    all symbols together, which made it blind to exactly the case it was meant to
+    catch: with a fixed total split over a varying number of samples, one symbol
+    rises as another falls, so no point on the diagonal exhibits the conflict and
+    the check passed on a shape space it should have rejected.
 
-    Note this samples rather than proves. It is a guard against the common cases,
-    not a decision procedure.
+    A negative result is not fatal. The caller can fall back to recording per
+    shape, or to laying the buffers out in an arena on each replay.
     """
     allocs = _find_allocations(source_code)
     if not allocs:
         return True, ""
 
-    if record_at <= 1:
-        return True, ""
-    step = max(1, record_at // probes)
-    shapes = sorted({record_at, 1, *range(1, record_at, step)})
-
     for name, sizes, strides, _dtype in allocs:
-        spans = []
-        for m in shapes:
-            env = dict.fromkeys(symbols, m)
+        def span(env: dict[str, int]) -> int | None:
             sz = [_eval_int(e, env) for e in sizes]
             st = [_eval_int(e, env) for e in strides]
             if any(v is None for v in sz) or any(v is None for v in st):
-                spans = []
-                break  # cannot evaluate; do not claim anything about this buffer
-            spans.append((m, 1 + sum((a - 1) * b for a, b in zip(sz, st))))
-        if not spans:
-            continue
-        at_max = next(s for m, s in spans if m == record_at)
-        worst_m, worst = max(spans, key=lambda p: p[1])
-        if worst > at_max:
-            return False, (
-                f"buffer {name} needs {worst} elements at shape {worst_m} but only "
-                f"{at_max} would be allocated at the recording shape {record_at}")
+                return None
+            return 1 + sum((a - 1) * b for a, b in zip(sz, st))
+
+        at_record = span(record_shape)
+        if at_record is None:
+            continue  # cannot evaluate; claim nothing about this buffer
+        for env in sample_shapes:
+            here = span(env)
+            if here is not None and here > at_record:
+                return False, (
+                    f"buffer {name} needs {here} elements at {env} but only "
+                    f"{at_record} would be allocated at {record_shape}")
     return True, ""
+
+
+def buffers_are_monotonic(
+    source_code: str, symbols: list[str], record_at: int, probes: int = 24
+) -> tuple[bool, str]:
+    """Single-symbol convenience wrapper over :func:`buffer_dominates`.
+
+    Only sound when the shape space really is one-dimensional, i.e. every symbol
+    moves together. Use :func:`buffer_dominates` with explicit per-symbol samples
+    otherwise.
+    """
+    if record_at <= 1:
+        return True, ""
+    step = max(1, record_at // probes)
+    samples = [dict.fromkeys(symbols, m)
+               for m in sorted({record_at, 1, *range(1, record_at, step)})]
+    return buffer_dominates(source_code, dict.fromkeys(symbols, record_at), samples)
 
 
 # --------------------------------------------------------------- arena layout
