@@ -1,21 +1,23 @@
-"""DynaGraph: reuse one recorded CUDA graph across an interval of shapes.
+"""DynaGraph: serve a whole space of shapes from one recorded CUDA graph.
 
 Today cudagraph_trees keys its function cache on the exact tuple of integer
 inputs, which under dynamic shapes *are* the symints, so every distinct shape
 records a new graph (see ``cudagraph_trees.deferred_cudagraphify``). This module
-supplies the pieces needed to record one graph per shape *interval* instead:
+records one graph and re-parameterizes it per replay instead:
 
 * extract, for every Triton kernel in the compiled wrapper, the symbolic
   expressions that drive its grid and its shape-carrying scalar arguments, plus
   the byte offset of each such argument inside the kernel parameter buffer;
 * generate, compile and load a "planner" kernel that recomputes all of the above
   on device from the current symints and re-parameterizes the graph nodes in
-  place, via ``cudaGraphKernelNodeSetGridDim`` / ``SetParam`` / ``SetEnabled``.
+  place, via ``cudaGraphKernelNodeSetGridDim`` / ``SetParam`` / ``SetEnabled``;
+* lay every intermediate buffer out in an arena owned here, and repoint the
+  kernels' buffer arguments at it, so the sizes are not frozen at capture.
 
 The planner is injected as the first node of the captured graph, so the update
 takes effect within the same launch.
 
-Two properties of the surrounding system shape the design:
+Three properties of the surrounding system shape the design:
 
 * Parameter byte offsets cannot be computed, only queried. PyTorch never builds a
   flat parameter buffer -- every launch path uses the array-of-pointers form of
@@ -23,9 +25,20 @@ Two properties of the surrounding system shape the design:
   ABI: natural C alignment, with int32 arguments *not* padded to 8 bytes. A
   kernel with two int32 arguments packs them at, say, 16 and 20, so an ``8 * i``
   formula is wrong. ``cuFuncGetParamInfo`` is the only reliable source.
-* The graph's private memory pool sizes every buffer at capture time, so a graph
-  must be recorded at the maximum shape of its interval. Smaller shapes then fit
-  inside the same allocations.
+* The graph's private memory pool sizes every buffer at capture time. Recording
+  at the largest shape of an interval is not enough to escape that: when a fixed
+  total is split over a varying number of samples one buffer grows as another
+  shrinks, so no single shape dominates (:func:`buffer_dominates` is the check
+  that says so). Hence the arena and the per-replay re-layout.
+* Graph inputs are not in the arena -- their addresses are baked into the nodes
+  -- so they are held in oversized storage and a shape past that headroom retires
+  the region rather than being served.
+
+Everything here is recovered by reading the generated wrapper, so being wrong is
+possible in ways that produce no error, only a tensor whose tail was never
+written. Every construct that is not fully understood is refused through
+:func:`_fallback`, replays are checked against eager for the first few shapes,
+and a mismatch retires the region.
 """
 
 from __future__ import annotations
@@ -137,6 +150,17 @@ def _parse_run_calls(src: str) -> dict[str, list[str]]:
             j += 1
         calls[name] = _split_args(src[i : j - 1])
     return calls
+
+
+def _fallback(tag: str, detail: str = "") -> bool:
+    """Record why a graph is not being served, and return False for the caller.
+
+    Every refusal goes through here so that a sweep over many models can count
+    the reasons. The tag is a stable short name meant to be grepped and tallied;
+    the detail is free text for whoever is reading one log.
+    """
+    log.info("DynaGraph fallback [%s]%s", tag, f": {detail}" if detail else "")
+    return False
 
 
 class Unsupported(Exception):
@@ -1065,32 +1089,72 @@ class DynaGraphRunner:
         self.outputs = [self.alias.get(b, b) for b in _graph_outputs(src)]
         self.outputs = [b for b in self.outputs if b in self.sizes]
         self.sym_from_input = _input_symbol_map(src)
+        # Shapes whose replay has already been checked against eager.
+        self.verified: OrderedSet[tuple[tuple[str, int], ...]] = OrderedSet()
         self.sym_index = {s: i for i, s in enumerate(self.symbols or [])}
 
-    def usable(self) -> bool:
-        return bool(
-            self.kernels and self.symbols and self.outputs and self.sym_from_input
-        )
+    def unusable_reason(self) -> str | None:
+        """The first thing that rules this graph out, or None to go ahead.
+
+        A reason rather than a bool because these four are the commonest way a
+        region is turned down, and a sweep over many models wants to know which.
+        """
+        if not self.kernels:
+            return "no-kernels"
+        if not self.symbols:
+            return "no-symbols"
+        if not self.outputs:
+            return "no-arena-outputs"
+        if not self.sym_from_input:
+            return "no-symbol-args"
+        return None
 
     def build(
         self,
         inputs: list[Any],
         lifetimes: dict[str, tuple[int, int]],
         env: dict[str, int],
-        headroom: float = 2.0,
     ) -> bool:
+        """Record the one graph, or return False to leave this region alone.
+
+        The order matters. Warming up has to happen before the planner is
+        generated, not merely before the capture: it is what makes each autotuner
+        commit to the single config the graph will bake in, and the grid formulas
+        are built from that config's block sizes. The capture comes last, and is
+        checked against eager before the graph is handed out.
+        """
         import torch
+        from torch._inductor import config
+
+        headroom = config.triton.dynagraph_headroom
 
         allocated = sorted(self.sizes)
         assign, n_slots = plan_slots(lifetimes, allocated)
         self.slot_of = dict(zip(allocated, assign))
         self.n_slots = n_slots
 
-        # Inputs must sit at fixed addresses for a graph, so they are copied into
-        # buffers owned here and the recorded graph reads only from those.
-        self.static_inputs = [
-            x.clone() if isinstance(x, torch.Tensor) else x for x in inputs
-        ]
+        # Inputs must sit at a fixed address for the graph's lifetime, so they are
+        # copied into storage owned here and the recorded graph reads only from
+        # that. The storage is oversized by the same headroom as the arena: the
+        # recorded shape is whatever happened to arrive first, and a later, larger
+        # shape has to land at the same address, since only the extents are
+        # patched, not the pointer. Past the headroom the region retires.
+        self.input_store: list[Any] = []
+        self.static_inputs = []
+        for x in inputs:
+            if not isinstance(x, torch.Tensor):
+                self.input_store.append(None)
+                self.static_inputs.append(x)
+                continue
+            if not x.is_contiguous():
+                return _fallback("input-not-contiguous")
+            n = x.numel()
+            store = torch.empty(
+                max(int(n * headroom), n), dtype=x.dtype, device=x.device
+            )
+            store[:n].copy_(x.reshape(-1))
+            self.input_store.append(store)
+            self.static_inputs.append(store[:n].view(x.shape))
 
         # The warmup has to come before the planner is generated, not just before
         # the capture: it is what makes each autotuner commit to the single
@@ -1100,11 +1164,7 @@ class DynaGraphRunner:
         for k in self.kernels:
             k["blocks"] = settled_blocks(self.model.__globals__.get(k["gname"]))
             if k["blocks"] is None:
-                log.info(
-                    "DynaGraph: %s did not settle on one config, falling back",
-                    k["name"],
-                )
-                return False
+                return _fallback("unsettled-config", k["name"])
 
         layout_src = generate_layout(self.sizes, self.slot_of, n_slots, self.symbols)
         try:
@@ -1112,8 +1172,7 @@ class DynaGraphRunner:
                 self.kernels, self.symbols, self.slot_of, self.alias
             )
         except Unsupported as exc:
-            log.info("DynaGraph cannot plan this graph, falling back: %s", exc)
-            return False
+            return _fallback("unmodelled", str(exc))
         if os.environ.get("TORCHINDUCTOR_DYNAGRAPH_DUMP"):
             with open(os.environ["TORCHINDUCTOR_DYNAGRAPH_DUMP"], "w") as fh:
                 fh.write(
@@ -1125,14 +1184,14 @@ class DynaGraphRunner:
             layout_src + planner_src, ["dynagraph_layout", "dynagraph_planner"]
         )
         if funcs is None:
-            return False
+            return _fallback("planner-build")
         self.f_layout, self.f_planner = funcs
 
         total = 0
         for span, itemsize in self.sizes.values():
             v = _eval_int(span, env)
             if v is None:
-                return False
+                return _fallback("unevaluable-size", span)
             total += ((v * itemsize + 255) // 256) * 256
         self.arena = torch.empty(
             max(int(total * headroom), 1024), dtype=torch.uint8, device=self.device
@@ -1168,20 +1227,11 @@ class DynaGraphRunner:
         the same partition eagerly costs nothing next to compiling the graph and
         turns that whole class of mistake into a fallback.
         """
-        import torch
 
         ref = self.model(list(self.static_inputs))
         got = self(list(self.static_inputs))
-        if len(got) != len(ref):
-            return False
-        for g, r in zip(got, ref):
-            if not torch.equal(g.reshape(-1), r.reshape(-1)):
-                log.info(
-                    "DynaGraph replay disagrees with eager at the recorded "
-                    "shape %s, falling back",
-                    env,
-                )
-                return False
+        if got is None or not _same_values(got, ref):
+            return _fallback("selfcheck-mismatch", f"at {env}")
         return True
 
     def _capture(self) -> bool:
@@ -1214,40 +1264,66 @@ class DynaGraphRunner:
         except Exception as exc:
             with contextlib.suppress(Exception):
                 launcher._end_device_node_collection()
-            log.info("DynaGraph capture failed, falling back: %s", exc)
-            return False
+            return _fallback("capture-failed", f"{type(exc).__name__}: {exc}")
 
         if len(handles) != len(self.kernels):
             # A mismatch means some kernel did not go through the static launcher,
             # so its node has no handle and the planner cannot reach it. Replaying
             # would leave that node at the recorded shape, which is silent
             # corruption rather than an error, so refuse the whole graph.
-            log.info(
-                "DynaGraph got %d handles for %d kernels, falling back",
-                len(handles),
-                len(self.kernels),
+            return _fallback(
+                "handle-mismatch",
+                f"{len(handles)} handles for {len(self.kernels)} kernels",
             )
-            return False
         self.handles.copy_(torch.tensor(handles, dtype=torch.int64))
         torch.cuda.synchronize()
         self.graph = graph
         return True
 
     def __call__(self, inputs: list[Any]) -> Any:
-        import torch
+        """Serve one call, or return None once this region can no longer be trusted.
 
-        for dst, srcv in zip(self.static_inputs, inputs):
-            if isinstance(dst, torch.Tensor) and isinstance(srcv, torch.Tensor):
-                dst.view(-1)[: srcv.numel()].copy_(srcv.reshape(-1))
-        env = {
-            sym: int(inputs[i])
-            for sym, i in self.sym_from_input.items()
-            if i < len(inputs) and isinstance(inputs[i], int)
-        }
+        None rather than an exception: the caller still holds `inputs`, which this
+        only clears on the way out, so it can just record the shape the ordinary
+        way.
+        """
+        import torch
+        from torch._inductor import config
+
+        env = {}
+        for sym, i in self.sym_from_input.items():
+            v = inputs[i] if i < len(inputs) else None
+            if isinstance(v, int):
+                env[sym] = v
+        key = tuple(sorted(env.items()))
+
+        for j, (store, srcv) in enumerate(zip(self.input_store, inputs)):
+            if store is None or not isinstance(srcv, torch.Tensor):
+                continue
+            n = srcv.numel()
+            if n > store.numel():
+                _fallback("input-too-large", f"arg {j}: {n} > {store.numel()}")
+                return None
+            if not srcv.is_contiguous():
+                _fallback("input-not-contiguous", f"arg {j}")
+                return None
+            store[:n].copy_(srcv.reshape(-1))
+
+        # New shapes are run eagerly alongside the replay until enough of them have
+        # agreed. The build-time check only covers the shape the graph was recorded
+        # at, and a grid formula can be right there and wrong everywhere else --
+        # that is exactly how the XBLOCK bug hid. Eager gets `inputs`, which still
+        # carries the real shape; the replay reads the fixed-size copies, so the
+        # two sides are computed independently.
+        ref = None
+        if key not in self.verified and len(self.verified) < (
+            config.triton.dynagraph_verify_shapes
+        ):
+            ref = self.model(list(inputs))
+
         for sym, val in env.items():
             if sym in self.sym_index:
                 self.ctx[self.sym_index[sym]] = val
-        inputs.clear()
 
         self.graph.replay()
 
@@ -1271,7 +1347,33 @@ class DynaGraphRunner:
             )
             out.append(flat.as_strided(sizes, strides))
 
+        if ref is not None:
+            if not _same_values(out, ref):
+                _fallback("runtime-mismatch", f"at {env}")
+                return None
+            self.verified.add(key)
+        inputs.clear()
         return out
+
+
+def _same_values(got: list[Any], ref: Any) -> bool:
+    """Bit-for-bit agreement between a replay's outputs and an eager run's.
+
+    Exact rather than tolerant on purpose: both sides run the same kernels with
+    the same settled launch config on the same inputs, so any difference at all
+    means the planner changed something it should not have.
+    """
+    import torch
+
+    flat = list(ref) if isinstance(ref, (list, tuple)) else [ref]
+    if len(got) != len(flat):
+        return False
+    return all(
+        isinstance(r, torch.Tensor)
+        and g.numel() == r.numel()
+        and torch.equal(g.reshape(-1), r.reshape(-1))
+        for g, r in zip(got, flat)
+    )
 
 
 def _compile_module(src: str, names: list[str]) -> tuple[int, ...] | None:
