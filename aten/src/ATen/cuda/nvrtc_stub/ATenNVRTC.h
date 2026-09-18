@@ -70,7 +70,8 @@ namespace at::cuda {
 #if defined(CUDA_VERSION)
 #define AT_FORALL_NVRTC_EXTENDED(_)              \
   AT_FORALL_NVRTC_BASE(_)                        \
-  _(cuTensorMapEncodeTiled)
+  _(cuTensorMapEncodeTiled)                      \
+  _(cuLaunchKernelEx)
 #else
 #define AT_FORALL_NVRTC_EXTENDED(_)              \
   AT_FORALL_NVRTC_BASE(_)

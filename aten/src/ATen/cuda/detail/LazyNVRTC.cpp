@@ -205,6 +205,22 @@ cuTensorMapEncodeTiled(
 #endif
 
 // Irregularly shaped functions
+// cuLaunchKernelEx: needed to pass per-launch attributes, in particular
+// CU_LAUNCH_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE, which is the only way to
+// obtain a CUgraphDeviceNode handle for a kernel node at capture time. The
+// alternative (setting the attribute on the captured graph afterwards) cannot
+// tell two nodes of the same kernel apart, because cuGraphGetNodes returns an
+// unspecified order and both nodes share a CUfunction.
+CUresult CUDAAPI cuLaunchKernelEx(const CUlaunchConfig* config,
+                                  CUfunction f,
+                                  void** kernelParams,
+                                  void** extra) {
+  auto fn = reinterpret_cast<decltype(&cuLaunchKernelEx)>(getCUDALibrary().sym(__func__));
+  TORCH_CHECK(fn, "Can't get cuLaunchKernelEx");
+  lazyNVRTC.cuLaunchKernelEx = fn;
+  return fn(config, f, kernelParams, extra);
+}
+
 CUresult CUDAAPI cuLaunchKernel(CUfunction f,
                                 unsigned int gridDimX,
                                 unsigned int gridDimY,

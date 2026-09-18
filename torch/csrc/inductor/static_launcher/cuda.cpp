@@ -277,10 +277,16 @@ inline void launchKernel(
     uint32_t numWarps,
     uint32_t sharedMemBytes,
     void** args,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    CUgraphDeviceNode* out_dev_node) {
   // cta_args is always 1 for inductor generated triton kernels,
   // so we don't need to figure out grid dimension here
 #if defined(USE_ROCM)
+  // ROCm has no cuLaunchKernelEx equivalent, so device-updatable graph nodes
+  // are unavailable. Fail loudly rather than silently ignoring the request.
+  TORCH_CHECK(
+      out_dev_node == nullptr,
+      "device-updatable kernel nodes are not supported on ROCm");
   int device = 0;
   AT_CUDA_DRIVER_CHECK(hipGetDevice(&device));
   int warp_size = 0;
@@ -301,6 +307,36 @@ inline void launchKernel(
       nullptr));
 
 #else
+  if (out_dev_node != nullptr) {
+    // Device-updatable path. Marking the node device-updatable is only possible
+    // at launch time: the handle we need comes back inside the attribute struct,
+    // written by the launch itself. Doing it after capture instead would mean
+    // recovering "which node is which kernel" from cuGraphGetNodes, whose order
+    // is unspecified, and two launches of the same Triton kernel share a
+    // CUfunction, so they cannot be told apart that way.
+    CUlaunchAttribute attr{};
+    attr.id = CU_LAUNCH_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE;
+    attr.value.deviceUpdatableKernelNode.deviceUpdatable = 1;
+
+    CUlaunchConfig config{};
+    config.gridDimX = gridX;
+    config.gridDimY = gridY;
+    config.gridDimZ = gridZ;
+    config.blockDimX = 32 * numWarps;
+    config.blockDimY = 1;
+    config.blockDimZ = 1;
+    config.sharedMemBytes = sharedMemBytes;
+    config.hStream = stream;
+    config.attrs = &attr;
+    config.numAttrs = 1;
+
+    AT_CUDA_DRIVER_CHECK(
+        nvrtc().cuLaunchKernelEx(&config, func, args, nullptr));
+    // The launch fills in devNode; it is only meaningful while capturing.
+    *out_dev_node = attr.value.deviceUpdatableKernelNode.devNode;
+    return;
+  }
+
   AT_CUDA_DRIVER_CHECK(nvrtc().cuLaunchKernel(
       func,
       gridX,
@@ -513,7 +549,8 @@ PyObject* launch_kernel_inner(
       numWarps,
       sharedMemBytes,
       kernelArgs.data(),
-      cudaStream);
+      cudaStream,
+      /*out_dev_node=*/nullptr);
   Py_RETURN_NONE;
 }
 
@@ -542,7 +579,8 @@ PyObject* launch_kernel_slow(
       numWarps,
       sharedMemBytes,
       kernelArgs.data(),
-      cudaStream);
+      cudaStream,
+      /*out_dev_node=*/nullptr);
   Py_RETURN_NONE;
 }
 
@@ -624,7 +662,8 @@ PyObject* launch_kernel(PyObject* self, PyObject* args) {
         numWarps,
         sharedMemBytes,
         nullptr,
-        cudaStream);
+        cudaStream,
+        /*out_dev_node=*/nullptr);
     Py_RETURN_NONE;
   } else if (num_args <= MAX_ARGS) {
     return launch_kernel_inner(
@@ -997,7 +1036,8 @@ static PyObject* fast_launcher_vectorcall(
       self->numWarps,
       self->sharedMemBytes,
       self->kernelArgs,
-      reinterpret_cast<cudaStream_t>(stream)); // NOLINT
+      reinterpret_cast<cudaStream_t>(stream), // NOLINT
+      /*out_dev_node=*/nullptr);
 
   Py_RETURN_NONE;
   END_HANDLE_TH_ERRORS
