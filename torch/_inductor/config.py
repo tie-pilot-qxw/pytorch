@@ -2079,6 +2079,27 @@ class triton:
     # Use cudagraph trees for memory pooling if `cudagraphs` is True
     cudagraph_trees = True
 
+    # DynaGraph: reuse one recorded CUDA graph across a whole interval of shapes
+    # instead of re-recording per distinct shape.
+    #
+    # The recorded graph's kernel nodes are made device-updatable at capture time,
+    # and a generated "planner" kernel, injected as the first node, recomputes each
+    # node's grid and its shape-carrying scalar arguments from the current symints.
+    # Because the graph's private memory pool sizes every buffer at capture time, a
+    # graph is recorded at the MAXIMUM shape of its interval; smaller shapes then
+    # fit inside the same allocations.
+    dynagraph: bool = (
+        os.environ.get("TORCHINDUCTOR_DYNAGRAPH", "0") == "1"
+    )
+
+    # Width of a DynaGraph shape bucket, as a ratio. 2.0 means a graph recorded at
+    # N serves shapes down to N/2. Wider buckets record fewer graphs but waste more
+    # work on the small end, since a replay always launches the grid the planner
+    # computes for the actual shape but allocates for the bucket maximum.
+    dynagraph_bucket_ratio: float = float(
+        os.environ.get("TORCHINDUCTOR_DYNAGRAPH_BUCKET_RATIO", "2.0")
+    )
+
     # Should we skip cudagraphing graphs with dynamic shape inputs
     # If False, we will re-record a graph for each unique set of shape inputs
     cudagraph_skip_dynamic_graphs = False
