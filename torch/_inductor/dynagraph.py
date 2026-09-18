@@ -435,3 +435,120 @@ def launch_planner(func: int, n_nodes: int, handles_ptr: int, ctx_ptr: int,
         block, 1, 1, 0, ctypes.c_void_p(stream), params, None)
     if rc != 0:
         raise RuntimeError(f"DynaGraph planner launch failed: {rc}")
+
+
+# --------------------------------------------------------------- safety check
+def _eval_int(expr: str, env: dict[str, int]) -> int | None:
+    """Evaluate an arithmetic expression over symbol values, or None if it is
+    not a plain arithmetic expression."""
+    try:
+        node = ast.parse(expr.strip(), mode="eval")
+    except SyntaxError:
+        return None
+
+    def go(n: ast.AST) -> int | None:
+        if isinstance(n, ast.Expression):
+            return go(n.body)
+        if isinstance(n, ast.Constant):
+            return int(n.value) if isinstance(n.value, int) else None
+        if isinstance(n, ast.Name):
+            return env.get(n.id)
+        if isinstance(n, ast.BinOp):
+            a, b = go(n.left), go(n.right)
+            if a is None or b is None:
+                return None
+            o = n.op
+            if isinstance(o, ast.Add):
+                return a + b
+            if isinstance(o, ast.Sub):
+                return a - b
+            if isinstance(o, ast.Mult):
+                return a * b
+            if isinstance(o, (ast.FloorDiv, ast.Div)):
+                return a // b if b else None
+            if isinstance(o, ast.Mod):
+                return a % b if b else None
+            return None
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub):
+            v = go(n.operand)
+            return None if v is None else -v
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in (
+                "min", "max"):
+            vs = [go(a) for a in n.args]
+            if any(v is None for v in vs):
+                return None
+            return min(vs) if n.func.id == "min" else max(vs)  # type: ignore[type-var]
+        return None
+
+    return go(node)
+
+
+def _find_allocations(src: str) -> list[tuple[str, list[str], list[str]]]:
+    out = []
+    for m in re.finditer(r"(\w+)\s*=\s*empty_strided_cuda\(", src):
+        name, i = m.group(1), m.end()
+        depth, j = 1, i
+        while j < len(src) and depth:
+            if src[j] == "(":
+                depth += 1
+            elif src[j] == ")":
+                depth -= 1
+            j += 1
+        args = _split_args(src[i : j - 1])
+        if len(args) < 2:
+            continue
+        def tup(a: str) -> list[str]:
+            a = a.strip()
+            return _split_args(a[1:-1]) if a.startswith("(") else []
+        out.append((name, tup(args[0]), tup(args[1])))
+    return out
+
+
+def buffers_are_monotonic(
+    source_code: str, symbols: list[str], record_at: int, probes: int = 24
+) -> tuple[bool, str]:
+    """Check that recording at ``record_at`` allocates enough for every smaller shape.
+
+    Recording one graph for a whole interval rests on an assumption that is easy
+    to leave unstated: every buffer's footprint must be non-decreasing in the
+    symints. If some buffer were larger at a *smaller* shape it would run past the
+    extent fixed for it at capture time and quietly corrupt its neighbour, with no
+    error raised.
+
+    Most size expressions are sums and products with positive coefficients and are
+    monotonic for that reason, but floor division and min/max can break it, so this
+    is checked rather than assumed. A negative result is not fatal: the caller
+    falls back to recording per shape, which is what PyTorch does today, so a
+    violated assumption costs performance and not correctness.
+
+    Note this samples rather than proves. It is a guard against the common cases,
+    not a decision procedure.
+    """
+    allocs = _find_allocations(source_code)
+    if not allocs:
+        return True, ""
+
+    if record_at <= 1:
+        return True, ""
+    step = max(1, record_at // probes)
+    shapes = sorted({record_at, 1, *range(1, record_at, step)})
+
+    for name, sizes, strides in allocs:
+        spans = []
+        for m in shapes:
+            env = dict.fromkeys(symbols, m)
+            sz = [_eval_int(e, env) for e in sizes]
+            st = [_eval_int(e, env) for e in strides]
+            if any(v is None for v in sz) or any(v is None for v in st):
+                spans = []
+                break  # cannot evaluate; do not claim anything about this buffer
+            spans.append((m, 1 + sum((a - 1) * b for a, b in zip(sz, st))))
+        if not spans:
+            continue
+        at_max = next(s for m, s in spans if m == record_at)
+        worst_m, worst = max(spans, key=lambda p: p[1])
+        if worst > at_max:
+            return False, (
+                f"buffer {name} needs {worst} elements at shape {worst_m} but only "
+                f"{at_max} would be allocated at the recording shape {record_at}")
+    return True, ""
