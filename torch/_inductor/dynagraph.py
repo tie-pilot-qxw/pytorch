@@ -213,7 +213,17 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
             for i, nm in enumerate(args)
             if scalar.get(nm) and i < len(pos)
         }
-        offsets = {nm: _param_info(func, args.index(nm)) for nm in exprs}
+        # Pointer arguments are recorded too, by the buffer name they carry. They
+        # are what the arena re-layout patches: which buffers share storage is
+        # fixed at compile time, but where each one sits is not, once the sizes
+        # are only known at replay.
+        ptrs = {
+            nm: pos[i].strip()
+            for i, nm in enumerate(args)
+            if not scalar.get(nm) and i < len(pos)
+        }
+        offsets = {nm: _param_info(func, args.index(nm))
+                   for nm in list(exprs) + list(ptrs)}
         if any(v is None for v in offsets.values()):
             return None, None
 
@@ -225,7 +235,8 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
                 return None, None
 
         kernels.append(dict(gname=gname, name=meta.get("kernel_name", gname),
-                            exprs=exprs, offsets=offsets, blocks=blocks, grid=grid))
+                            exprs=exprs, ptrs=ptrs, offsets=offsets,
+                            blocks=blocks, grid=grid))
 
     # launch order == order of the .run( call sites in the wrapper
     order = {k["gname"]: source_code.find(f"{k['gname']}.run(") for k in kernels}
@@ -307,7 +318,9 @@ __device__ __forceinline__ int64_t dg_eval(int32_t k, const int64_t* __restrict_
 // which silently corrupts the tail block.
 extern "C" __global__ void dynagraph_planner(
     const cudaGraphDeviceNode_t* __restrict__ handles,
-    const int64_t* __restrict__ ctx)
+    const int64_t* __restrict__ ctx,
+    char* __restrict__ arena,
+    const int64_t* __restrict__ slot_off)
 {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= /*@N@*/) return;
@@ -331,11 +344,23 @@ extern "C" __global__ void dynagraph_planner(
 /*@PARAMS@*/
     default: break;
   }
+
+  // Repoint buffer arguments into the arena. Needed whenever no single shape
+  // dominates the interval: with a fixed total split over a varying number of
+  // samples, one buffer grows as another shrinks, so recording at a maximum
+  // cannot cover both and the layout has to be redone per replay.
+  if (arena != nullptr) {
+    switch (i) {
+/*@PTRS@*/
+      default: break;
+    }
+  }
 }
 """
 
 
-def generate_planner(kernels: list[dict[str, Any]], symbols: list[str]) -> str:
+def generate_planner(kernels: list[dict[str, Any]], symbols: list[str],
+                     slot_of: dict[str, int] | None = None) -> str:
     sym_index = {s: i for i, s in enumerate(symbols)}
     exprs: list[str] = []
 
@@ -383,6 +408,7 @@ def generate_planner(kernels: list[dict[str, Any]], symbols: list[str]) -> str:
         ("/*@N@*/", str(len(kernels))),
         ("/*@GRID@*/", "\n".join(grid_cases)),
         ("/*@PARAMS@*/", "\n".join(param_cases)),
+        ("/*@PTRS@*/", generate_pointer_patches(kernels, slot_of or {})),
     ):
         out = out.replace(tag, val)
     return out
@@ -483,7 +509,7 @@ def _eval_int(expr: str, env: dict[str, int]) -> int | None:
     return go(node)
 
 
-def _find_allocations(src: str) -> list[tuple[str, list[str], list[str]]]:
+def _find_allocations(src: str) -> list[tuple[str, list[str], list[str], str]]:
     out = []
     for m in re.finditer(r"(\w+)\s*=\s*empty_strided_cuda\(", src):
         name, i = m.group(1), m.end()
@@ -500,7 +526,8 @@ def _find_allocations(src: str) -> list[tuple[str, list[str], list[str]]]:
         def tup(a: str) -> list[str]:
             a = a.strip()
             return _split_args(a[1:-1]) if a.startswith("(") else []
-        out.append((name, tup(args[0]), tup(args[1])))
+        dtype = args[2].strip() if len(args) > 2 else "torch.float32"
+        out.append((name, tup(args[0]), tup(args[1]), dtype))
     return out
 
 
@@ -533,7 +560,7 @@ def buffers_are_monotonic(
     step = max(1, record_at // probes)
     shapes = sorted({record_at, 1, *range(1, record_at, step)})
 
-    for name, sizes, strides in allocs:
+    for name, sizes, strides, _dtype in allocs:
         spans = []
         for m in shapes:
             env = dict.fromkeys(symbols, m)
@@ -552,3 +579,148 @@ def buffers_are_monotonic(
                 f"buffer {name} needs {worst} elements at shape {worst_m} but only "
                 f"{at_max} would be allocated at the recording shape {record_at}")
     return True, ""
+
+
+# --------------------------------------------------------------- arena layout
+def plan_slots(
+    lifetimes: dict[str, tuple[int, int]], allocated: list[str]
+) -> tuple[list[int], int]:
+    """Assign each allocated buffer to a slot; buffers sharing a slot never overlap.
+
+    Which buffers may share storage is fixed at compile time, because the
+    allocation order and the lifetimes are properties of the schedule and do not
+    change with shape. Only the size of each slot varies at runtime. That split is
+    what keeps the device side cheap: a slot's size is the maximum over the buffers
+    assigned to it, and the offsets are a prefix sum, so the runtime work is one
+    O(number of slots) sweep rather than general allocation.
+
+    Lifetimes form an interval graph, for which colouring greedily in order of
+    start time is optimal, so this uses the minimum number of slots.
+
+    Returns (slot index per buffer in ``allocated`` order, slot count).
+    """
+    order = sorted(range(len(allocated)),
+                   key=lambda i: lifetimes.get(allocated[i], (0, 0))[0])
+    slot_free_at: list[int] = []   # step at which each slot becomes reusable
+    assign = [0] * len(allocated)
+    for i in order:
+        start, end = lifetimes.get(allocated[i], (0, -1))
+        if end < 0:
+            end = 1 << 30          # graph output: lives past the whole schedule
+        placed = False
+        for s, free_at in enumerate(slot_free_at):
+            if free_at <= start:
+                slot_free_at[s] = end
+                assign[i] = s
+                placed = True
+                break
+        if not placed:
+            slot_free_at.append(end)
+            assign[i] = len(slot_free_at) - 1
+    return assign, len(slot_free_at)
+
+
+def buffer_size_exprs(source_code: str) -> dict[str, str]:
+    """Symbolic element-span of every ``empty_strided_cuda`` buffer, by name.
+
+    Sizes have to come from the wrapper rather than from Inductor's memory
+    planning: ``memory.compute_size_for_scheduler_buffer`` is typed as returning
+    ints and does in fact return them, already specialized with the hint value, so
+    nothing symbolic survives to that layer. The lifetimes from the same pass are
+    still usable, being independent of shape.
+
+    The span is ``1 + sum((size_i - 1) * stride_i)`` rather than the product of the
+    sizes, so that a non-contiguous layout is accounted for.
+    """
+    out: dict[str, tuple[str, int]] = {}
+    for name, sizes, strides, dtype in _find_allocations(source_code):
+        if not sizes or len(sizes) != len(strides):
+            continue
+        terms = [f"(({a}) - 1) * ({b})" for a, b in zip(sizes, strides)]
+        span = "1 + " + " + ".join(terms) if terms else "1"
+        out[name] = (span, _ITEMSIZE.get(dtype, 4))
+    return out
+
+
+# Element sizes for the dtypes Inductor emits in empty_strided_cuda calls.
+_ITEMSIZE = {
+    "torch.float32": 4, "torch.float": 4, "torch.float64": 8, "torch.double": 8,
+    "torch.float16": 2, "torch.half": 2, "torch.bfloat16": 2,
+    "torch.int64": 8, "torch.long": 8, "torch.int32": 4, "torch.int": 4,
+    "torch.int16": 2, "torch.int8": 1, "torch.uint8": 1, "torch.bool": 1,
+    "torch.float8_e4m3fn": 1, "torch.float8_e5m2": 1,
+}
+
+
+_LAYOUT_TEMPLATE = r"""
+// Recomputes the arena layout for the current shape. Separate from the planner
+// because the offsets are a prefix sum over slots, which does not fit the
+// planner's one-thread-per-node shape; both run as the first nodes of the graph.
+extern "C" __global__ void dynagraph_layout(
+    const int64_t* __restrict__ ctx, int64_t* __restrict__ slot_off)
+{
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+#define S(i) (ctx[(i)])
+  int64_t sz[/*@NSLOTS@*/];
+  for (int i = 0; i < /*@NSLOTS@*/; ++i) sz[i] = 0;
+
+  // A slot must hold the largest of the buffers assigned to it.
+/*@SLOTSIZES@*/
+
+  // 256-byte alignment, matching what the caching allocator hands out, so that
+  // vectorized accesses and TMA descriptors keep the alignment they were
+  // compiled for.
+  int64_t acc = 0;
+  for (int i = 0; i < /*@NSLOTS@*/; ++i) {
+    slot_off[i] = acc;
+    acc += (sz[i] + 255) & ~(int64_t)255;
+  }
+  slot_off[/*@NSLOTS@*/] = acc;   // total, for the caller to check against the arena
+#undef S
+}
+"""
+
+
+def generate_layout(
+    buf_sizes: dict[str, tuple[str, int]],
+    slot_of: dict[str, int],
+    n_slots: int,
+    symbols: list[str],
+) -> str:
+    sym_index = {s: i for i, s in enumerate(symbols)}
+    lines = []
+    for name, (span, itemsize) in sorted(buf_sizes.items()):
+        if name not in slot_of:
+            continue
+        c = _expr_to_c(span, sym_index)
+        lines.append(
+            f"  {{ int64_t b = ({c}) * {itemsize}; "
+            f"if (b > sz[{slot_of[name]}]) sz[{slot_of[name]}] = b; }}"
+            f"  // {name}")
+    out = _LAYOUT_TEMPLATE
+    for tag, val in (("/*@NSLOTS@*/", str(n_slots)),
+                     ("/*@SLOTSIZES@*/", "\n".join(lines))):
+        out = out.replace(tag, val)
+    return out
+
+
+def generate_pointer_patches(
+    kernels: list[dict[str, Any]], slot_of: dict[str, int]
+) -> str:
+    """Per-node ``case`` bodies that repoint each buffer argument into the arena."""
+    cases = []
+    for i, k in enumerate(kernels):
+        body = []
+        for nm, buf in (k.get("ptrs") or {}).items():
+            if buf not in slot_of:
+                continue  # an input or a graph output, not arena-managed
+            off, size = k["offsets"][nm]
+            if size != 8:
+                continue
+            body.append(
+                f"      {{ char* p = arena + slot_off[{slot_of[buf]}]; "
+                f"cudaGraphKernelNodeSetParam(handles[i], {off}, &p, 8); }}"
+                f"  // {nm} = {buf}")
+        if body:
+            cases.append(f"    case {i}:\n" + "\n".join(body) + "\n      break;")
+    return "\n".join(cases)
