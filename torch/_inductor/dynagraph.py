@@ -967,6 +967,37 @@ def _entry_source(src: str) -> str | None:
     return bodies[0]
 
 
+# Ways the wrapper launches GPU work that is not a Triton kernel this pass can
+# reach. extern_kernels is cuBLAS/cuDNN, torch.ops and aten calls are fallbacks
+# to the dispatcher, and a .item() forces a device-to-host read.
+_UNREACHABLE = re.compile(
+    r"\bextern_kernels\s*\.|\btorch\s*\.\s*ops\s*\.|(?<![\w.])aten\s*\.\w|\.item\(\)"
+)
+
+
+def unreachable_launch(src: str) -> str | None:
+    """A call in the entry function that the planner could never re-parameterize.
+
+    The handle count alone does not catch these, which is easy to get wrong: an
+    extern kernel is not a CachingAutotuner, so it never enters the kernel table,
+    and it does not go through the static launcher, so it never yields a handle.
+    It is missing from both sides at once and the counts still agree. What has
+    actually been stopping such graphs is the replay check noticing wrong
+    numbers, which is an empirical result and not a guarantee -- a node left at
+    the shape it was recorded at is exactly the silent corruption this pass is
+    supposed to refuse outright.
+    """
+    body = _entry_source(src)
+    if body is None:
+        return None
+    for line in body.splitlines():
+        code = line.split("#", 1)[0]
+        m = _UNREACHABLE.search(code)
+        if m:
+            return code.strip()[:120]
+    return None
+
+
 def _input_symbol_map(src: str) -> dict[str, int]:
     """Symbol -> index in the argument list.
 
@@ -1107,6 +1138,8 @@ class DynaGraphRunner:
             return "no-arena-outputs"
         if not self.sym_from_input:
             return "no-symbol-args"
+        if unreachable_launch(self.src):
+            return "extern-launch"
         return None
 
     def build(
@@ -1271,6 +1304,10 @@ class DynaGraphRunner:
             # so its node has no handle and the planner cannot reach it. Replaying
             # would leave that node at the recorded shape, which is silent
             # corruption rather than an error, so refuse the whole graph.
+            #
+            # The converse does not hold, which is why unreachable_launch exists:
+            # a call that bypasses the static launcher is usually missing from the
+            # kernel table too, and the two counts still agree.
             return _fallback(
                 "handle-mismatch",
                 f"{len(handles)} handles for {len(self.kernels)} kernels",
