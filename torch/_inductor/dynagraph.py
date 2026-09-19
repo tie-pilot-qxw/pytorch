@@ -137,6 +137,9 @@ def _parse_run_calls(src: str) -> dict[str, list[str]]:
 
     A kernel whose grid_type is FixedGrid additionally passes grid_0/1/2 right
     after its arguments, so the grid is recoverable the same way.
+
+    Trailing keyword arguments -- ``stream=raw_stream0`` -- are dropped, so that
+    the length of what comes back can be compared against the kernel signature.
     """
     calls: dict[str, list[str]] = {}
     for m in re.finditer(r"(\w+)\.run\(", src):
@@ -148,7 +151,10 @@ def _parse_run_calls(src: str) -> dict[str, list[str]]:
             elif src[j] == ")":
                 depth -= 1
             j += 1
-        calls[name] = _split_args(src[i : j - 1])
+        args = _split_args(src[i : j - 1])
+        while args and re.match(r"\s*\w+\s*=[^=]", args[-1]):
+            args.pop()
+        calls[name] = args
     return calls
 
 
@@ -205,6 +211,11 @@ def _is_symbolic(expr: Any) -> bool:
     return bool(expr) and bool(re.search(r"\bs\d+\b", str(expr)))
 
 
+# Constexprs the autotuner picks. Unlike a specialized scalar these never reach
+# the .run() call site, so they are excluded when lining its positionals up.
+_TUNED = ("XBLOCK", "YBLOCK", "ZBLOCK", "R0_BLOCK", "R1_BLOCK", "RBLOCK")
+
+
 def settled_blocks(obj: Any) -> dict[str, int] | None:
     """Block sizes of the one config a kernel will launch with, or None.
 
@@ -220,11 +231,7 @@ def settled_blocks(obj: Any) -> dict[str, int] | None:
     if len(launchers) != 1:
         return None
     kwargs = getattr(getattr(launchers[0], "config", None), "kwargs", None) or {}
-    return {
-        bk: kwargs[bk]
-        for bk in ("XBLOCK", "YBLOCK", "ZBLOCK", "R0_BLOCK")
-        if bk in kwargs
-    }
+    return {bk: kwargs[bk] for bk in _TUNED if bk in kwargs}
 
 
 def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
@@ -245,7 +252,25 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
             continue
         meta = obj.inductor_meta or {}
         sig = (obj.triton_meta or {}).get("signature", {})
+        constants = (obj.triton_meta or {}).get("constants", {}) or {}
+        # Two different orderings, and conflating them slides every argument
+        # after the first specialized one onto the wrong expression.
+        #
+        # `args` is the cubin's parameter list, which is what cuFuncGetParamInfo
+        # indexes: a constexpr is baked into the code and is not a parameter.
+        # `call_order` is what the wrapper actually passes to .run(), where a
+        # scalar that Inductor specialized to a constant is still present even
+        # though the signature now calls it constexpr -- only the autotuned block
+        # sizes drop out. Seen in the wild as
+        #     signature ... ks0:i64, xnumel:constexpr, r0_numel:i32 ...
+        #     .run(arg1_1, buf0, buf2, s77, 1, ..._r0_numel, stream=...)
+        # where reading r0_numel off the shorter list yields the literal 1.
         args = [k for k, v in sig.items() if v != "constexpr"]
+        call_order = [
+            k
+            for k, v in sig.items()
+            if v != "constexpr" or (k in constants and k not in _TUNED)
+        ]
         # Only integer scalars are patched. Pointers live at fixed addresses in
         # the graph's private pool; expanding their names would yield an
         # empty_strided_cuda(...) expression that merely looks shape-dependent.
@@ -267,19 +292,24 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
             return None, None  # kernel not statically launched; bail out
 
         pos = run_args.get(gname) or []
+        n_grid = 3 if meta.get("grid_type") == "FixedGrid" else 0
+        if len(call_order) != len(pos) - n_grid:
+            # Nothing here can say which positional is which, and reading them
+            # by a guessed offset is how a node ends up patched with another
+            # argument's value.
+            return None, None
+        at = {nm: call_order.index(nm) for nm in args if nm in call_order}
         exprs = {
-            nm: _resolve(pos[i], source_code, symbols)
-            for i, nm in enumerate(args)
-            if scalar.get(nm) and i < len(pos)
+            nm: _resolve(pos[at[nm]], source_code, symbols)
+            for nm in args
+            if scalar.get(nm) and nm in at
         }
         # Pointer arguments are recorded too, by the buffer name they carry. They
         # are what the arena re-layout patches: which buffers share storage is
         # fixed at compile time, but where each one sits is not, once the sizes
         # are only known at replay.
         ptrs = {
-            nm: pos[i].strip()
-            for i, nm in enumerate(args)
-            if not scalar.get(nm) and i < len(pos)
+            nm: pos[at[nm]].strip() for nm in args if not scalar.get(nm) and nm in at
         }
         offsets = {
             nm: _param_info(func, args.index(nm)) for nm in list(exprs) + list(ptrs)
@@ -291,7 +321,7 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
         if meta.get("grid_type") == "FixedGrid":
             grid = [
                 _resolve(e, source_code, symbols)
-                for e in pos[len(args) : len(args) + 3]
+                for e in pos[len(call_order) : len(call_order) + 3]
             ]
             if len(grid) != 3:
                 return None, None
@@ -1136,6 +1166,11 @@ class DynaGraphRunner:
             return "no-symbols"
         if not self.outputs:
             return "no-arena-outputs"
+        # Ahead of the symbol check, because a multi-partition wrapper has no
+        # single entry function and so reports an empty symbol map -- it would
+        # otherwise be counted under a cause that is not its own.
+        if _entry_source(self.src) is None:
+            return "multi-partition"
         if not self.sym_from_input:
             return "no-symbol-args"
         if unreachable_launch(self.src):
@@ -1362,9 +1397,32 @@ class DynaGraphRunner:
             if sym in self.sym_index:
                 self.ctx[self.sym_index[sym]] = val
 
+        # The layout has to be known before the replay, not after it. Nothing
+        # else bounds it: the arena is sized once at build from the shape that
+        # happened to arrive first, and a buffer growing faster than the input
+        # outruns the headroom -- by the time the graph's own layout node has run
+        # the kernels have already written past the end. Running the same kernel
+        # here first is what makes the check preventive, and it costs nothing
+        # extra: reading the offsets already forced this sync, it has only moved
+        # ahead of the replay. The layout node inside the graph then recomputes
+        # the same values from the same ctx.
+        _launch(
+            self.f_layout,
+            [self.ctx.data_ptr(), self.slot_off.data_ptr()],
+            1,
+            1,
+            torch.cuda.current_stream().cuda_stream,
+        )
+        offsets = self.slot_off.tolist()
+        if offsets[self.n_slots] > self.arena.numel():
+            _fallback(
+                "arena-too-small",
+                f"{offsets[self.n_slots]} > {self.arena.numel()} at {env}",
+            )
+            return None
+
         self.graph.replay()
 
-        offsets = self.slot_off.tolist()
         out = []
         for name in self.outputs:
             span, itemsize = self.sizes[name]
