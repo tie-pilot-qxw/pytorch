@@ -46,6 +46,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import ctypes
+import functools
 import logging
 import os
 import re
@@ -127,8 +128,15 @@ def _split_args(argstr: str) -> list[str]:
     return [a for a in out if a and "=" not in a.split("(")[0]]
 
 
-def _parse_run_calls(src: str) -> dict[str, list[str]]:
-    """Positional arguments of every ``<kernel>.run(...)`` in the wrapper.
+def _parse_run_calls(src: str) -> list[tuple[str, list[str]]]:
+    """Every ``<kernel>.run(...)`` in the entry function, in launch order.
+
+    A list rather than a map keyed on the kernel: a model that repeats a block
+    launches the same kernel once per block, and each launch is its own graph
+    node with its own device-updatable handle. Keying by name kept only the last
+    call site, so a twelve-block model built a table of five entries against
+    forty-eight nodes and the handle count refused the graph -- correctly, but
+    for a reason that made every repeating model look unsupported.
 
     Sizes are not named variables in general; they are inlined at the call site::
 
@@ -141,20 +149,23 @@ def _parse_run_calls(src: str) -> dict[str, list[str]]:
     Trailing keyword arguments -- ``stream=raw_stream0`` -- are dropped, so that
     the length of what comes back can be compared against the kernel signature.
     """
-    calls: dict[str, list[str]] = {}
-    for m in re.finditer(r"(\w+)\.run\(", src):
+    body = _entry_source(src)
+    if body is None:
+        return []
+    calls: list[tuple[str, list[str]]] = []
+    for m in re.finditer(r"(\w+)\.run\(", body):
         name, i = m.group(1), m.end()
         depth, j = 1, i
-        while j < len(src) and depth:
-            if src[j] == "(":
+        while j < len(body) and depth:
+            if body[j] == "(":
                 depth += 1
-            elif src[j] == ")":
+            elif body[j] == ")":
                 depth -= 1
             j += 1
-        args = _split_args(src[i : j - 1])
+        args = _split_args(body[i : j - 1])
         while args and re.match(r"\s*\w+\s*=[^=]", args[-1]):
             args.pop()
-        calls[name] = args
+        calls.append((name, args))
     return calls
 
 
@@ -243,13 +254,17 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
     """
     from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 
-    run_args = _parse_run_calls(source_code)
+    run_calls = _parse_run_calls(source_code)
     symbols = frozenset(re.findall(r"\b(s\d+)\b", source_code))
+    autotuners = {
+        nm: o for nm, o in call_globals.items() if isinstance(o, CachingAutotuner)
+    }
 
     kernels = []
-    for gname, obj in call_globals.items():
-        if not isinstance(obj, CachingAutotuner):
-            continue
+    for gname, pos in run_calls:
+        obj = autotuners.get(gname)
+        if obj is None:
+            return None, None  # a .run on something not introspectable
         meta = obj.inductor_meta or {}
         sig = (obj.triton_meta or {}).get("signature", {})
         constants = (obj.triton_meta or {}).get("constants", {}) or {}
@@ -291,7 +306,6 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
         if not func:
             return None, None  # kernel not statically launched; bail out
 
-        pos = run_args.get(gname) or []
         n_grid = 3 if meta.get("grid_type") == "FixedGrid" else 0
         if len(call_order) != len(pos) - n_grid:
             # Nothing here can say which positional is which, and reading them
@@ -310,6 +324,16 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
         # are only known at replay.
         ptrs = {
             nm: pos[at[nm]].strip() for nm in args if not scalar.get(nm) and nm in at
+        }
+        # A scalar Inductor specialized to a constant is gone from the parameter
+        # list but still sits at the call site. It needs no patch -- it is baked
+        # into the cubin -- but a grid formula built on it still has to be able
+        # to read its value, or an otherwise ordinary kernel gets refused for
+        # having "no xnumel".
+        consts = {
+            nm: pos[i].strip()
+            for i, nm in enumerate(call_order)
+            if nm not in args and i < len(pos)
         }
         offsets = {
             nm: _param_info(func, args.index(nm)) for nm in list(exprs) + list(ptrs)
@@ -331,6 +355,7 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
                 gname=gname,
                 name=meta.get("kernel_name", gname),
                 exprs=exprs,
+                consts=consts,
                 ptrs=ptrs,
                 offsets=offsets,
                 blocks=blocks,
@@ -339,9 +364,7 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
             )
         )
 
-    # launch order == order of the .run( call sites in the wrapper
-    order = {k["gname"]: source_code.find(f"{k['gname']}.run(") for k in kernels}
-    kernels.sort(key=lambda k: order[k["gname"]] if order[k["gname"]] >= 0 else 1 << 30)
+    # Already in launch order: the table is built by walking the call sites.
     return kernels, sorted(symbols)
 
 
@@ -465,6 +488,10 @@ extern "C" __global__ void dynagraph_planner(
 # Grid shapes that are a ceil-divide per axis. The other GridExpr subclasses in
 # triton_heuristics -- cooperative reductions, split scans, combo kernels --
 # derive their grid differently and are refused rather than approximated.
+# The y dimension of a launch is limited to this, which is why Inductor has a
+# grid shape that folds the overflow into z.
+_MAX_Y_GRID = 65535
+
 _GRID_AXES = {
     "Grid1D": (("xnumel", "XBLOCK"),),
     "Grid2D": (("xnumel", "XBLOCK"), ("ynumel", "YBLOCK")),
@@ -496,26 +523,50 @@ def generate_planner(
                 f"gz=dg_eval({gz},ctx); break;  // {k['name']}"
             )
         else:
-            axes = _GRID_AXES.get(k.get("grid_type") or "")
-            if axes is None:
-                raise Unsupported(
-                    f"{k['name']}: grid type {k.get('grid_type')} is not modelled"
-                )
+            gt = k.get("grid_type") or ""
             blocks = k["blocks"]
             if blocks is None:
                 raise Unsupported(f"{k['name']}: launch config has not settled")
-            parts = []
-            for axis, (numel, bk) in zip(("gx", "gy", "gz"), axes):
-                e = k["exprs"].get(numel)
+
+            def extent(numel: str, bk: str) -> tuple[int, int]:
+                # exprs holds the patchable scalars; consts holds the ones baked
+                # into the cubin, whose axis is simply fixed.
+                e = k["exprs"].get(numel) or k["consts"].get(numel)
                 if e is None or bk not in blocks:
                     raise Unsupported(f"{k['name']}: no {numel}/{bk} to size a grid")
-                blk = blocks[bk]
-                parts.append(
-                    f"{axis}=dg_floordiv(dg_eval({idx(e)},ctx) + {blk} - 1, {blk});"
+                return idx(e), blocks[bk]
+
+            if gt == "Grid2DWithYZOverflow":
+                # What Inductor actually emits for a tiled pointwise: the y tiles
+                # are folded into z once they would pass the 65535 limit on the y
+                # dimension of a launch.
+                (xe, xb), (ye, yb) = extent("xnumel", "XBLOCK"), extent(
+                    "ynumel", "YBLOCK"
                 )
-            grid_cases.append(
-                f"    case {i}: " + " ".join(parts) + f" break;  // {k['name']}"
-            )
+                grid_cases.append(
+                    f"    case {i}: {{ int64_t raw = dg_floordiv("
+                    f"dg_eval({ye},ctx) + {yb} - 1, {yb});"
+                    f" int64_t div = dg_floordiv(raw + {_MAX_Y_GRID} - 1,"
+                    f" {_MAX_Y_GRID});"
+                    f" gx = dg_floordiv(dg_eval({xe},ctx) + {xb} - 1, {xb});"
+                    f" gy = (div == 0) ? 0 : dg_floordiv(raw + div - 1, div);"
+                    f" gz = div; }} break;  // {k['name']}"
+                )
+            else:
+                axes = _GRID_AXES.get(gt)
+                if axes is None:
+                    raise Unsupported(
+                        f"{k['name']}: grid type {k.get('grid_type')} is not modelled"
+                    )
+                parts = []
+                for axis, (numel, bk) in zip(("gx", "gy", "gz"), axes):
+                    e_i, blk = extent(numel, bk)
+                    parts.append(
+                        f"{axis}=dg_floordiv(dg_eval({e_i},ctx) + {blk} - 1, {blk});"
+                    )
+                grid_cases.append(
+                    f"    case {i}: " + " ".join(parts) + f" break;  // {k['name']}"
+                )
 
         patches = []
         for nm, e in k["exprs"].items():
@@ -611,12 +662,26 @@ def launch_planner(
 
 
 # --------------------------------------------------------------- safety check
+@functools.lru_cache(maxsize=4096)
+def _parse_expr(expr: str) -> Any:
+    """Parsed form of a wrapper expression, cached.
+
+    These strings are fixed when the graph is compiled, but they are evaluated
+    once per buffer per replay; re-parsing them there measured as most of the
+    per-call cost in a launch-bound region, which is the one place this pass is
+    supposed to be saving time.
+    """
+    try:
+        return ast.parse(expr.strip(), mode="eval")
+    except SyntaxError:
+        return None
+
+
 def _eval_int(expr: str, env: dict[str, int]) -> int | None:
     """Evaluate an arithmetic expression over symbol values, or None if it is
     not a plain arithmetic expression."""
-    try:
-        node = ast.parse(expr.strip(), mode="eval")
-    except SyntaxError:
+    node = _parse_expr(expr)
+    if node is None:
         return None
 
     def go(n: ast.AST) -> int | None:
@@ -674,12 +739,23 @@ def _find_allocations(src: str) -> list[tuple[str, list[str], list[str], str]]:
         if len(args) < 2:
             continue
 
-        def tup(a: str) -> list[str]:
+        def tup(a: str) -> list[str] | None:
+            # None means "not a tuple literal, so this allocation was not
+            # understood", which is different from `()` -- a 0-d tensor, whose
+            # size and stride tuples are legitimately empty and which holds one
+            # element. Conflating the two dropped scalar buffers from the size
+            # table, and a kernel writing to one was then refused as belonging to
+            # no allocation.
             a = a.strip()
-            return _split_args(a[1:-1]) if a.startswith("(") else []
+            if not (a.startswith("(") and a.endswith(")")):
+                return None
+            return _split_args(a[1:-1])
 
+        sizes, strides = tup(args[0]), tup(args[1])
+        if sizes is None or strides is None:
+            continue
         dtype = args[2].strip() if len(args) > 2 else "torch.float32"
-        out.append((name, tup(args[0]), tup(args[1]), dtype))
+        out.append((name, sizes, strides, dtype))
     return out
 
 
@@ -808,7 +884,7 @@ def buffer_size_exprs(source_code: str) -> dict[str, tuple[str, int]]:
     """
     out: dict[str, tuple[str, int]] = {}
     for name, sizes, strides, dtype in _find_allocations(source_code):
-        if not sizes or len(sizes) != len(strides):
+        if len(sizes) != len(strides):
             continue
         terms = [f"(({a}) - 1) * ({b})" for a, b in zip(sizes, strides)]
         span = "1 + " + " + ".join(terms) if terms else "1"
@@ -1152,6 +1228,9 @@ class DynaGraphRunner:
         self.sym_from_input = _input_symbol_map(src)
         # Shapes whose replay has already been checked against eager.
         self.verified: OrderedSet[tuple[tuple[str, int], ...]] = OrderedSet()
+        # Arena offsets and output geometry per shape. Recomputing them every
+        # replay is pure overhead once a shape repeats, and shapes repeat.
+        self.plans: dict[tuple[tuple[str, int], ...], Any] = {}
         self.sym_index = {s: i for i, s in enumerate(self.symbols or [])}
 
     def unusable_reason(self) -> str | None:
@@ -1272,7 +1351,96 @@ class DynaGraphRunner:
             len(self.kernels), dtype=torch.int64, device=self.device
         )
 
-        return self._capture() and self._replays_match(env)
+        return (
+            self._capture()
+            and self._layout_agrees(env)
+            and self._replays_match(env)
+        )
+
+    def slot_offsets(self, env: dict[str, int]) -> list[int] | None:
+        """Byte offset of every slot, plus the total, computed on the host.
+
+        The same prefix sum the layout kernel does on device. Reading the device
+        copy instead costs a synchronize on every call, and in a launch-bound
+        region that synchronize is most of what the graph was supposed to save --
+        it measured as roughly a 2x regression against per-shape recording. The
+        arithmetic is therefore duplicated deliberately, and the two copies are
+        checked against each other once, at build.
+        """
+        sz = [0] * self.n_slots
+        for name, (span, itemsize) in self.sizes.items():
+            v = _eval_int(span, env)
+            if v is None:
+                return None
+            nbytes = v * itemsize
+            i = self.slot_of[name]
+            if nbytes > sz[i]:
+                sz[i] = nbytes
+        off, acc = [], 0
+        for nbytes in sz:
+            off.append(acc)
+            acc += (nbytes + 255) & ~255
+        off.append(acc)
+        return off
+
+    def _make_plan(self, env: dict[str, int]) -> list[Any] | None:
+        """Where each output lands in the arena at this shape, or None to retire."""
+        import torch
+
+        offsets = self.slot_offsets(env)
+        if offsets is None:
+            _fallback("unevaluable-size", f"at {env}")
+            return None
+        if offsets[self.n_slots] > self.arena.numel():
+            _fallback(
+                "arena-too-small",
+                f"{offsets[self.n_slots]} > {self.arena.numel()} at {env}",
+            )
+            return None
+
+        plan = []
+        for name in self.outputs:
+            span, itemsize = self.sizes[name]
+            sizes_e, strides_e, dtype_name = self.layouts[name]
+            vals = [_eval_int(e, env) for e in (span, *sizes_e, *strides_e)]
+            if any(v is None for v in vals):
+                _fallback("unevaluable-size", f"output {name} at {env}")
+                return None
+            ints = [v for v in vals if v is not None]
+            n, rest = ints[0], ints[1:]
+            plan.append(
+                (
+                    offsets[self.slot_of[name]],
+                    n * itemsize,
+                    getattr(torch, dtype_name.split(".")[-1]),
+                    rest[: len(sizes_e)],
+                    rest[len(sizes_e) :],
+                )
+            )
+        return plan
+
+    def _layout_agrees(self, env: dict[str, int]) -> bool:
+        """Host prefix sum matches what the layout kernel computes."""
+        import torch
+
+        want = self.slot_offsets(env)
+        if want is None:
+            return _fallback("unevaluable-size", f"at {env}")
+        for sym, val in env.items():
+            if sym in self.sym_index:
+                self.ctx[self.sym_index[sym]] = val
+        _launch(
+            self.f_layout,
+            [self.ctx.data_ptr(), self.slot_off.data_ptr()],
+            1,
+            1,
+            torch.cuda.current_stream().cuda_stream,
+        )
+        torch.cuda.synchronize()
+        got = self.slot_off.tolist()
+        if got != want:
+            return _fallback("layout-mismatch", f"host {want} vs device {got}")
+        return True
 
     def _warmup(self) -> None:
         import torch
@@ -1397,49 +1565,32 @@ class DynaGraphRunner:
             if sym in self.sym_index:
                 self.ctx[self.sym_index[sym]] = val
 
-        # The layout has to be known before the replay, not after it. Nothing
-        # else bounds it: the arena is sized once at build from the shape that
-        # happened to arrive first, and a buffer growing faster than the input
-        # outruns the headroom -- by the time the graph's own layout node has run
-        # the kernels have already written past the end. Running the same kernel
-        # here first is what makes the check preventive, and it costs nothing
-        # extra: reading the offsets already forced this sync, it has only moved
-        # ahead of the replay. The layout node inside the graph then recomputes
-        # the same values from the same ctx.
-        _launch(
-            self.f_layout,
-            [self.ctx.data_ptr(), self.slot_off.data_ptr()],
-            1,
-            1,
-            torch.cuda.current_stream().cuda_stream,
-        )
-        offsets = self.slot_off.tolist()
-        if offsets[self.n_slots] > self.arena.numel():
-            _fallback(
-                "arena-too-small",
-                f"{offsets[self.n_slots]} > {self.arena.numel()} at {env}",
-            )
-            return None
+        # Computed here rather than read back from the device: the layout node
+        # inside the graph writes the same numbers, but reading them would mean a
+        # synchronize per call. Doing it on the host also makes the bound check
+        # preventive -- by the time the graph's layout node has run, the kernels
+        # that would overrun the arena have already run too.
+        plan = self.plans.get(key)
+        if plan is None:
+            plan = self._make_plan(env)
+            if plan is None:
+                return None
+            # Capped: the workloads this targets have long-tailed shape
+            # distributions, so the number of distinct shapes is not bounded by
+            # anything. Dropping the table is fine -- it is a cache, and the
+            # shapes that recur will refill it.
+            if len(self.plans) >= 4096:
+                self.plans.clear()
+            self.plans[key] = plan
 
         self.graph.replay()
 
         out = []
-        for name in self.outputs:
-            span, itemsize = self.sizes[name]
-            sizes_e, strides_e, dtype_name = self.layouts[name]
-            vals = [_eval_int(e, env) for e in (span, *sizes_e, *strides_e)]
-            ints = [v for v in vals if v is not None]
-            if len(ints) != len(vals):
-                raise RuntimeError(f"DynaGraph cannot size output {name}")
-            n, rest = ints[0], ints[1:]
-            sizes, strides = rest[: len(sizes_e)], rest[len(sizes_e) :]
-            base = offsets[self.slot_of[name]]
-            # The layout kernel keeps every slot 256-byte aligned, so viewing the
-            # byte arena as the buffer dtype is always legal. as_strided keeps the
+        for base, nbytes, dtype, sizes, strides in plan:
+            # The layout keeps every slot 256-byte aligned, so viewing the byte
+            # arena as the buffer dtype is always legal. as_strided keeps the
             # storage offset of the slice it is called on.
-            flat = self.arena[base : base + n * itemsize].view(
-                getattr(torch, dtype_name.split(".")[-1])
-            )
+            flat = self.arena[base : base + nbytes].view(dtype)
             out.append(flat.as_strided(sizes, strides))
 
         if ref is not None:
