@@ -487,12 +487,13 @@ def cudagraphify_impl(
                     out is dg_rebuild
                     and dynagraph_rebuilds < config.triton.dynagraph_rebuilds
                 ):
-                    # The region was built on a smaller shape than this one,
-                    # or a static input it reads in place has moved (a forward
-                    # rebuilt on a larger shape hands its backward saved
-                    # activations from a new arena). Build again here, so this
-                    # call sizes the storage and fixes the addresses, and serve
-                    # from the new runner; the old one is dropped.
+                    # Under a fixed arena layout the region was built on a
+                    # smaller shape than this one, or a static input it reads
+                    # in place has moved to an unaligned address. Build again
+                    # here, so this call sizes the storage and fixes the
+                    # addresses, and serve from the new runner; the old one is
+                    # dropped. (The dynamic layout grows instead and never
+                    # asks for this.)
                     dynagraph_rebuilds += 1
                     dynagraph_runner = _maybe_build_dynagraph(
                         model, inputs, kwargs, static_input_idxs

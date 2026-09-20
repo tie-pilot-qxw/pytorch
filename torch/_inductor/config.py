@@ -2092,29 +2092,56 @@ class triton:
     # one buffer grow as another shrinks.
     dynagraph: bool = os.environ.get("TORCHINDUCTOR_DYNAGRAPH", "0") == "1"
 
-    # How much spare room DynaGraph leaves in each arena slot and in the storage
-    # holding graph inputs, as a multiple of what the recorded shape needs. Slot
-    # offsets are fixed at build so buffer pointers are patched once rather than
-    # on every replay, and inputs cannot move once the graph is captured; the
-    # recorded shape is just whichever one arrived first -- so a shape needing
-    # more than this in any one slot retires the region and recording resumes.
+    # How DynaGraph lays its arena out. "dynamic": per shape, from the symbol
+    # values (each slot is the largest buffer assigned to it, offsets a prefix
+    # sum), so memory is the maximum over shapes of the live total -- a packed
+    # batch whose per-sample lengths shift under a fixed sum costs what one
+    # shape costs -- and the arena grows to the largest total seen. Buffer
+    # pointers are then re-patched on every shape change (free on the host
+    # path, one runtime call per moved pointer on the device path). "fixed":
+    # slot offsets chosen at build with `dynagraph_headroom`, pointers patched
+    # once per graph; memory is the sum of per-slot maxima, and a shape that
+    # outgrows a slot rebuilds the region (`dynagraph_rebuilds`).
+    dynagraph_layout: Literal["dynamic", "fixed"] = os.environ.get(  # type: ignore[assignment]
+        "TORCHINDUCTOR_DYNAGRAPH_LAYOUT", "dynamic"
+    )
+
+    # Under the dynamic layout, how much larger than needed the arena is made
+    # when it grows (1.0: exactly what the shape needs; every new largest
+    # total is one reallocation and, for a region with extern child sites,
+    # a fresh harvest of the shapes that recur).
+    dynagraph_grow: float = float(os.environ.get("TORCHINDUCTOR_DYNAGRAPH_GROW", "1.0"))
+
+    # Fixed layout only: spare room in each arena slot as a multiple of what
+    # the recorded shape needs. The recorded shape is whichever arrived first,
+    # so a shape needing more than this in any one slot rebuilds the region.
     dynagraph_headroom: float = float(
         os.environ.get("TORCHINDUCTOR_DYNAGRAPH_HEADROOM", "2.0")
     )
 
-    # Headroom for storage whose size carries an unbacked symbol (a boolean
-    # mask's row count, a nonzero): such a value has no largest-first order
-    # a caller could offer, so a later, larger one rebuilds the region;
-    # more room up front means fewer rebuilds.
+    # Fixed layout only: headroom for a slot whose size carries an unbacked
+    # symbol (a boolean mask's row count, a nonzero): such a value has no
+    # largest-first order a caller could offer, so more room up front means
+    # fewer rebuilds.
     dynagraph_unbacked_headroom: float = float(
         os.environ.get("TORCHINDUCTOR_DYNAGRAPH_UNBACKED_HEADROOM", "4.0")
     )
 
-    # How many times a DynaGraph region may be rebuilt on a shape that outgrew
-    # the storage it was built with, before such shapes are simply recorded the
-    # ordinary way. Each rebuild costs one recording and a planner build.
+    # How many times a DynaGraph region may be rebuilt (a fixed-layout slot
+    # outgrown, a static input moved to an unaligned address) before such
+    # shapes are simply recorded the ordinary way. Each rebuild costs one
+    # recording and a planner build.
     dynagraph_rebuilds: int = int(
         os.environ.get("TORCHINDUCTOR_DYNAGRAPH_REBUILDS", "3")
+    )
+
+    # How many graphs a region keeps for extern sites whose node topology
+    # varies with the shape (cuDNN conv tiers by batch, cuBLAS splitK by M):
+    # under host-side selection one per combination of topologies met, the
+    # least recently used dropped past this; under SWITCH the bodies per site
+    # and the re-captures. A budget of this module, not a driver limit.
+    dynagraph_max_graphs: int = int(
+        os.environ.get("TORCHINDUCTOR_DYNAGRAPH_MAX_GRAPHS", "8")
     )
 
     # How many distinct shapes a DynaGraph region is checked against eager before
