@@ -2102,6 +2102,14 @@ class triton:
         os.environ.get("TORCHINDUCTOR_DYNAGRAPH_HEADROOM", "2.0")
     )
 
+    # Headroom for storage whose size carries an unbacked symbol (a boolean
+    # mask's row count, a nonzero): such a value has no largest-first order
+    # a caller could offer, so a later, larger one rebuilds the region;
+    # more room up front means fewer rebuilds.
+    dynagraph_unbacked_headroom: float = float(
+        os.environ.get("TORCHINDUCTOR_DYNAGRAPH_UNBACKED_HEADROOM", "4.0")
+    )
+
     # How many times a DynaGraph region may be rebuilt on a shape that outgrew
     # the storage it was built with, before such shapes are simply recorded the
     # ordinary way. Each rebuild costs one recording and a planner build.
