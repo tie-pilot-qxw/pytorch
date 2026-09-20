@@ -524,7 +524,21 @@ extern "C" __global__ void dynagraph_setctx(int64_t* __restrict__ ctx/*@SETCTX_P
 {
   if (blockIdx.x != 0 || threadIdx.x != 0) return;
 /*@SETCTX_BODY@*/
+  // The arena layout for this shape: each slot is the largest buffer assigned
+  // to it, offsets are a prefix sum kept 256-byte aligned, the total last.
+  // Under a fixed layout these are the constants the build chose.
+  {
+    int64_t acc = 0, m;
+    (void)acc; (void)m;
+/*@LAYOUT@*/
+  }
 }
+
+// The arena base and the slot offsets live in ctx (written by setctx), so a
+// grown arena is a new value in the next setctx launch, not a new graph.
+#define ARENA ((char*)ctx[/*@ARENA@*/])
+#define SLOT_OFF(k) (ctx[/*@OFF0@*/ + (k)])
+#define LASTP(j) (ctx[/*@LASTP0@*/ + (j)])
 
 // One thread per node. Both the grid and the shape-carrying scalar arguments
 // must be updated: a stale grid launches the wrong number of blocks, while stale
@@ -532,9 +546,7 @@ extern "C" __global__ void dynagraph_setctx(int64_t* __restrict__ ctx/*@SETCTX_P
 // which silently corrupts the tail block.
 extern "C" __global__ void dynagraph_planner(
     const cudaGraphDeviceNode_t* __restrict__ handles,
-    int64_t* __restrict__ ctx,
-    char* __restrict__ arena,
-    const int64_t* __restrict__ slot_off)
+    int64_t* __restrict__ ctx)
 {
   // Last slot of ctx is the host's answer to "did the shape change since the
   // replay before this one". Patching is idempotent, so repeating it for an
@@ -610,11 +622,12 @@ extern "C" __global__ void dynagraph_planner(
   // Repoint buffer arguments into the arena. Needed whenever no single shape
   // dominates the interval: with a fixed total split over a varying number of
   // samples, one buffer grows as another shrinks, so recording at a maximum
-  // cannot cover both and the layout has to be redone per replay.
-  // Slot offsets are fixed, so these only need writing once after capture.
-  // The host raises the flag then and clears it after the first replay; the
-  // bisect of the real 48-node planner put these at half its cost.
-  if (arena != nullptr && ctx[/*@PTRDIRTY@*/] != 0) {
+  // cannot cover both and the layout is redone per shape. Each argument
+  // remembers the address it was last set to (LASTP), and only one that
+  // moved costs a runtime call: under a fixed layout that is once after the
+  // capture, under the dynamic layout it is the slots the shape shifted. The
+  // bisect of the real 48-node planner put these calls at half its cost.
+  if (ctx[/*@ARENA@*/] != 0 && (ctx[/*@NSYM@*/] != 0 || ctx[/*@PTRDIRTY@*/] != 0)) {
     switch (i) {
 /*@PTRS@*/
       default: break;
@@ -790,6 +803,8 @@ def generate_planner(
     views: dict[str, Any] | None = None,
     itemsize_of: dict[str, int] | None = None,
     input_addr: dict[int, int] | None = None,
+    sizes: dict[str, tuple[str, int]] | None = None,
+    fixed_off: Sequence[int] | None = None,
 ) -> str:
     """The device-side planner: CUDA source with a kernel that patches the graph.
 
@@ -799,9 +814,14 @@ def generate_planner(
     extern-output, offset-view and in-place-input arguments per run. The
     generated `case` bodies come from the same kernel table the host patcher
     reads, so the two paths agree by construction.
+
+    `sizes` (element span and item size per buffer) with `slot_of` is what
+    the `setctx` kernel lays the arena out from on every shape; `fixed_off`
+    instead bakes a layout chosen at build (`dynagraph_layout="fixed"`).
     """
     n_ext = n_sites if n_ext is None else n_ext
     n_in = len(argv) if argv else 0
+    n_slots = (max(slot_of.values()) + 1) if slot_of else 0
     sym_index = {s: i for i, s in enumerate(symbols)}
     exprs: list[str] = []
 
@@ -927,8 +947,37 @@ def generate_planner(
     # argument position (only the patched ones are ever read).
     in0 = body0 + 2 * n_sites
     indirty = in0 + n_in
+    # Then the arena base, the slot offsets with the total, and the address
+    # each arena pointer argument was last set to (`ctx_layout`).
+    arena_i, off0, lastp0 = ctx_layout(
+        n_sym, len(kernels), n_ext, n_sites, n_in, n_slots
+    )
     v_in = n_sym + 1 + n_ext + n_sites
-    n_vals = v_in + 1 + n_in
+    n_vals = v_in + 1 + n_in + 1
+    # Generated before the EXPRS table is joined: it registers expressions.
+    layout_lines = []
+    if slot_of:
+        if fixed_off is not None:
+            layout_lines = [
+                f"    ctx[{off0 + slot}] = {int(v)};"
+                for slot, v in enumerate(fixed_off)
+            ]
+        else:
+            per_slot: dict[int, list[str]] = {}
+            for name, (span, item) in (sizes or {}).items():
+                if name in slot_of:
+                    per_slot.setdefault(slot_of[name], []).append(
+                        f"dg_eval({idx(span)},ctx) * {int(item)}"
+                    )
+            for slot in range(n_slots):
+                terms = per_slot.get(slot, ["0"])
+                layout_lines.append(f"    m = {terms[0]};")
+                for t in terms[1:]:
+                    layout_lines.append(f"    {{ int64_t v = {t}; if (v > m) m = v; }}")
+                layout_lines.append(
+                    f"    ctx[{off0 + slot}] = acc; acc += (m + 255) & ~(int64_t)255;"
+                )
+            layout_lines.append(f"    ctx[{off0 + n_slots}] = acc;")
     view_cases = generate_view_pointer_patches(
         kernels,
         slot_of,
@@ -950,6 +999,10 @@ def generate_planner(
         + [f"  ctx[{body0 + t}] = v{n_sym + 1 + n_ext + t};" for t in range(n_sites)]
         + [f"  ctx[{indirty}] = v{v_in};"]
         + [f"  ctx[{in0 + j}] = v{v_in + 1 + j};" for j in range(n_in)]
+        + [f"  ctx[{arena_i}] = v{n_vals - 1};"]
+    )
+    ptr_cases, _n_ptr = generate_pointer_patches(
+        kernels, slot_of, alias, input_bufs, extern_out_of, views
     )
     out = _PLANNER_TEMPLATE
     # Substituted rather than %-formatted: the generated C contains the modulo
@@ -969,6 +1022,10 @@ def generate_planner(
         ("/*@BODY0@*/", str(body0)),
         ("/*@COND0@*/", str(body0 + n_sites)),
         ("/*@INDIRTY@*/", str(indirty)),
+        ("/*@ARENA@*/", str(arena_i)),
+        ("/*@OFF0@*/", str(off0)),
+        ("/*@LASTP0@*/", str(lastp0)),
+        ("/*@LAYOUT@*/", "\n".join(layout_lines)),
         (
             "/*@INPTRS@*/",
             generate_input_pointer_patches(
@@ -977,12 +1034,7 @@ def generate_planner(
         ),
         ("/*@GRID@*/", "\n".join(grid_cases)),
         ("/*@PARAMS@*/", "\n".join(param_cases)),
-        (
-            "/*@PTRS@*/",
-            generate_pointer_patches(
-                kernels, slot_of, alias, input_bufs, extern_out_of, views
-            ),
-        ),
+        ("/*@PTRS@*/", ptr_cases),
         ("/*@VIEWPTRS@*/", view_cases),
         (
             "/*@EXTPTRS@*/",
@@ -1013,6 +1065,7 @@ _HOST_TEMPLATE = r"""
 #define NSITE /*@NSITE@*/
 #define NEXT /*@NEXT@*/
 #define NIN /*@NIN@*/
+#define NSLOT /*@NSLOT@*/
 
 static int g_dg_err = 0;
 
@@ -1025,6 +1078,16 @@ static inline int64_t dg_mod(int64_t a, int64_t b) {
 static inline int64_t dg_min(int64_t a, int64_t b) { return a < b ? a : b; }
 static inline int64_t dg_max(int64_t a, int64_t b) { return a > b ? a : b; }
 #define S(i) (syms[(i)])
+
+// The arena layout for this shape, the same arithmetic as the planner's
+// setctx and the Python side: each slot is the largest buffer assigned to
+// it, offsets are a prefix sum kept 256-byte aligned, the total last. Under
+// a fixed layout these are the constants the build chose.
+static inline void dg_layout(const int64_t* syms, int64_t* slot_off) {
+  int64_t acc = 0, m;
+  (void)acc; (void)m; (void)syms; (void)slot_off;
+/*@LAYOUT@*/
+}
 
 struct Node {
   CUgraphNode node;
@@ -1118,26 +1181,31 @@ extern "C" void dg_free(void* h) { delete (Exec*)h; }
 // One call per replay. Returns 0, or 1 + node index / 1000 + site index /
 // 2000 for the launch, of the call that failed. Every node compares what it
 // holds with what this call asks for and is only updated when something
-// differs: a node whose grid and arguments carry no symbol and read no
-// patched input is never touched after its buffer pointers are written
-// (ptr_dirty, once per exec). Inputs read by address (`in`, per argument
-// position; null where the input is copied or static) are patched into the
-// nodes that read them when their address moved. With `launch`, the exec is
-// launched on `stream` at the end -- the whole step is this one call.
+// differs: a node whose grid and arguments carry no symbol, whose buffers
+// the layout did not move and which reads no moved input is not touched
+// (`ptr_dirty` forces every node once, after a capture). Inputs are read
+// through `in` (one address per argument position: the input's own storage
+// when it is read in place, the copy held by the region otherwise; null
+// where nothing is known) and patched into the nodes that read them when
+// the address moved. With `launch`, the exec is launched on `stream` at the
+// end -- the whole step is this one call.
 extern "C" int dg_step(void* h, const int64_t* syms, int ptr_dirty, char* arena,
-                       const int64_t* slot_off, const char* const* ext,
-                       const CUgraph* child, const char* const* in,
-                       void* stream, int launch) {
+                       const char* const* ext, const CUgraph* child,
+                       const char* const* in, void* stream, int launch) {
   Exec* e = (Exec*)h;
   CUresult rc;
+  int64_t slot_off[NSLOT + 1];
+  dg_layout(syms, slot_off);
   bool in_changed[NIN > 0 ? NIN : 1];
   for (int i = 0; i < NIN; ++i) {
     in_changed[i] = in != nullptr && in[i] != nullptr && in[i] != e->last_in[i];
     if (in_changed[i]) e->last_in[i] = in[i];
   }
   (void)in_changed;
+  // `ptr_dirty` also forces the children: after a re-harvest the new graph
+  // may have been given the handle value the destroyed one had.
   for (int s = 0; s < NSITE; ++s) {
-    if (child && child[s] && child[s] != e->child[s] && e->cnodes[s]) {
+    if (child && child[s] && (ptr_dirty || child[s] != e->child[s]) && e->cnodes[s]) {
       rc = cuGraphExecChildGraphNodeSetParams(e->ex, e->cnodes[s], child[s]);
       if (rc != CUDA_SUCCESS) { g_dg_err = rc; return 1000 + s; }
       e->child[s] = child[s];
@@ -1179,12 +1247,39 @@ def generate_host_patcher(
     views: dict[str, Any] | None = None,
     itemsize_of: dict[str, int] | None = None,
     input_addr: dict[int, int] | None = None,
+    sizes: dict[str, tuple[str, int]] | None = None,
+    fixed_off: Sequence[int] | None = None,
 ) -> str:
     """The host-side counterpart of `generate_planner`: same tables, C++ on the
     host through `cuGraphExecKernelNodeSetParams` instead of a kernel on the
     device through the device graph update API. `patch_inputs` are the
-    argument positions read through their own address rather than copied."""
+    argument positions whose readers take the address from the per-call
+    table. `sizes` with `slot_of` gives the per-shape arena layout;
+    `fixed_off` bakes one chosen at build."""
     sym_index = {s: i for i, s in enumerate(symbols)}
+    n_slots = (max(slot_of.values()) + 1) if slot_of else 0
+    layout_lines = []
+    if slot_of:
+        if fixed_off is not None:
+            layout_lines = [
+                f"  slot_off[{slot}] = {int(v)};" for slot, v in enumerate(fixed_off)
+            ]
+        else:
+            per_slot: dict[int, list[str]] = {}
+            for name, (span, item) in (sizes or {}).items():
+                if name in slot_of:
+                    per_slot.setdefault(slot_of[name], []).append(
+                        f"({_expr_to_c(span, sym_index)}) * {int(item)}"
+                    )
+            for slot in range(n_slots):
+                terms = per_slot.get(slot, ["0"])
+                layout_lines.append(f"  m = {terms[0]};")
+                for t in terms[1:]:
+                    layout_lines.append(f"  {{ int64_t v = {t}; if (v > m) m = v; }}")
+                layout_lines.append(
+                    f"  slot_off[{slot}] = acc; acc += (m + 255) & ~(int64_t)255;"
+                )
+            layout_lines.append(f"  slot_off[{n_slots}] = acc;")
     alias = alias or {}
     extern_out_of = extern_out_of or {}
     argv = argv or {}
@@ -1347,8 +1442,8 @@ def generate_host_patcher(
                     f"{k['name']} argument {nm} is {raw}, which no allocation owns"
                 )
             lines.append(
-                f"  if (ptr_dirty) *(char**)(nd->buf.data() + {off}) = arena + slot_off[{slot_of[buf]}];"
-                f"  // {nm} = {buf}"
+                f"  {{ char* p = arena + slot_off[{slot_of[buf]}]; char** at = (char**)(nd->buf.data() + {off});"
+                f" if (*at != p) {{ *at = p; touched = true; }} }}  // {nm} = {buf}"
             )
         lines.append(
             "  if (touched && !zero) { rc = cuGraphExecKernelNodeSetParams(e->ex, nd->node, &nd->p);"
@@ -1368,6 +1463,8 @@ def generate_host_patcher(
         ("/*@NSITE@*/", str(n_sites)),
         ("/*@NEXT@*/", str(n_sites if n_ext is None else n_ext)),
         ("/*@NIN@*/", str(len(argv))),
+        ("/*@NSLOT@*/", str(n_slots)),
+        ("/*@LAYOUT@*/", "\n".join(layout_lines)),
         ("/*@NODES@*/", "\n".join(blocks_of)),
     ):
         out = out.replace(tag, val)
@@ -1436,16 +1533,15 @@ def _compile_host(src: str) -> Any:
     lib.dg_free.argtypes = [ctypes.c_void_p]
     lib.dg_step.restype = ctypes.c_int
     lib.dg_step.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_int,
+        ctypes.c_void_p,  # exec state
+        ctypes.c_void_p,  # symbol values
+        ctypes.c_int,  # pointers dirty
+        ctypes.c_void_p,  # arena base
+        ctypes.c_void_p,  # extern slot addresses
+        ctypes.c_void_p,  # child graphs
+        ctypes.c_void_p,  # input addresses
+        ctypes.c_void_p,  # stream
+        ctypes.c_int,  # launch
     ]
     _host_lib_cache[src] = lib
     return lib
@@ -1467,27 +1563,33 @@ def compile_planner(src: str, arch: str | None = None) -> int | None:
     return got[0] if got else None
 
 
+def ctx_layout(
+    n_sym: int, n_k: int, n_ext: int, n_sites: int, n_in: int, n_slots: int
+) -> tuple[int, int, int]:
+    """Where the arena base, the slot offsets and the last-set pointer
+    addresses sit in a planner's ctx: past the symbols, the two flags, the
+    node states, the extern slots, the SWITCH bodies and handles, the input
+    addresses and the "inputs moved" flag. Returns (arena, off0, lastp0);
+    `lastp0` is followed by one slot per arena pointer argument."""
+    arena_i = n_sym + 2 + n_k + n_ext + 2 * n_sites + n_in + 1
+    off0 = arena_i + 1
+    return arena_i, off0, off0 + n_slots + 1
+
+
 def launch_planner(
     func: int,
     n_nodes: int,
     handles_ptr: int,
     ctx_ptr: int,
     stream: int,
-    arena_ptr: int = 0,
-    slot_off_ptr: int = 0,
 ) -> None:
     """Launch the planner, one thread per graph node.
 
-    A null arena means shapes only: the generated code skips the pointer patches
-    and every buffer keeps the address the capture gave it.
+    The arena base and layout are in ctx (a zero base means shapes only: the
+    generated code skips the pointer patches and every buffer keeps the
+    address the capture gave it).
     """
-    _launch(
-        func,
-        [handles_ptr, ctx_ptr, arena_ptr, slot_off_ptr],
-        (n_nodes + 127) // 128,
-        128,
-        stream,
-    )
+    _launch(func, [handles_ptr, ctx_ptr], (n_nodes + 127) // 128, 128, stream)
 
 
 # --------------------------------------------------------------- safety check
@@ -1855,7 +1957,7 @@ def generate_view_pointer_patches(
                     raise Unsupported(
                         f"{k['name']} argument {nm} is {raw}, which no allocation owns"
                     )
-                base = f"arena + slot_off[{slot_of[buf]}]"
+                base = f"ARENA + SLOT_OFF({slot_of[buf]})"
             body.append(
                 f"      {{ char* p = {base} + (int64_t)dg_eval({expr_idx(voff)},ctx) * {item}; "
                 f"cudaGraphKernelNodeSetParam(handles[i], {off}, &p, 8); }}"
@@ -1954,37 +2056,41 @@ def generate_pointer_patches(
     input_bufs: Any = (),
     extern_out_of: dict[str, int] | None = None,
     views: dict[str, Any] | None = None,
-) -> str:
+) -> tuple[str, int]:
     """Per-node ``case`` bodies that repoint each buffer argument into the arena.
 
     ``slot_of`` of None means no arena: the planner is only patching shapes and
     every buffer keeps the address the capture gave it. That is different from an
     empty assignment, which would mean an arena exists but owns nothing.
 
-    Call sites name the buffer Inductor renamed to, not the one that owns the
-    allocation -- ``buf2 = buf0  # reuse`` means ``buf2`` never appears in the
-    slot assignment -- so the alias map has to be applied before the lookup.
-    Anything still unaccounted for is refused: an unpatched pointer keeps the
+    Each argument compares the address for this layout with the one it was
+    last set to (its LASTP slot in ctx, zero after a capture) and issues the
+    runtime call only when they differ. Returns the cases and how many LASTP
+    slots they use.
+
+    A buffer the wrapper allocated but that is missing from the slot assignment
+    is refused rather than skipped. Skipping would leave the argument at the
     address the capture gave it, and the graph would quietly return whichever
     kernel last wrote there.
     """
     if slot_of is None:
-        return ""
+        return "", 0
     alias = alias or {}
     views = views or {}
     cases = []
+    n_ptr = 0
     for i, k in enumerate(kernels):
         body = []
         for nm, raw in (k.get("ptrs") or {}).items():
             buf, voff = _view_of(raw, alias, views)
             if not re.fullmatch(r"buf\d+", buf):
-                continue  # a graph input, which keeps its own fixed address
+                continue  # a graph input, patched from its own address
             if not _off_is_zero(voff):
                 continue  # a view at an offset: generate_view_pointer_patches
             if buf in input_bufs:
                 # Produced by an earlier partition and handed to this one as an
                 # argument. It is an input like any other, just named for the
-                # buffer it carries, so its address is fixed the same way.
+                # buffer it carries, so its address is patched the same way.
                 continue
             if buf in (extern_out_of or {}):
                 continue  # patched from ctx, see generate_extern_pointer_patches
@@ -1996,13 +2102,16 @@ def generate_pointer_patches(
             if size != 8:
                 raise Unsupported(f"{k['name']} pointer {nm} is {size} bytes")
             body.append(
-                f"      {{ char* p = arena + slot_off[{slot_of[buf]}]; "
-                f"cudaGraphKernelNodeSetParam(handles[i], {off}, &p, 8); }}"
+                f"      {{ char* p = ARENA + SLOT_OFF({slot_of[buf]}); "
+                f"if ((int64_t)p != LASTP({n_ptr})) {{ "
+                f"cudaGraphKernelNodeSetParam(handles[i], {off}, &p, 8); "
+                f"LASTP({n_ptr}) = (int64_t)p; }} }}"
                 f"  // {nm} = {buf}"
             )
+            n_ptr += 1
         if body:
             cases.append(f"    case {i}:\n" + "\n".join(body) + "\n      break;")
-    return "\n".join(cases)
+    return "\n".join(cases), n_ptr
 
 
 # --------------------------------------------------------------- runner
@@ -2148,15 +2257,16 @@ def _is_eager_site(name: str) -> bool:
 
 # Topologies one extern site may take before further ones are simply recorded
 # per shape upstream. cuDNN conv shows three tiers by batch; cuBLAS two.
-_MAX_BODIES = 8
+# These are budgets of this module, not driver limits: how many bodies a
+# SWITCH site may grow, how many re-captures a SWITCH runner may do, and how
+# many graphs a host-selected region keeps before the least recently used
+# one is dropped (`config.triton.dynagraph_max_graphs`).
 
-# Re-captures one runner may do under device-side SWITCH: each is a full
-# capture, and a region whose topologies keep multiplying is better recorded
-# per shape upstream.
-_MAX_RECAPTURES = 4
-# Graphs one region may hold under host-side selection, one per combination
-# of extern topologies met.
-_MAX_EXECS = 8
+
+def _max_graphs() -> int:
+    from torch._inductor import config
+
+    return max(1, int(config.triton.dynagraph_max_graphs))
 
 
 def _site_calls(src: str, entry: str | None) -> list[tuple[str, str | None]]:
@@ -2480,14 +2590,21 @@ class _Exec:
         # (`generate_extern_pointer_patches`), then the SWITCH body selected
         # for this shape, then the conditional handle (zero while the site is
         # a plain child node).
-        self.ctx = torch.ones(
-            n_sym + 2 + n_k + len(runner.ext_slots) + 2 * n_s + len(runner.argv) + 1,
+        # Then (`ctx_layout`): the arena base, the slot offsets and the
+        # address each arena pointer argument was last set to.
+        _arena_i, _off0, lastp0 = ctx_layout(
+            n_sym, n_k, len(runner.ext_slots), n_s, len(runner.argv), runner.n_slots
+        )
+        self.ctx = torch.zeros(
+            lastp0 + max(int(getattr(runner, "n_ptr", 0)), 0),
             dtype=torch.int64,
             device=runner.device,
         )
-        self.ctx[n_sym + 2 + n_k :] = 0
-        self.ctx[: n_sym + 1] = 0
+        self.ctx[n_sym + 2 : n_sym + 2 + n_k] = 1
         self.ptr_dirty = True
+        # When this graph was last picked to serve a call (`_harvest` drops
+        # the one used longest ago once over budget).
+        self.used = 0
         # Symbol values the graph was last patched for. None until the first
         # replay, so the first one never takes the early-out.
         self.applied: Any = None
@@ -2613,6 +2730,12 @@ class DynaGraphRunner:
             self.exact = True
             self.child_graphs, self.child_holds = {}, {}
             self.harvests = 0
+            self.tick = 0
+            self.n_slots, self.n_ptr = 0, 0
+            self.inplace: OrderedSet[int] = OrderedSet()
+            self.extern_read: OrderedSet[int] = OrderedSet()
+            self.fixed_off: list[int] | None = None
+            self.fixed_size: list[int] | None = None
             self.skip_keys = OrderedSet()
             self.plans = {}
             self.sym_index = {}
@@ -2717,6 +2840,8 @@ class DynaGraphRunner:
         # they are never handed out twice.
         self.harvest_pool: Any = None
         self.harvests = 0
+        # Call counter, stamped on the graph that served each call (LRU).
+        self.tick = 0
         # Shapes whose extern topology differs from the captured one; served
         # upstream, per shape, without retiring the region.
         self.skip_keys: OrderedSet[Any] = OrderedSet()
@@ -2781,13 +2906,12 @@ class DynaGraphRunner:
         from torch._inductor.utils import remove_unaligned_input_idxs
 
         headroom = config.triton.dynagraph_headroom
-        # Inputs of a region with an unbacked symbol are sized by it (the
-        # rows a mask selected), so their storage takes the larger headroom.
-        in_headroom = (
-            max(headroom, float(config.triton.dynagraph_unbacked_headroom))
-            if any(re.fullmatch(r"u\d+", sym) for sym in self.symbols)
-            else headroom
-        )
+        # "dynamic": the arena is laid out per shape (slot sizes from the
+        # symbol values, a prefix sum) and grows to the largest total seen;
+        # memory is the maximum over shapes of the sum. "fixed": slot offsets
+        # are chosen at build with headroom, so the device path never patches
+        # a pointer twice; memory is the sum of per-slot maxima.
+        self.fixed = config.triton.dynagraph_layout == "fixed"
 
         allocated = sorted(self.sizes)
         assign, n_slots = plan_slots(lifetimes, allocated)
@@ -2831,11 +2955,11 @@ class DynaGraphRunner:
                 continue
             # Sized and viewed by the input's own strides: a transposed or
             # sliced input keeps its geometry in the copy, since the kernels
-            # were specialized on that geometry and read through it.
+            # were specialized on that geometry and read through it. Exactly
+            # this call's size: a larger one later replaces the storage and
+            # the readers are repointed (`_grow_store`).
             n = _extent(x)
-            store = torch.empty(
-                max(int(n * in_headroom), n, 1), dtype=x.dtype, device=x.device
-            )
+            store = torch.empty(max(n, 1), dtype=x.dtype, device=x.device)
             view = _store_view(store, x)
             view.copy_(x)
             self.input_store.append(store)
@@ -2880,52 +3004,70 @@ class DynaGraphRunner:
             if k["blocks"] is None:
                 return _fallback("unsettled-config", k["name"])
 
-        # Fixed slots: each sized for the recorded shape times the headroom.
-        # Memory becomes the sum of per-slot maxima instead of the maximum over
-        # shapes of the sum, which is the price of never moving a pointer.
         sz = self._slot_sizes(env)
         if sz is None:
             return _fallback("unevaluable-size", "at build")
-        # A slot holding a buffer whose size carries an unbacked symbol gets
-        # the larger headroom: its value has no largest-first order to offer.
-        ub = float(config.triton.dynagraph_unbacked_headroom)
-        per_slot = [headroom] * len(sz)
-        for name, (span, _item) in self.sizes.items():
-            slot = self.slot_of.get(name)
-            if (
-                slot is not None
-                and slot < len(per_slot)
-                and re.search(r"\bu\d+\b", str(span))
-            ):
-                per_slot[slot] = max(per_slot[slot], ub)
-        if any(h != headroom for h in per_slot):
-            log.info(
-                "DynaGraph unbacked slots: headroom %s, sizes %s",
-                per_slot,
-                {n: str(sp) for n, (sp, _i) in self.sizes.items()},
-            )
-        self.fixed_size, self.fixed_off = fixed_slot_offsets(sz, headroom, per_slot)
+        self.fixed_size: list[int] | None = None
+        self.fixed_off: list[int] | None = None
+        if self.fixed:
+            # Each slot sized for the recorded shape times the headroom; one
+            # holding a buffer whose size carries an unbacked symbol gets the
+            # larger headroom, since its value has no largest-first order.
+            ub = float(config.triton.dynagraph_unbacked_headroom)
+            per_slot = [headroom] * len(sz)
+            for name, (span, _item) in self.sizes.items():
+                slot = self.slot_of.get(name)
+                if (
+                    slot is not None
+                    and slot < len(per_slot)
+                    and re.search(r"\bu\d+\b", str(span))
+                ):
+                    per_slot[slot] = max(per_slot[slot], ub)
+            self.fixed_size, self.fixed_off = fixed_slot_offsets(sz, headroom, per_slot)
         if self.update == "auto":
             self.update = self._pick_update()
-        # Item sizes of everything a view can be taken of, and the fixed
-        # address of every input not read in place (its storage here, or
-        # the static tensor itself), for the pointer patches of offset views.
+        # Item sizes of everything a view can be taken of, for the pointer
+        # patches of offset views.
         self.itemsize_of = {
             name: int(item) for name, (_span, item) in self.sizes.items()
         }
-        self.input_addr: dict[int, int] = {}
         for name, j in self.argv.items():
             if j < len(inputs) and isinstance(inputs[j], torch.Tensor):
                 self.itemsize_of[name] = inputs[j].element_size()
-                store = self.input_store[j]
-                self.input_addr[j] = (
-                    store.data_ptr() if store is not None else inputs[j].data_ptr()
-                )
+        # Every tensor input is read through the per-call address table
+        # (`in_ptrs`): its own storage when read in place, the copy held here
+        # otherwise, the tensor itself when static. So nothing bakes an
+        # input address into the graph, and a copy that has to grow, or a
+        # static input that moves, is a new entry in the table.
+        self.patch_inputs = OrderedSet(
+            j
+            for j in self.argv.values()
+            if j < len(inputs) and isinstance(inputs[j], torch.Tensor)
+        )
+        # Inputs an extern child reads: the harvested graph holds their
+        # address, so one of those moving means harvesting again.
+        self.extern_read = self._extern_read_positions()
+        for j in self.patch_inputs:
+            store = self.input_store[j]
+            self.in_ptrs[j] = (
+                store.data_ptr() if store is not None else inputs[j].data_ptr()
+            )
+        # Of those, the ones read where they are, no copy (`__call__`).
+        self.inplace: OrderedSet[int] = OrderedSet()
+        # How many arena pointer arguments the planner tracks (LASTP slots).
+        self.n_ptr = generate_pointer_patches(
+            self.kernels,
+            self.slot_of,
+            self.alias,
+            self.input_bufs,
+            self.extern_outs_of,
+            self.views,
+        )[1]
         host_src: str | None = None
         planner_src: str | None = None
         try:
             if self.update == "host":
-                self.patch_inputs = self._inputs_by_address(inputs, static)
+                self.inplace = self._inputs_by_address(inputs, static)
                 host_src = generate_host_patcher(
                     self.kernels,
                     self.symbols,
@@ -2939,15 +3081,17 @@ class DynaGraphRunner:
                     n_ext=len(self.ext_slots),
                     views=self.views,
                     itemsize_of=self.itemsize_of,
-                    input_addr=self.input_addr,
+                    sizes=self.sizes,
+                    fixed_off=self.fixed_off,
                 )
                 planner_src = None
             else:
                 # Read in place only when the copy would cost more than a
                 # planner run: large activations, a KV cache. Static inputs
-                # stay copied-nothing and checked; a moved one rebuilds.
+                # are read where they are and checked; a moved one is
+                # repointed like any other.
                 thr = int(config.triton.dynagraph_patch_bytes)
-                self.patch_inputs = OrderedSet(
+                self.inplace = OrderedSet(
                     i
                     for i in self._inputs_by_address(inputs, static)
                     if thr > 0
@@ -2967,7 +3111,8 @@ class DynaGraphRunner:
                     patch_inputs=self.patch_inputs,
                     views=self.views,
                     itemsize_of=self.itemsize_of,
-                    input_addr=self.input_addr,
+                    sizes=self.sizes,
+                    fixed_off=self.fixed_off,
                 )
         except Unsupported as exc:
             return _fallback("unmodelled", str(exc))
@@ -2987,9 +3132,8 @@ class DynaGraphRunner:
             if self.host_lib is None:
                 return _fallback("planner-build", "host patcher")
             self.f_planner = None
-            # What the patcher needs on the host: the slot offsets and the
-            # kernel functions in launch order.
-            self.slot_off_host = (ctypes.c_int64 * len(self.fixed_off))(*self.fixed_off)
+            # What the patcher needs on the host: the kernel functions in
+            # launch order.
             flat = [f for k in self.kernels for f in k["funcs"]]
             self.funcs_host = (ctypes.c_void_p * max(len(flat), 1))(*flat)
             self.nfuncs_host = (ctypes.c_int * max(len(self.kernels), 1))(
@@ -3003,15 +3147,14 @@ class DynaGraphRunner:
                 return _fallback("planner-build")
             self.f_planner, self.f_setctx = funcs
 
+        offsets = self.slot_offsets(env)
+        if offsets is None:
+            return _fallback("unevaluable-size", "layout at build")
+        # The arena: what this shape needs (times the headroom under a fixed
+        # layout, where that is the slots' own room). Under the dynamic layout
+        # a later shape needing more gets a larger one (`_grow_arena`).
         self.arena = torch.empty(
-            max(self.fixed_off[-1], 1024), dtype=torch.uint8, device=self.device
-        )
-        if len(self.fixed_off) != n_slots + 1:
-            return _fallback(
-                "layout-mismatch", f"{len(self.fixed_off)} offsets for {n_slots} slots"
-            )
-        self.slot_off = torch.tensor(
-            self.fixed_off, dtype=torch.int64, device=self.device
+            max(offsets[-1], 1024), dtype=torch.uint8, device=self.device
         )
         if self.extern_sites:
             key = tuple(sorted(env.items()))
@@ -3021,6 +3164,86 @@ class DynaGraphRunner:
         return self._capture() and self._replays_match(env)
 
     # ------------------------------------------------------------ extern
+    def _extern_read_positions(self) -> OrderedSet[int]:
+        """Argument positions an extern call line mentions: a harvested child
+        graph holds their address, so a copy of theirs cannot move without a
+        new harvest."""
+        out: OrderedSet[int] = OrderedSet()
+        if self.extern_sites and self.body:
+            for line in self.body.splitlines():
+                code = line.split("#", 1)[0]
+                if _SITE_CALL.search(code):
+                    for nm in re.findall(r"\b[A-Za-z_]\w*\b", code):
+                        if nm in self.argv:
+                            out.add(self.argv[nm])
+        return out
+
+    def _invalidate_harvests(self) -> None:
+        """Forget every harvested extern graph: the addresses they hold are
+        stale (the arena or a copied input moved). Shapes are harvested again
+        as they recur; the graphs keep their nodes and get the new children
+        swapped in."""
+        self.child_graphs.clear()
+        self.child_holds.clear()
+        self.extern_outs.clear()
+        self.key_bodies.clear()
+        self.eager_calls.clear()
+        self.host_args.clear()
+        self.ctx_args.clear()
+        self._ex_of.clear()
+        self.out_cache.clear()
+        for ex in self.execs.values():
+            # Every child is swapped again, whatever its handle value: the
+            # driver may give a new graph the handle a destroyed one had,
+            # so "same handle" no longer means "same graph".
+            ex.child_applied = None
+            ex.applied = None
+            ex.ptr_dirty = True
+            ex.site_applied_raw = [[None] * len(h) for h in ex.site_held]
+
+    def _grow_arena(self, total: int) -> None:
+        """A shape needs more arena than there is: replace it with a larger
+        one. Pointers are laid out per shape anyway, so every graph takes
+        the new base through its next update (`ptr_dirty`); only harvested
+        extern graphs, which hold absolute addresses, are redone."""
+        import torch
+        from torch._inductor import config
+
+        grow = max(1.0, float(config.triton.dynagraph_grow))
+        new = torch.empty(
+            max(int(total * grow), total, 1024), dtype=torch.uint8, device=self.device
+        )
+        log.info("DynaGraph arena %d -> %d bytes", self.arena.numel(), new.numel())
+        self.arena = new
+        self.plans.clear()
+        self.out_cache.clear()
+        self.ctx_args.clear()
+        self.host_args.clear()
+        for ex in self.execs.values():
+            ex.ptr_dirty = True
+            ex.applied = None
+        if self.extern_sites:
+            self._invalidate_harvests()
+
+    def _grow_store(self, j: int, x: Any, n: int) -> None:
+        """The copy held for input `j` is too small for this call: replace
+        it. Its readers take the new address from the table on this call;
+        an extern child that read the old copy is harvested again."""
+        import torch
+
+        store = torch.empty(max(n, 1), dtype=x.dtype, device=x.device)
+        log.info(
+            "DynaGraph input %d storage %d -> %d elements",
+            j,
+            self.input_store[j].numel(),
+            store.numel(),
+        )
+        self.input_store[j] = store
+        self.static_inputs[j] = _store_view(store, x)
+        self.in_ptrs[j] = store.data_ptr()
+        if j in self.extern_read:
+            self._invalidate_harvests()
+
     def _inputs_by_address(self, inputs: list[Any], static: Any) -> OrderedSet[int]:
         """Argument positions to read through their own address, no copy.
 
@@ -3040,15 +3263,7 @@ class DynaGraphRunner:
         """
         import torch
 
-        # Names an extern call line mentions -- read by a child graph.
-        extern_read: OrderedSet[str] = OrderedSet()
-        if self.extern_sites and self.body:
-            for line in self.body.splitlines():
-                code = line.split("#", 1)[0]
-                if _SITE_CALL.search(code):
-                    for nm in re.findall(r"\b[A-Za-z_]\w*\b", code):
-                        if nm in self.argv:
-                            extern_read.add(nm)
+        extern_read = self._extern_read_positions()
         readers: dict[int, int] = {}
         for k in self.kernels:
             for raw in (k.get("ptrs") or {}).values():
@@ -3056,10 +3271,10 @@ class DynaGraphRunner:
                 if buf in self.argv:
                     readers[self.argv[buf]] = readers.get(self.argv[buf], 0) + 1
         out: OrderedSet[int] = OrderedSet()
-        for name, i in self.argv.items():
+        for i in self.argv.values():
             if i >= len(inputs) or not isinstance(inputs[i], torch.Tensor):
                 continue
-            if name in extern_read:
+            if i in extern_read:
                 continue
             if readers.get(i, 0) > 16:
                 continue
@@ -3069,11 +3284,11 @@ class DynaGraphRunner:
     def _rebind_static(self, inputs: list[Any]) -> bool:
         """Static inputs moved: take the new addresses if every one can be.
 
-        Under the host path a reader of a moved input is repointed by the
-        next `dg_step` (the input is in the patch set; it compares addresses
-        itself). One read by an extern child, or now unaligned, cannot be:
-        the caller rebuilds on this call's inputs. The device path has no
-        input patching, so it rebuilds as well.
+        A reader of a moved input is repointed by the next update on either
+        path (every input is in the address table). One read by an extern
+        child means harvesting again; one now unaligned cannot be read in
+        place at all (Inductor specialized on 16-byte alignment), so the
+        caller rebuilds on this call's inputs.
         """
         import torch
 
@@ -3084,29 +3299,33 @@ class DynaGraphRunner:
             and inputs[i].data_ptr() != self.static_ptrs[i]
         ]
         for i in moved:
-            ptr = inputs[i].data_ptr()
-            if i not in self.patch_inputs or ptr % 16:
+            if inputs[i].data_ptr() % 16:
                 return False
         for i in moved:
             ptr = inputs[i].data_ptr()
             self.static_ptrs[i] = ptr
             self.static_inputs[i] = inputs[i]
             self.in_ptrs[i] = ptr
+        if any(i in self.extern_read for i in moved):
+            self._invalidate_harvests()
         log.info("DynaGraph static inputs moved, repointed: %s", moved)
         return True
 
     def _shape_inputs(self, inputs: list[Any]) -> list[Any]:
         """The argument list a harvest runs the wrapper on.
 
-        Static inputs are read in place; a copied one is its storage here,
-        viewed with this call's shape. Symbols pass through as ints.
+        An input read in place (static, or `inplace`) is the caller's tensor
+        itself; a copied one is its storage here, viewed with this call's
+        shape. Symbols pass through as ints. An extern call never reads an
+        in-place input (`_inputs_by_address`), so the addresses a harvest
+        captures are all storage held here.
         """
         import torch
 
         out = []
         for i, x in enumerate(inputs):
             store = self.input_store[i] if i < len(self.input_store) else None
-            if store is None or not isinstance(x, torch.Tensor):
+            if store is None or i in self.inplace or not isinstance(x, torch.Tensor):
                 out.append(x)
             else:
                 out.append(_store_view(store, x))
@@ -3353,7 +3572,7 @@ class DynaGraphRunner:
             not self.host_mode
             and fresh
             and self.execs
-            and self.recaptures >= _MAX_RECAPTURES
+            and self.recaptures >= _max_graphs()
         ):
             self.skip_keys.add(key)
             _fallback("extern-topology", f"recapture budget spent, {counts} at {env}")
@@ -3363,7 +3582,7 @@ class DynaGraphRunner:
             raw = raws[i]
             topos = self.site_topos[i]
             if n not in topos:
-                if len(topos) >= _MAX_BODIES:
+                if len(topos) >= _max_graphs():
                     self.skip_keys.add(key)
                     _fallback(
                         "extern-topology",
@@ -3381,26 +3600,27 @@ class DynaGraphRunner:
             # combinations seen track the largest site's tiers, not their
             # product -- the sites step together with the shape.
             fresh = tuple(bodies) not in self.execs
-            if fresh and self.execs and len(self.execs) >= _MAX_EXECS:
-                self.skip_keys.add(key)
-                _fallback(
-                    "extern-topology",
-                    f"{len(self.execs)} graphs already, {counts} at {env}",
+            if fresh and self.execs and len(self.execs) >= _max_graphs():
+                # Over budget: drop the graph used longest ago. A shape that
+                # needs it again captures again (milliseconds), so no shape
+                # is ever handed back to per-shape recording for this.
+                combo = min(self.execs, key=lambda c: self.execs[c].used)
+                gone = self.execs.pop(combo)
+                for k2 in [k2 for k2, e2 in self._ex_of.items() if e2 is gone]:
+                    del self._ex_of[k2]
+                self.host_args.clear()
+                log.info(
+                    "DynaGraph dropped graph %s (%d kept) for %s at %s",
+                    combo,
+                    len(self.execs),
+                    counts,
+                    env,
                 )
-                return False
-        # Bounded like `plans`: the shape space is long-tailed.
+        # Bounded like `plans`: the shape space is long-tailed. The dropped
+        # harvests hold child handles and output addresses a re-harvested
+        # shape must not find (and a handle may be reused by the driver).
         if len(self.child_graphs) >= 1024:
-            self.child_graphs.clear()
-            self.child_holds.clear()
-            self.extern_outs.clear()
-            self.key_bodies.clear()
-            self.eager_calls.clear()
-            self.out_cache.clear()
-            # These hold child handles and output addresses of the dropped
-            # harvests: a re-harvested shape must not find them.
-            self.host_args.clear()
-            self.ctx_args.clear()
-            self._ex_of.clear()
+            self._invalidate_harvests()
         self.child_graphs[key] = raws
         self.child_holds[key] = graphs
         self.extern_outs[key] = results
@@ -3540,38 +3760,54 @@ class DynaGraphRunner:
     def slot_offsets(self, env: dict[str, int]) -> list[int] | None:
         """Byte offset of every slot, plus the total, computed on the host.
 
-        The same prefix sum the layout kernel does on device. Reading the device
-        copy instead costs a synchronize on every call, and in a launch-bound
-        region that synchronize is most of what the graph was supposed to save --
-        it measured as roughly a 2x regression against per-shape recording. The
-        arithmetic is therefore duplicated deliberately, and the two copies are
-        checked against each other once, at build.
+        The same prefix sum the generated code does per shape (setctx on the
+        device, `dg_layout` on the host): slot size is the largest buffer
+        assigned, offsets are kept 256-byte aligned. Reading it back from the
+        device would cost a synchronize on every call, so the arithmetic is
+        duplicated deliberately and must agree. Under a fixed layout these
+        are the build's constants, and None for a shape that outgrows one of
+        its slots (the caller rebuilds).
         """
         sz = self._slot_sizes(env)
         if sz is None:
             return None
-        # A shape whose buffer outgrows its fixed slot cannot be laid out
-        # without moving pointers; the caller reports arena-too-small.
-        if any(v > cap for v, cap in zip(sz, self.fixed_size)):
-            return None
-        return list(self.fixed_off)
+        if self.fixed_off is not None:
+            if self.fixed_size is not None and any(
+                v > cap for v, cap in zip(sz, self.fixed_size)
+            ):
+                return None
+            return list(self.fixed_off)
+        off, acc = [], 0
+        for nbytes in sz:
+            off.append(acc)
+            acc += (nbytes + 255) & ~255
+        off.append(acc)
+        return off
 
     def _slot_sizes(self, env: dict[str, int]) -> list[int] | None:
         return slot_sizes(self.sizes, self.slot_of, self.n_slots, env)
 
     def _make_plan(self, env: dict[str, int]) -> Any:
-        """Where each output lands in the arena at this shape, or None to retire."""
+        """Where each output lands in the arena at this shape, with the
+        arena bytes the shape needs; None to retire, REBUILD when a fixed
+        layout cannot hold it."""
         import torch
 
         sz = self._slot_sizes(env)
         if sz is None:
             _fallback("unevaluable-size", f"at {env}")
             return None
-        for i, (need, cap) in enumerate(zip(sz, self.fixed_size)):
-            if need > cap:
-                _fallback("arena-too-small", f"slot {i} needs {need} > {cap} at {env}")
-                return REBUILD
-        offsets = self.fixed_off
+        if self.fixed_size is not None:
+            for i, (need, cap) in enumerate(zip(sz, self.fixed_size)):
+                if need > cap:
+                    _fallback(
+                        "arena-too-small", f"slot {i} needs {need} > {cap} at {env}"
+                    )
+                    return REBUILD
+        offsets = self.slot_offsets(env)
+        if offsets is None:
+            _fallback("unevaluable-size", f"layout at {env}")
+            return None
 
         plan = []
         for name, view in zip(self.outputs, self.output_views):
@@ -3595,7 +3831,7 @@ class DynaGraphRunner:
                     rest[len(sizes_e) :],
                 )
             )
-        return plan
+        return plan, offsets[-1]
 
     def _host_step(self, env: dict[str, int], key: Any, stream: int) -> bool:
         """Patch the exec on the host for this call and launch it: one C++ call.
@@ -3632,7 +3868,6 @@ class DynaGraphRunner:
             syms,
             int(ex.ptr_dirty),
             self.arena.data_ptr(),
-            self.slot_off_host,
             ext,
             child,
             self.in_ptrs,
@@ -3704,6 +3939,7 @@ class DynaGraphRunner:
         else:
             vals += [0] * (len(self.ext_slots) + len(self.extern_sites))
         vals += [0] * (1 + len(self.argv))
+        vals.append(self.arena.data_ptr())
         down = list(vals)
         down[n_sym] = 0
         args = (_prep_vals(vals), _prep_vals(down))
@@ -3989,8 +4225,6 @@ class DynaGraphRunner:
                         self.ex.handles.data_ptr(),
                         self.ex.ctx.data_ptr(),
                         raw,
-                        self.arena.data_ptr(),
-                        self.slot_off.data_ptr(),
                     )
                 if with_children:
                     # Allocations still come from the graph pool here; only
@@ -4099,8 +4333,8 @@ class DynaGraphRunner:
         held_idxs = [i for ok, i in self.out_order if not ok]
         held_idxs += [i for i in self.mutated_inputs if i not in held_idxs]
         out_pass = [(pos, v) for pos, (ok, v) in enumerate(self.out_order) if not ok]
-        mut_copy = [i for i in self.mutated_inputs if i not in self.patch_inputs]
-        mut_patch = [i for i in self.mutated_inputs if i in self.patch_inputs]
+        mut_copy = [i for i in self.mutated_inputs if i not in self.inplace]
+        mut_patch = [i for i in self.mutated_inputs if i in self.inplace]
         return (
             sym_order,
             held_idxs,
@@ -4159,10 +4393,11 @@ class DynaGraphRunner:
         # the host path, are read where they are).
         copied: list[int] = []
         in_ptrs = self.in_ptrs
+        inplace = self.inplace
         for j, (store, srcv) in enumerate(zip(self.input_store, inputs)):
             if store is None or not isinstance(srcv, torch.Tensor):
                 continue
-            if j in self.patch_inputs:
+            if j in inplace:
                 ptr = srcv.data_ptr()
                 if ptr % 16 == 0:
                     # Read in place: the nodes that read it are repointed.
@@ -4173,8 +4408,8 @@ class DynaGraphRunner:
             if srcv.is_contiguous() and srcv.dtype is store.dtype:
                 n = srcv.numel()
                 if n > store.numel():
-                    _fallback("input-too-large", f"arg {j}: {n} > {store.numel()}")
-                    return REBUILD
+                    self._grow_store(j, srcv, n)
+                    store = self.input_store[j]
                 # One driver call on the current stream: no aten dispatch
                 # and no view built, which is what `copy_` cost.
                 if n:
@@ -4190,11 +4425,11 @@ class DynaGraphRunner:
             else:
                 n = _extent(srcv)
                 if n > store.numel():
-                    _fallback("input-too-large", f"arg {j}: {n} > {store.numel()}")
-                    return REBUILD
+                    self._grow_store(j, srcv, n)
+                    store = self.input_store[j]
                 _store_view(store, srcv).copy_(srcv)
             copied.append(j)
-            if j in self.patch_inputs:
+            if j in inplace:
                 in_ptrs[j] = store.data_ptr()
 
         # The nodes hold these addresses, so a parameter that moved would be read
@@ -4205,9 +4440,9 @@ class DynaGraphRunner:
             inputs, self.static_ptrs, self.static_idxs
         ):
             if not self._rebind_static(inputs):
-                # Rebuilt on this call's inputs (bounded by
-                # `dynagraph_rebuilds`): the graph would otherwise read the
-                # old address, stale weights rather than an error.
+                # An unaligned one: rebuilt on this call's inputs (bounded
+                # by `dynagraph_rebuilds`), since the graph would otherwise
+                # read the old address, stale weights rather than an error.
                 _fallback(
                     "static-input-moved", f"{len(self.static_idxs)} static inputs"
                 )
@@ -4221,18 +4456,22 @@ class DynaGraphRunner:
         # two sides are computed independently.
         # Computed on the host, which also makes the bound check preventive:
         # a shape the arena cannot hold is turned away before anything runs.
-        plan = self.plans.get(key)
-        if plan is None:
-            plan = self._make_plan(env)
-            if plan is None or plan is REBUILD:
-                return plan
+        planned = self.plans.get(key)
+        if planned is None:
+            planned = self._make_plan(env)
+            if planned is None or planned is REBUILD:
+                return planned
             # Capped: the workloads this targets have long-tailed shape
             # distributions, so the number of distinct shapes is not bounded by
             # anything. Dropping the table is fine -- it is a cache, and the
             # shapes that recur will refill it.
             if len(self.plans) >= 4096:
                 self.plans.clear()
-            self.plans[key] = plan
+            self.plans[key] = planned
+        plan, total = planned
+        if total > self.arena.numel():
+            # Only under the dynamic layout (a fixed one refused above).
+            self._grow_arena(total)
 
         ex = self.ex
         if self.extern_sites:
@@ -4249,6 +4488,8 @@ class DynaGraphRunner:
                     self._ex_of.clear()
                 self._ex_of[key] = ex
             self.ex = ex
+        self.tick += 1
+        ex.used = self.tick
 
         ref = None
         if key not in ex.verified and len(ex.verified) < verify_shapes:
@@ -4332,9 +4573,10 @@ class DynaGraphRunner:
             t = held[v]
             store = self.input_store[v]
             # A static input is read in place, so it is its own answer; so is
-            # one read by address. A copied one was read -- and possibly
-            # written -- in the storage here, viewed with this call's shape.
-            if store is None or (v in self.patch_inputs and v not in copied):
+            # one read where it is on this call. A copied one was read -- and
+            # possibly written -- in the storage here, viewed with this
+            # call's shape.
+            if store is None or v not in copied:
                 out[pos] = t
             else:
                 out[pos] = _store_view(store, t)
