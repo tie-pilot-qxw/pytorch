@@ -253,8 +253,16 @@ def _resolve(expr: str, src: str, symbols: frozenset[str], depth: int = 8) -> st
     return expr
 
 
+# A backed symbol is spelled `s<n>`; an unbacked one (the row count of a
+# boolean mask, a nonzero) `u<n>`. Under cudagraph_trees the graph is cut at
+# the op that produces an unbacked size, and the value reaches the next
+# partition as a plain int argument, so from here on it is a symbol like any
+# other: the host knows it before the launch.
+_SYMBOL = r"\b[su]\d+\b"
+
+
 def _is_symbolic(expr: Any) -> bool:
-    return bool(expr) and bool(re.search(r"\bs\d+\b", str(expr)))
+    return bool(expr) and bool(re.search(_SYMBOL, str(expr)))
 
 
 # Constexprs the autotuner picks. Unlike a specialized scalar these never reach
@@ -299,7 +307,7 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
     from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 
     run_calls = _parse_run_calls(source_code)
-    symbols = frozenset(re.findall(r"\b(s\d+)\b", source_code))
+    symbols = frozenset(re.findall(r"\b([su]\d+)\b", source_code))
     autotuners = {
         nm: o for nm, o in call_globals.items() if isinstance(o, CachingAutotuner)
     }
@@ -1662,10 +1670,14 @@ def slot_sizes(
 
 
 def fixed_slot_offsets(
-    sizes: list[int], headroom: float
+    sizes: list[int], headroom: float, per_slot: Sequence[float] | None = None
 ) -> tuple[list[int], list[int]]:
-    """(per-slot capacity, offsets with the total last) for fixed slots."""
-    caps = [max(int(v * headroom), v, 256) for v in sizes]
+    """(per-slot capacity, offsets with the total last) for fixed slots.
+
+    `per_slot` overrides the headroom of individual slots (an unbacked size
+    gets more room, see `dynagraph_unbacked_headroom`)."""
+    hr = list(per_slot) if per_slot is not None else [headroom] * len(sizes)
+    caps = [max(int(v * h), v, 256) for v, h in zip(sizes, hr)]
     off, acc = [], 0
     for nbytes in caps:
         off.append(acc)
@@ -2178,8 +2190,8 @@ def _input_symbol_map(src: str) -> dict[str, int]:
     if not all(re.fullmatch(r"[A-Za-z_]\w*", n) for n in names):
         return {}
     pos = {n: i for i, n in enumerate(names)}
-    out = {n: i for n, i in pos.items() if re.fullmatch(r"s\d+", n)}
-    for m in re.finditer(r"^\s*(s\d+)\s*=\s*([A-Za-z_]\w*)\s*$", body, re.MULTILINE):
+    out = {n: i for n, i in pos.items() if re.fullmatch(r"[su]\d+", n)}
+    for m in re.finditer(r"^\s*([su]\d+)\s*=\s*([A-Za-z_]\w*)\s*$", body, re.MULTILINE):
         if m.group(2) in pos:
             out[m.group(1)] = pos[m.group(2)]
     return out
@@ -2661,6 +2673,13 @@ class DynaGraphRunner:
         from torch._inductor.utils import remove_unaligned_input_idxs
 
         headroom = config.triton.dynagraph_headroom
+        # Inputs of a region with an unbacked symbol are sized by it (the
+        # rows a mask selected), so their storage takes the larger headroom.
+        in_headroom = (
+            max(headroom, float(config.triton.dynagraph_unbacked_headroom))
+            if any(re.fullmatch(r"u\d+", sym) for sym in self.symbols)
+            else headroom
+        )
 
         allocated = sorted(self.sizes)
         assign, n_slots = plan_slots(lifetimes, allocated)
@@ -2707,7 +2726,7 @@ class DynaGraphRunner:
             # were specialized on that geometry and read through it.
             n = _extent(x)
             store = torch.empty(
-                max(int(n * headroom), n, 1), dtype=x.dtype, device=x.device
+                max(int(n * in_headroom), n, 1), dtype=x.dtype, device=x.device
             )
             view = _store_view(store, x)
             view.copy_(x)
@@ -2759,7 +2778,25 @@ class DynaGraphRunner:
         sz = self._slot_sizes(env)
         if sz is None:
             return _fallback("unevaluable-size", "at build")
-        self.fixed_size, self.fixed_off = fixed_slot_offsets(sz, headroom)
+        # A slot holding a buffer whose size carries an unbacked symbol gets
+        # the larger headroom: its value has no largest-first order to offer.
+        ub = float(config.triton.dynagraph_unbacked_headroom)
+        per_slot = [headroom] * len(sz)
+        for name, (span, _item) in self.sizes.items():
+            slot = self.slot_of.get(name)
+            if (
+                slot is not None
+                and slot < len(per_slot)
+                and re.search(r"\bu\d+\b", str(span))
+            ):
+                per_slot[slot] = max(per_slot[slot], ub)
+        if any(h != headroom for h in per_slot):
+            log.info(
+                "DynaGraph unbacked slots: headroom %s, sizes %s",
+                per_slot,
+                {n: str(sp) for n, (sp, _i) in self.sizes.items()},
+            )
+        self.fixed_size, self.fixed_off = fixed_slot_offsets(sz, headroom, per_slot)
         if self.update == "auto":
             self.update = self._pick_update()
         # Item sizes of everything a view can be taken of, and the fixed
