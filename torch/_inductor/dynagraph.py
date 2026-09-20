@@ -455,45 +455,75 @@ def _expr_to_c(expr: str, sym_index: dict[str, int]) -> str:
 
     Parsed rather than string-substituted: these expressions contain Python's
     ``//``, whose behaviour on negative operands differs from C's ``/``, and
-    textual replacement also loses operator precedence.
+    textual replacement also loses operator precedence. ``/`` is Python's true
+    division and is carried as a double, as is a float constant; a
+    ``math.floor`` / ``math.ceil`` brings the value back to an integer
+    (Inductor writes a ceiling division as ``(-1)*math.floor((-1/64)*s12)``).
+    The result has to be an integer.
     """
 
-    def go(n: ast.AST) -> str:
+    def go(n: ast.AST) -> tuple[str, bool]:
+        """(C code, is a double)."""
         if isinstance(n, ast.Expression):
             return go(n.body)
         if isinstance(n, ast.Constant):
-            if not isinstance(n.value, int):
-                raise Unsupported(f"non-integer constant {n.value!r}")
-            return f"(int64_t){n.value}"
+            if isinstance(n.value, bool) or not isinstance(n.value, (int, float)):
+                raise Unsupported(f"non-numeric constant {n.value!r}")
+            if isinstance(n.value, int):
+                return f"(int64_t){n.value}", False
+            return f"((double){n.value!r})", True
         if isinstance(n, ast.Name):
             if n.id not in sym_index:
                 raise KeyError(f"unknown symbol {n.id}")
-            return f"S({sym_index[n.id]})"
+            return f"S({sym_index[n.id]})", False
         if isinstance(n, ast.BinOp):
-            a, b = go(n.left), go(n.right)
+            (a, fa), (b, fb) = go(n.left), go(n.right)
             op = n.op
+            if isinstance(op, ast.Div):
+                return f"((double){a} / (double){b})", True
+            if isinstance(op, (ast.FloorDiv, ast.Mod)) and (fa or fb):
+                raise Unsupported(f"{type(op).__name__} on a non-integer in {expr!r}")
             if isinstance(op, ast.Add):
-                return f"({a} + {b})"
+                return f"({a} + {b})", fa or fb
             if isinstance(op, ast.Sub):
-                return f"({a} - {b})"
+                return f"({a} - {b})", fa or fb
             if isinstance(op, ast.Mult):
-                return f"({a} * {b})"
-            if isinstance(op, (ast.FloorDiv, ast.Div)):
-                return f"dg_floordiv({a}, {b})"
+                return f"({a} * {b})", fa or fb
+            if isinstance(op, ast.FloorDiv):
+                return f"dg_floordiv({a}, {b})", False
             if isinstance(op, ast.Mod):
-                return f"dg_mod({a}, {b})"
+                return f"dg_mod({a}, {b})", False
             raise NotImplementedError(f"operator {type(op).__name__}")
         if isinstance(n, ast.UnaryOp):
             if isinstance(n.op, ast.USub):
-                return f"(-{go(n.operand)})"
+                a, fa = go(n.operand)
+                return f"(-{a})", fa
             if isinstance(n.op, ast.UAdd):
                 return go(n.operand)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
-            if n.func.id in ("min", "max") and len(n.args) == 2:
-                return f"dg_{n.func.id}({go(n.args[0])}, {go(n.args[1])})"
-        raise NotImplementedError(f"unsupported expression node {type(n).__name__}")
+        if isinstance(n, ast.Call):
+            f = n.func
+            if isinstance(f, ast.Name) and f.id in ("min", "max") and len(n.args) == 2:
+                (a, fa), (b, fb) = go(n.args[0]), go(n.args[1])
+                if fa or fb:
+                    raise Unsupported(f"{f.id} on a non-integer in {expr!r}")
+                return f"dg_{f.id}({a}, {b})", False
+            if (
+                isinstance(f, ast.Attribute)
+                and isinstance(f.value, ast.Name)
+                and f.value.id == "math"
+                and f.attr in ("floor", "ceil")
+                and len(n.args) == 1
+            ):
+                a, _fa = go(n.args[0])
+                return f"((int64_t){f.attr}((double){a}))", False
+        raise NotImplementedError(
+            f"unsupported expression node {type(n).__name__} in {expr!r}"
+        )
 
-    return go(ast.parse(expr.strip(), mode="eval"))
+    code, is_float = go(ast.parse(expr.strip(), mode="eval"))
+    if is_float:
+        raise Unsupported(f"non-integer expression {expr!r}")
+    return code
 
 
 _PLANNER_TEMPLATE = r"""
@@ -1067,6 +1097,7 @@ _HOST_TEMPLATE = r"""
 // (CUDA guarantees this for exec updates), so this overlaps with the step
 // before.
 #include <cuda.h>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -1626,11 +1657,17 @@ def _eval_int(expr: str, env: dict[str, int]) -> int | None:
     if node is None:
         return None
 
-    def go(n: ast.AST) -> int | None:
+    import math
+
+    def go(n: ast.AST) -> Any:
+        # Python's own arithmetic: `/` is true division (a float), `//` and
+        # `%` floor; `math.floor` / `math.ceil` return to an integer.
         if isinstance(n, ast.Expression):
             return go(n.body)
         if isinstance(n, ast.Constant):
-            return int(n.value) if isinstance(n.value, int) else None
+            if isinstance(n.value, bool) or not isinstance(n.value, (int, float)):
+                return None
+            return n.value
         if isinstance(n, ast.Name):
             return env.get(n.id)
         if isinstance(n, ast.BinOp):
@@ -1644,7 +1681,9 @@ def _eval_int(expr: str, env: dict[str, int]) -> int | None:
                 return a - b
             if isinstance(o, ast.Mult):
                 return a * b
-            if isinstance(o, (ast.FloorDiv, ast.Div)):
+            if isinstance(o, ast.Div):
+                return a / b if b else None
+            if isinstance(o, ast.FloorDiv):
                 return a // b if b else None
             if isinstance(o, ast.Mod):
                 return a % b if b else None
@@ -1652,18 +1691,28 @@ def _eval_int(expr: str, env: dict[str, int]) -> int | None:
         if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub):
             v = go(n.operand)
             return None if v is None else -v
-        if (
-            isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Name)
-            and n.func.id in ("min", "max")
-        ):
-            vs = [go(a) for a in n.args]
-            if any(v is None for v in vs):
-                return None
-            return min(vs) if n.func.id == "min" else max(vs)  # type: ignore[type-var]
+        if isinstance(n, ast.Call):
+            f = n.func
+            if isinstance(f, ast.Name) and f.id in ("min", "max"):
+                vs = [go(a) for a in n.args]
+                if any(v is None for v in vs):
+                    return None
+                return min(vs) if f.id == "min" else max(vs)
+            if (
+                isinstance(f, ast.Attribute)
+                and isinstance(f.value, ast.Name)
+                and f.value.id == "math"
+                and f.attr in ("floor", "ceil")
+                and len(n.args) == 1
+            ):
+                v = go(n.args[0])
+                return None if v is None else int(getattr(math, f.attr)(v))
         return None
 
-    return go(node)
+    v = go(node)
+    if isinstance(v, float):
+        return int(v) if v == int(v) else None
+    return v
 
 
 def _find_allocations(src: str) -> list[tuple[str, list[str], list[str], str]]:
@@ -2280,6 +2329,53 @@ def _max_graphs() -> int:
     return max(1, int(config.triton.dynagraph_max_graphs))
 
 
+def _max_lanes() -> int:
+    from torch._inductor import config
+
+    return max(1, int(config.triton.dynagraph_max_lanes))
+
+
+class _Steps:
+    """Which step of the run a call belongs to.
+
+    A region called more than once in a step -- a decoder layer compiled as
+    one Dynamo frame and run for every layer -- must not hand the second
+    call the first call's memory while autograd still holds the first call's
+    outputs for the backward; each call in a step gets an arena of its own
+    (a lane), and lanes are reused from the next step on. The step boundary
+    is upstream's (`cudagraph_trees.can_start_new_generation`): a new
+    top-level torch.compile invocation starts one, unless a forward is
+    still waiting for its backward, or the user marks steps by hand.
+    """
+
+    step = 0
+    dynamo_gen = -1
+    mark = 0
+    pending_backward = False
+    _boxes: Any = None
+
+
+def _step_of(mode: str) -> int:
+    """The current step, advancing `_Steps` as `mode` ("forward",
+    "backward" or "inference") requires."""
+    boxes = _Steps._boxes
+    if boxes is None:
+        from torch._dynamo.mutation_guard import GenerationTracker
+        from torch._inductor.cudagraph_trees import MarkStepBox
+
+        boxes = _Steps._boxes = (GenerationTracker, MarkStepBox)
+    d, m = boxes[0].generation, boxes[1].mark_step_counter
+    if d != _Steps.dynamo_gen or m != _Steps.mark:
+        if m != _Steps.mark or not _Steps.pending_backward:
+            _Steps.step += 1
+        _Steps.dynamo_gen, _Steps.mark = d, m
+    if mode == "forward":
+        _Steps.pending_backward = True
+    elif mode == "backward":
+        _Steps.pending_backward = False
+    return _Steps.step
+
+
 def _site_calls(src: str, entry: str | None) -> list[tuple[str, str | None]]:
     """(site name, buffer it assigns or None) per call in the entry, in order.
 
@@ -2484,6 +2580,34 @@ def _off_is_zero(off: str) -> bool:
     return _eval_int(off, {}) == 0
 
 
+def _out_targets(src: str) -> list[str]:
+    """The `out=` argument of every extern call line, as written (a name or
+    an inline `reinterpret_tensor(...)`), balanced over its parentheses."""
+    out = []
+    for ln in src.splitlines():
+        code = ln.split("#", 1)[0]
+        if not _SITE_CALL.search(code):
+            continue
+        m = re.search(r"\bout\s*=\s*", code)
+        if not m:
+            continue
+        i = m.end()
+        depth, j = 0, i
+        while j < len(code):
+            c = code[j]
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif c == "," and depth == 0:
+                break
+            j += 1
+        out.append(code[i:j].strip())
+    return out
+
+
 def _buffer_views(src: str) -> dict[str, tuple[list[str], list[str], str]]:
     """Geometry of every `bufA = reinterpret_tensor(bufB, sizes, strides, offset)`.
 
@@ -2559,6 +2683,18 @@ def lifetimes_from_source(src: str) -> dict[str, tuple[int, int]]:
             else max(died.get(x, len(steps)) for x in names)
         )
         out[nm] = (b, end)
+    return out
+
+
+def _over_storage(t: Any, byte_off: int, dtype: Any, sizes: Any, strides: Any) -> Any:
+    """A fresh tensor over `t`'s storage at a byte offset: not a view of `t`,
+    so it has a version counter of its own."""
+    import torch
+
+    out = torch.empty(0, dtype=dtype, device=t.device)
+    out.set_(
+        t.untyped_storage(), byte_off // out.element_size(), list(sizes), list(strides)
+    )
     return out
 
 
@@ -2698,6 +2834,16 @@ class DynaGraphRunner:
         from torch._inductor import config
 
         self.model = model
+        # "forward", "backward" or "inference": what the region is to autograd,
+        # which is what tells a step boundary from a call within one.
+        self.mode = "inference"
+        # The arenas: one per call of a step (`_Steps`), `self.arena` being
+        # the one the current call uses.
+        self.lanes: list[Any] = []
+        self.lane = 0
+        self.step_seen = -1
+        self.calls_in_step = 0
+        self.lanes_warned = False
         self.src = src
         self.device = device
         dev = torch.device(device)
@@ -2743,7 +2889,6 @@ class DynaGraphRunner:
             self.ext_slots = []
             self.exact = True
             self.child_graphs, self.child_holds = {}, {}
-            self.harvest_addr = {}
             self.harvests = 0
             self.tick = 0
             self.n_slots, self.n_ptr = 0, 0
@@ -2801,10 +2946,13 @@ class DynaGraphRunner:
                 self.outputs.append(owner)
                 self.output_views.append(views.get(name))
             elif name in argv or (owner in argv and views.get(name) is None):
-                # An input handed straight through (a rename at most: a
-                # `reinterpret_tensor` view of an input would need its own
-                # geometry, which the pass-through does not carry).
+                # An input handed straight through (a rename at most).
                 self.out_order.append((False, argv.get(name, argv.get(owner))))
+            elif owner in argv:
+                # A `reinterpret_tensor` view of an input, returned as such
+                # (a residual stream handed on under a new shape): the input
+                # viewed with the geometry the wrapper gave it, per shape.
+                self.out_order.append(("inview", (argv[owner], views[name])))
             elif owner in self.extern_outs_of:
                 # Handed back from the harvest for the current shape.
                 self.out_order.append(("extern", self.extern_outs_of[owner]))
@@ -2812,6 +2960,7 @@ class DynaGraphRunner:
                 # Neither ours to lay out nor ours to pass on -- refuse rather
                 # than return a tuple of the wrong length.
                 self.outputs, self.out_order, self.output_views = [], [], []
+                self.refused_output = (name, owner)
                 break
         self.sym_from_input = _input_symbol_map(body)
         # extern_kernels.* call sites, in order. Each becomes a child-graph
@@ -2828,16 +2977,16 @@ class DynaGraphRunner:
         # Allocation order, so a harvest can hand each empty_strided_cuda call
         # its arena view by position.
         self.alloc_order = [n for n, _, _, _ in _find_allocations(body)]
-        # key -> raw child graph per site, plus the CUDAGraph objects that own
-        # them; the raw handles are only valid while those live.
+        # Harvest key (`_hkey`: shape, lane, extern-read addresses) -> raw
+        # child graph per site, plus the CUDAGraph objects that own them; the
+        # raw handles are only valid while those live.
         self.child_graphs: dict[Any, list[int]] = {}
         self.child_holds: dict[Any, list[Any]] = {}
-        # key -> what each site returned when harvested at that shape. For a
-        # site without `out=` that is the storage its output lives in.
+        # Harvest key -> what each site returned when harvested. For a site
+        # without `out=` that is the storage its output lives in.
         self.extern_outs: dict[Any, list[Any]] = {}
-        # key -> site -> (fn, args, kwargs) of the ops run on the host before
-        # each replay (`_EAGER_OP_NAMES`), as the harvest at that shape called
-        # them.
+        # Harvest key -> site -> (fn, args, kwargs) of the ops run on the host
+        # before each replay (`_EAGER_OP_NAMES`), as the harvest called them.
         self.eager_calls: dict[Any, dict[int, Any]] = {}
         # Per site: the topologies seen (`_node_sig`), one body each, with
         # the first graph seen for each and the object owning it; per key,
@@ -2847,8 +2996,6 @@ class DynaGraphRunner:
         self.site_graphs: list[list[int | None]] = [[] for _ in self.extern_sites]
         self.site_holds: list[list[Any]] = [[] for _ in self.extern_sites]
         self.key_bodies: dict[Any, list[int]] = {}
-        # key -> (arena base, extern-read input addresses) the harvest saw.
-        self.harvest_addr: dict[Any, tuple[int, ...]] = {}
         self.recaptures = 0
         # One memory pool for every harvested graph of this region. Each
         # capture otherwise gets a private pool of its own, and a pool
@@ -2873,7 +3020,8 @@ class DynaGraphRunner:
         self.host_args: dict[Any, Any] = {}
         self.in_ptrs = (ctypes.c_void_p * max(len(self.argv), 1))()
         # Per shape: the output tensors that do not depend on the call.
-        self.out_cache: dict[Any, list[Any]] = {}
+        # key -> (the outputs fixed per shape, the input-view outputs' geometry)
+        self.out_cache: dict[Any, Any] = {}
         self.sym_index = {s: i for i, s in enumerate(self.symbols or [])}
 
     def unusable_reason(self) -> str | None:
@@ -2888,7 +3036,7 @@ class DynaGraphRunner:
         # name its partition, which nothing observed does.
         if self.body is None:
             return "multi-partition"
-        if not self.kernels:
+        if not self.kernels and not self.extern_sites:
             return "no-kernels"
         if not self.symbols:
             return "no-symbols"
@@ -2896,6 +3044,12 @@ class DynaGraphRunner:
         # buffers it was handed, owning no allocation of its own, and that is a
         # graph worth serving -- it still has grids and scalars to patch.
         if not self.out_order:
+            ret = re.search(r"^\s*return\s*(.*)$", self.body or "", re.MULTILINE)
+            log.info(
+                "DynaGraph no-outputs: refused at %s; the wrapper returns %s",
+                getattr(self, "refused_output", None),
+                ret.group(1).strip() if ret else "?",
+            )
             return "no-outputs"
         if not self.sym_from_input:
             return "no-symbol-args"
@@ -2956,6 +3110,26 @@ class DynaGraphRunner:
         # input has to be copied into aligned storage anyway, because Inductor
         # specialized its kernels on the example's alignment.
         static = OrderedSet(remove_unaligned_input_idxs(inputs, static_input_idxs))
+        # Inputs the wrapper writes into: a kernel's out / in_out pointer or an
+        # extern call's `out=` resolving to an argument. Inductor does this to
+        # reuse a dead input as scratch (a backward's saved activation), which
+        # is only harmless because upstream replays on its own copies of the
+        # inputs. So such an input is always copied here and never read in
+        # place, whatever cudagraph_trees says about its address: read in
+        # place, the scratch writes would land in a tensor another autograd
+        # node still holds, and the eager runs' `out=` writes would bump its
+        # version. Only what Inductor names as mutated is written back.
+        self.written_scan: OrderedSet[int] = OrderedSet()
+        for k in self.kernels:
+            for nm, raw in (k.get("ptrs") or {}).items():
+                if nm.startswith(("in_out_ptr", "out_ptr")):
+                    j = self.argv.get(_view_of(raw, self.alias, self.views)[0])
+                    if j is not None:
+                        self.written_scan.add(j)
+        for raw in _out_targets(self.body or ""):
+            j = self.argv.get(_view_of(raw, self.alias, self.views)[0])
+            if j is not None:
+                self.written_scan.add(j)
         self.input_store: list[Any] = []
         self.static_inputs = []
         # Parallel to `inputs`, as `_tensors_data_ptrs_at_indices_equal` wants it.
@@ -2967,7 +3141,7 @@ class DynaGraphRunner:
                 self.static_inputs.append(x)
                 self.static_ptrs.append(None)
                 continue
-            if i in static:
+            if i in static and i not in self.written_scan:
                 self.input_store.append(None)
                 self.static_inputs.append(x)
                 self.static_ptrs.append(x.data_ptr())
@@ -2999,19 +3173,27 @@ class DynaGraphRunner:
         # per build. Inductor's own list covers extern calls, which the kernel
         # scan cannot see; the scan covers what the list does not name.
         self.mutated_all: list[int] = []
-        written = [
-            self.argv.get(_view_of(raw, self.alias, self.views)[0])
-            for k in self.kernels
-            for nm, raw in (k.get("ptrs") or {}).items()
-            if nm.startswith(("in_out_ptr", "out_ptr"))
-        ]
-        written += [int(i) for i in mutated_input_idxs]
-        for i in written:
-            if i is None or i >= len(inputs) or not isinstance(inputs[i], torch.Tensor):
+        for i in [*self.written_scan, *(int(i) for i in mutated_input_idxs)]:
+            if i >= len(inputs) or not isinstance(inputs[i], torch.Tensor):
                 continue
             if i not in self.mutated_all:
                 self.mutated_all.append(i)
-            if self.input_store[i] is not None and i not in self.mutated_inputs:
+        # Written back to the caller: what Inductor says the program mutates,
+        # and a written input the region hands back (a buffer from an earlier
+        # partition updated in place and returned: the caller reads it). Not
+        # one the wrapper merely used as scratch.
+        returned = OrderedSet(v for ok, v in self.out_order if ok is False)
+        returned.update(v[0] for ok, v in self.out_order if ok == "inview")
+        for i in [
+            *(int(i) for i in mutated_input_idxs),
+            *(i for i in self.written_scan if i in returned),
+        ]:
+            if (
+                i < len(inputs)
+                and isinstance(inputs[i], torch.Tensor)
+                and self.input_store[i] is not None
+                and i not in self.mutated_inputs
+            ):
                 self.mutated_inputs.append(i)
 
         # The warmup has to come before the planner is generated, not just before
@@ -3176,9 +3358,10 @@ class DynaGraphRunner:
         self.arena = torch.empty(
             max(offsets[-1], 1024), dtype=torch.uint8, device=self.device
         )
+        self.lanes, self.lane = [self.arena], 0
         if self.extern_sites:
             key = tuple(sorted(env.items()))
-            if not self._harvest(env, key, inputs):
+            if not self._harvest(env, key, self._hkey(key), inputs):
                 return False
 
         return self._capture() and self._replays_match(env)
@@ -3198,53 +3381,34 @@ class DynaGraphRunner:
                             out.add(self.argv[nm])
         return out
 
-    def _harvest_addr(self) -> tuple[int, ...]:
-        """What a harvest bakes in: the arena base and the address of every
-        input an extern call reads (the copy held here, or the tensor itself
-        when static). A harvest is only valid for a call that sees the same."""
-        return (
-            self.arena.data_ptr(),
-            *[self.in_ptrs[j] or 0 for j in self.extern_read],
-        )
+    def _hkey(self, key: Any) -> Any:
+        """What a harvest is good for: the shape, the lane (its child graphs
+        hold the arena base) and the address of every input an extern call
+        reads (the copy held here, or the tensor itself when static). A call
+        that sees the same finds its harvest under this; one that does not
+        harvests again, and the old entry stays for the call that recurs."""
+        return (key, self.lane, tuple(self.in_ptrs[j] or 0 for j in self.extern_read))
 
-    def _drop_harvest(self, key: Any) -> None:
-        """Forget one shape's harvest: its child graphs hold addresses this
-        call does not use. The exec holding its children swaps them again
-        whatever handle value the new graphs get."""
+    def _invalidate_harvests(self, lane: int | None = None) -> None:
+        """Forget the harvested extern graphs of one lane, or all: the
+        addresses they hold are stale (the arena moved). Shapes are
+        harvested again as they recur; the graphs keep their nodes and get
+        the new children swapped in."""
         for d in (
             self.child_graphs,
             self.child_holds,
             self.extern_outs,
             self.key_bodies,
             self.eager_calls,
-            self.harvest_addr,
             self.host_args,
             self.ctx_args,
-            self.out_cache,
+            self._ex_of,
         ):
-            d.pop(key, None)
-        ex = self._ex_of.pop(key, None)
-        if ex is not None:
-            ex.child_applied = None
-            ex.applied = None
-            ex.ptr_dirty = True
-            ex.site_applied_raw = [[None] * len(h) for h in ex.site_held]
-
-    def _invalidate_harvests(self) -> None:
-        """Forget every harvested extern graph: the addresses they hold are
-        stale (the arena or a copied input moved). Shapes are harvested again
-        as they recur; the graphs keep their nodes and get the new children
-        swapped in."""
-        self.child_graphs.clear()
-        self.child_holds.clear()
-        self.extern_outs.clear()
-        self.key_bodies.clear()
-        self.eager_calls.clear()
-        self.harvest_addr.clear()
-        self.host_args.clear()
-        self.ctx_args.clear()
-        self._ex_of.clear()
-        self.out_cache.clear()
+            if lane is None:
+                d.clear()
+            else:
+                for k in [k for k in d if k[1] == lane]:
+                    del d[k]
         for ex in self.execs.values():
             # Every child is swapped again, whatever its handle value: the
             # driver may give a new graph the handle a destroyed one had,
@@ -3266,17 +3430,17 @@ class DynaGraphRunner:
         new = torch.empty(
             max(int(total * grow), total, 1024), dtype=torch.uint8, device=self.device
         )
-        log.info("DynaGraph arena %d -> %d bytes", self.arena.numel(), new.numel())
-        self.arena = new
-        self.plans.clear()
-        self.out_cache.clear()
-        self.ctx_args.clear()
-        self.host_args.clear()
+        log.info(
+            "DynaGraph arena %d -> %d bytes (lane %d)",
+            self.arena.numel(),
+            new.numel(),
+            self.lane,
+        )
+        self.arena = self.lanes[self.lane] = new
         for ex in self.execs.values():
             ex.ptr_dirty = True
             ex.applied = None
-        if self.extern_sites:
-            self._invalidate_harvests()
+        self._invalidate_harvests(self.lane)
 
     def _grow_store(self, j: int, x: Any, n: int) -> None:
         """The copy held for input `j` is too small for this call: replace
@@ -3294,8 +3458,8 @@ class DynaGraphRunner:
         self.input_store[j] = store
         self.static_inputs[j] = _store_view(store, x)
         self.in_ptrs[j] = store.data_ptr()
-        # A harvest that captured the old copy is found stale by its
-        # address record when its shape recurs (`_harvest_addr`).
+        # A harvest that captured the old copy is keyed by its address
+        # (`_hkey`); the shape is harvested again at the new one.
 
     def _inputs_by_address(self, inputs: list[Any], static: Any) -> OrderedSet[int]:
         """Argument positions to read through their own address, no copy.
@@ -3327,7 +3491,7 @@ class DynaGraphRunner:
         for i in self.argv.values():
             if i >= len(inputs) or not isinstance(inputs[i], torch.Tensor):
                 continue
-            if i in extern_read:
+            if i in extern_read or i in self.written_scan:
                 continue
             if readers.get(i, 0) > 16:
                 continue
@@ -3533,11 +3697,11 @@ class DynaGraphRunner:
             )
         return out
 
-    def _combo(self, key: Any) -> tuple[int, ...]:
-        """Which graph serves `key`: the topology combination under host-side
+    def _combo(self, hkey: Any) -> tuple[int, ...]:
+        """Which graph serves `hkey`: the topology combination under host-side
         selection, the one and only graph otherwise."""
-        if self.host_mode and self.extern_sites and key in self.key_bodies:
-            return tuple(self.key_bodies[key])
+        if self.host_mode and self.extern_sites and hkey in self.key_bodies:
+            return tuple(self.key_bodies[hkey])
         return ()
 
     def _harvest_stream(self) -> Any:
@@ -3549,7 +3713,9 @@ class DynaGraphRunner:
             st = self._side_stream = torch.cuda.Stream()
         return st
 
-    def _harvest(self, env: dict[str, int], key: Any, inputs: list[Any]) -> bool:
+    def _harvest(
+        self, env: dict[str, int], key: Any, hkey: Any, inputs: list[Any]
+    ) -> bool:
         """Capture every extern call at this shape into its own small graph.
 
         The wrapper is run eagerly with the arena laid out for `env`, so the
@@ -3695,18 +3861,17 @@ class DynaGraphRunner:
         # shape must not find (and a handle may be reused by the driver).
         if len(self.child_graphs) >= 1024:
             self._invalidate_harvests()
-        self.child_graphs[key] = raws
-        self.harvest_addr[key] = self._harvest_addr()
-        self.child_holds[key] = graphs
-        self.extern_outs[key] = results
-        self.key_bodies[key] = bodies
-        self.eager_calls[key] = eager
+        self.child_graphs[hkey] = raws
+        self.child_holds[hkey] = graphs
+        self.extern_outs[hkey] = results
+        self.key_bodies[hkey] = bodies
+        self.eager_calls[hkey] = eager
         self.harvests += 1
-        if fresh and self.execs and not self._recapture(key, inputs):
+        if fresh and self.execs and not self._recapture(hkey, inputs):
             return False
         return True
 
-    def _recapture(self, key: Any, inputs: list[Any]) -> bool:
+    def _recapture(self, hkey: Any, inputs: list[Any]) -> bool:
         """Capture another main graph: this shape's extern topologies are new.
 
         Under host-side selection the graph is added beside the others;
@@ -3715,33 +3880,33 @@ class DynaGraphRunner:
         again, as after a build.
         """
         # On this shape's inputs, not the build's: the extern outputs handed
-        # back to the wrapper are the ones harvested at `key`, and the wrapper
+        # back to the wrapper are the ones harvested at `hkey`, and the wrapper
         # asserts their metadata against the shape it is running at.
-        if not self._capture(key, self._shape_inputs(inputs)):
+        if not self._capture(hkey, self._shape_inputs(inputs)):
             return False
         self.recaptures += 1
         return True
 
-    def _ext_value(self, key: Any, slot: int) -> Any:
-        """What extern slot `slot` holds at `key`: a site's result, or one
+    def _ext_value(self, hkey: Any, slot: int) -> Any:
+        """What extern slot `slot` holds at `hkey`: a site's result, or one
         element of a tuple-valued one."""
         site, elem = self.ext_slots[slot]
-        t = self.extern_outs[key][site]
+        t = self.extern_outs[hkey][site]
         if elem is not None and isinstance(t, (tuple, list)):
             return t[elem] if elem < len(t) else None
         return t
 
-    def _ext_ptrs(self, key: Any) -> list[int]:
-        """The address in every extern slot at `key` (0 where it is not a tensor)."""
+    def _ext_ptrs(self, hkey: Any) -> list[int]:
+        """The address in every extern slot at `hkey` (0 where it is not a tensor)."""
         import torch
 
         out = []
         for slot in range(len(self.ext_slots)):
-            t = self._ext_value(key, slot)
+            t = self._ext_value(hkey, slot)
             out.append(t.data_ptr() if isinstance(t, torch.Tensor) else 0)
         return out
 
-    def _harvest_result(self, key: Any, i: int, a: Any, kw: Any) -> Any:
+    def _harvest_result(self, hkey: Any, i: int, a: Any, kw: Any) -> Any:
         """What the wrapper goes on using after site `i` at capture.
 
         With `out=` that is the buffer the call was handed, which is what the
@@ -3750,7 +3915,7 @@ class DynaGraphRunner:
         """
         if "out" in kw:
             return kw["out"]
-        return self.extern_outs[key][i]
+        return self.extern_outs[hkey][i]
 
     def _pool_allocs(self) -> Any:
         """Deferred real allocations for the main capture, one per call site."""
@@ -3808,18 +3973,18 @@ class DynaGraphRunner:
             sig.append((int(ty), *dims, coop))
         return tuple(sig)
 
-    def _swap_children(self, key: Any) -> bool:
-        """Point every child-graph node at this shape's harvested graph."""
+    def _swap_children(self, hkey: Any) -> bool:
+        """Point every child-graph node at this call's harvested graphs."""
         from cuda.bindings import runtime as cr
 
         from torch.cuda._utils import _check_cuda_bindings as ck
 
-        bodies = self.key_bodies[key]
-        if key == self.ex.child_applied:
+        bodies = self.key_bodies[hkey]
+        if hkey == self.ex.child_applied:
             return True
         ex = self.ex.graph.raw_cuda_graph_exec()
         try:
-            for i, (raw, j) in enumerate(zip(self.child_graphs[key], bodies)):
+            for i, (raw, j) in enumerate(zip(self.child_graphs[hkey], bodies)):
                 if self.host_mode:
                     j = 0
                 node = self.ex.site_body_nodes[i][j]
@@ -3828,8 +3993,8 @@ class DynaGraphRunner:
                 ck(cr.cudaGraphExecChildGraphNodeSetParams(ex, node, raw))
                 self.ex.site_applied_raw[i][j] = raw
         except RuntimeError as exc:
-            return _fallback("extern-swap", f"{exc} at {key}")
-        self.ex.child_applied = key
+            return _fallback("extern-swap", f"{exc} at {hkey[0]}")
+        self.ex.child_applied = hkey
         return True
 
     def slot_offsets(self, env: dict[str, int]) -> list[int] | None:
@@ -3908,7 +4073,7 @@ class DynaGraphRunner:
             )
         return plan, offsets[-1]
 
-    def _host_step(self, env: dict[str, int], key: Any, stream: int) -> bool:
+    def _host_step(self, env: dict[str, int], hkey: Any, stream: int) -> bool:
         """Patch the exec on the host for this call and launch it: one C++ call.
 
         The call touches only what differs from what the exec holds (per
@@ -3918,7 +4083,7 @@ class DynaGraphRunner:
         """
 
         ex = self.ex
-        args = self.host_args.get(key)
+        args = self.host_args.get(hkey)
         if args is None:
             syms = (ctypes.c_int64 * max(len(self.symbols), 1))(
                 *[int(env[s]) for s in self.symbols]
@@ -3926,17 +4091,17 @@ class DynaGraphRunner:
             n_s = len(self.extern_sites)
             if n_s:
                 ext = (ctypes.c_void_p * max(len(self.ext_slots), 1))(
-                    *self._ext_ptrs(key)
+                    *self._ext_ptrs(hkey)
                 )
                 child = (ctypes.c_void_p * n_s)(
-                    *[(g or 0) for g in self.child_graphs[key]]
+                    *[(g or 0) for g in self.child_graphs[hkey]]
                 )
             else:
                 ext = child = None
             args = (syms, ext, child)
             if len(self.host_args) >= 4096:
                 self.host_args.clear()
-            self.host_args[key] = args
+            self.host_args[hkey] = args
         syms, ext, child = args
         rc = ex.host_lib.dg_step(
             ex.host,
@@ -3954,13 +4119,17 @@ class DynaGraphRunner:
                 "host-update",
                 f"dg_step returned {rc} (CUDA error {ex.host_lib.dg_last_error()}) at {env}",
             )
-        ex.applied = key
+        ex.applied = hkey
         ex.ptr_dirty = False
-        ex.child_applied = key
+        ex.child_applied = hkey
         return True
 
     def _write_ctx(
-        self, env: dict[str, int], key: Any, stream: int, in_changed: Sequence[int] = ()
+        self,
+        env: dict[str, int],
+        hkey: Any,
+        stream: int,
+        in_changed: Sequence[int] = (),
     ) -> None:
         """Hand the planner its inputs for this shape: one `setctx` launch.
 
@@ -3974,7 +4143,7 @@ class DynaGraphRunner:
         each other. A call that changes nothing only lowers the flags, once.
         """
         ex = self.ex
-        same = key == ex.applied and not ex.ptr_dirty
+        same = hkey == ex.applied and not ex.ptr_dirty
         d = self._ctx_in0
         if same and not in_changed:
             if ex.flag_on and ex.last_args is not None:
@@ -3984,9 +4153,9 @@ class DynaGraphRunner:
                 _launch_prepared(self.f_setctx, ex.ctx.data_ptr(), down, stream)
                 ex.flag_on = False
             return
-        args = self.ctx_args.get(key)
+        args = self.ctx_args.get(hkey)
         if args is None:
-            args = self._make_ctx_args(env, key)
+            args = self._make_ctx_args(env, hkey)
         up, down = args
         if self.patch_inputs:
             # The current addresses, into both arrays (the prepared values of
@@ -4002,15 +4171,15 @@ class DynaGraphRunner:
         _launch_prepared(self.f_setctx, ex.ctx.data_ptr(), down if same else up, stream)
         ex.last_args = args
         ex.flag_on = True
-        ex.applied = key
+        ex.applied = hkey
 
-    def _make_ctx_args(self, env: dict[str, int], key: Any) -> Any:
-        """The prepared `setctx` arguments for `key`: flags up, and flags down."""
+    def _make_ctx_args(self, env: dict[str, int], hkey: Any) -> Any:
+        """The prepared `setctx` arguments for `hkey`: flags up, and flags down."""
         n_sym = len(self.symbols)
         vals = [int(env[sym]) for sym in self.symbols] + [1]
-        if self.extern_sites and key in self.extern_outs:
-            vals += self._ext_ptrs(key)
-            vals += list(self.key_bodies[key])
+        if self.extern_sites and hkey in self.extern_outs:
+            vals += self._ext_ptrs(hkey)
+            vals += list(self.key_bodies[hkey])
         else:
             vals += [0] * (len(self.ext_slots) + len(self.extern_sites))
         vals += [0] * (1 + len(self.argv))
@@ -4020,7 +4189,7 @@ class DynaGraphRunner:
         args = (_prep_vals(vals), _prep_vals(down))
         if len(self.ctx_args) >= 4096:
             self.ctx_args.clear()
-        self.ctx_args[key] = args
+        self.ctx_args[hkey] = args
         return args
 
     def _pick_update(self) -> str:
@@ -4123,7 +4292,11 @@ class DynaGraphRunner:
 
         ref = self._reference(self.static_inputs)
         with self._unwritten(self.static_inputs):
+            # Not a call of the step: the first real call gets the lane the
+            # build harvested at, not the next one.
+            step_seen, calls = self.step_seen, self.calls_in_step
             got = self(list(self.static_inputs))
+            self.step_seen, self.calls_in_step = step_seen, calls
             ok = got is not None and _same_values(got, ref, self.exact)
         if not ok:
             if got is not None:
@@ -4408,9 +4581,14 @@ class DynaGraphRunner:
         from torch._inductor import config
 
         sym_order = sorted(self.sym_from_input.items())
-        held_idxs = [i for ok, i in self.out_order if not ok]
+        held_idxs = [i for ok, i in self.out_order if ok is False]
+        held_idxs += [
+            v[0] for ok, v in self.out_order if ok == "inview" and v[0] not in held_idxs
+        ]
         held_idxs += [i for i in self.mutated_inputs if i not in held_idxs]
-        out_pass = [(pos, v) for pos, (ok, v) in enumerate(self.out_order) if not ok]
+        out_pass = [
+            (pos, v) for pos, (ok, v) in enumerate(self.out_order) if ok is False
+        ]
         mut_copy = [i for i in self.mutated_inputs if i not in self.inplace]
         mut_patch = [i for i in self.mutated_inputs if i in self.inplace]
         return (
@@ -4460,6 +4638,31 @@ class DynaGraphRunner:
             if i < n_in and isinstance((v := inputs[i]), int)
         )
         env = dict(key)
+
+        # The lane: this call's arena. Every call of a step gets its own,
+        # since the outputs of the earlier ones are still out there.
+        step = _step_of(self.mode)
+        if step != self.step_seen:
+            self.step_seen, self.calls_in_step = step, 0
+        lane = self.calls_in_step
+        self.calls_in_step += 1
+        if lane >= len(self.lanes):
+            if lane >= _max_lanes():
+                if not self.lanes_warned:
+                    self.lanes_warned = True
+                    log.info(
+                        "DynaGraph: call %d of a step exceeds dynagraph_max_lanes=%d,"
+                        " served upstream",
+                        lane + 1,
+                        _max_lanes(),
+                    )
+                return SKIP_SHAPE
+            self.lanes.append(
+                torch.empty(
+                    self.lanes[0].numel(), dtype=torch.uint8, device=self.device
+                )
+            )
+        self.lane, self.arena = lane, self.lanes[lane]
 
         # Held aside because `inputs` is cleared on the way out, and these are
         # the tensors that come back out or get written back into.
@@ -4552,26 +4755,22 @@ class DynaGraphRunner:
             self._grow_arena(total)
 
         ex = self.ex
+        hkey = self._hkey(key)
         if self.extern_sites:
             if key in self.skip_keys:
                 return SKIP_SHAPE
-            if (
-                key in self.child_graphs
-                and self.harvest_addr.get(key) != self._harvest_addr()
-            ):
-                # Harvested when an input it reads, or the arena, sat
-                # elsewhere: a copy since replaced, a static input moved.
-                self._drop_harvest(key)
-            ex = self._ex_of.get(key)
+            ex = self._ex_of.get(hkey)
             if ex is None:
-                if key not in self.child_graphs and not self._harvest(env, key, inputs):
+                if hkey not in self.child_graphs and not self._harvest(
+                    env, key, hkey, inputs
+                ):
                     return SKIP_SHAPE if key in self.skip_keys else None
                 # The graph for this shape's topologies; the harvest just
                 # made it if it was new.
-                ex = self.execs[self._combo(key)]
+                ex = self.execs[self._combo(hkey)]
                 if len(self._ex_of) >= 4096:
                     self._ex_of.clear()
-                self._ex_of[key] = ex
+                self._ex_of[hkey] = ex
             self.ex = ex
         self.tick += 1
         ex.used = self.tick
@@ -4588,14 +4787,14 @@ class DynaGraphRunner:
                 for j in self.patch_inputs:
                     if (in_ptrs[j] or 0) != last[j]:
                         in_changed.append(j)
-            self._write_ctx(env, key, stream, in_changed)
-            if self.extern_sites and not self._swap_children(key):
+            self._write_ctx(env, hkey, stream, in_changed)
+            if self.extern_sites and not self._swap_children(hkey):
                 return None
 
         if self.extern_sites:
-            calls = self.eager_calls.get(key)
+            calls = self.eager_calls.get(hkey)
             if calls:
-                outs = self.extern_outs[key]
+                outs = self.extern_outs[hkey]
                 for i, (fn, a, kw) in calls.items():
                     r = fn(*a, **kw)
                     if "out" not in kw:
@@ -4603,7 +4802,7 @@ class DynaGraphRunner:
 
         if host:
             # Patch what moved and launch, one call into the region's C++.
-            if not self._host_step(env, key, stream):
+            if not self._host_step(env, hkey, stream):
                 return None
         else:
             # Launched directly: torch's `replay()` also moves the CUDA
@@ -4633,38 +4832,68 @@ class DynaGraphRunner:
                 if i in copied:
                     self._write_back(held[i], self.input_store[i], cu, stream)
 
-        # The arena views and extern outputs are the same tensors every call
-        # at this shape (fixed slots, per-shape harvest), so they are built
-        # once per shape; only an input handed back changes per call.
-        fixed = self.out_cache.get(key)
-        if fixed is None:
-            fixed = []
-            for is_arena, v in self.out_order:
+        # The geometry of every output is per shape and cached; the tensors
+        # are per call, since the arena is this call's lane and an extern
+        # output is this call's harvest.
+        cached = self.out_cache.get(key)
+        if cached is None:
+            geom: list[Any] = []
+            # Outputs that are a view of an input: geometry per shape, base
+            # per call (the caller's tensor, or the copy it was read from).
+            inview: list[tuple[int, int, list[int], list[int], int]] = []
+            for pos, (is_arena, v) in enumerate(self.out_order):
                 if is_arena == "extern":
-                    fixed.append(self._ext_value(key, v))
+                    geom.append(("extern", v))
+                elif is_arena == "inview":
+                    idx, (sizes_e, strides_e, off_e) = v
+                    vals = [_eval_int(e, env) for e in (*sizes_e, *strides_e, off_e)]
+                    if any(x is None for x in vals):
+                        _fallback("unevaluable-size", f"output view at {env}")
+                        return None
+                    ints = [int(x) for x in vals if x is not None]
+                    n_s = len(sizes_e)
+                    inview.append((pos, idx, ints[:n_s], ints[n_s:-1], ints[-1]))
+                    geom.append(None)
                 elif not is_arena:
-                    fixed.append(None)
+                    geom.append(None)
                 else:
-                    base, nbytes, dtype, sizes, strides = plan[v]
-                    # The layout keeps every slot 256-byte aligned, so viewing
-                    # the byte arena as the buffer dtype is always legal.
-                    flat = self.arena[base : base + nbytes].view(dtype)
-                    fixed.append(flat.as_strided(sizes, strides))
+                    base, _nbytes, dtype, sizes, strides = plan[v]
+                    geom.append(("arena", base, dtype, sizes, strides))
             if len(self.out_cache) >= 4096:
                 self.out_cache.clear()
-            self.out_cache[key] = fixed
-        out = list(fixed)
-        for pos, v in out_pass:
-            t = held[v]
-            store = self.input_store[v]
-            # A static input is read in place, so it is its own answer; so is
-            # one read where it is on this call. A copied one was read -- and
-            # possibly written -- in the storage here, viewed with this
-            # call's shape.
-            if store is None or v not in copied:
-                out[pos] = t
+            cached = self.out_cache[key] = (geom, inview)
+        geom, inview = cached
+        arena = self.arena
+        out: list[Any] = []
+        for g in geom:
+            if g is None:
+                out.append(None)
+            elif g[0] == "arena":
+                # A tensor of its own over the arena's storage (the layout
+                # keeps every slot 256-byte aligned, so the element offset is
+                # exact), not a view of the arena tensor: views share their
+                # base's version counter, and one in-place write to any
+                # output would make autograd refuse every other output of
+                # this arena it had saved.
+                out.append(_over_storage(arena, g[1], g[2], g[3], g[4]))
             else:
-                out[pos] = _store_view(store, t)
+                out.append(self._ext_value(hkey, g[1]))
+        # An input handed back is the caller's own tensor, never a view of
+        # the copy held here: a mutated one was written back into it above,
+        # and a view of the copy would share the copy's version counter,
+        # which the next call's copy bumps -- autograd then refuses a tensor
+        # it saved from this call ("modified by an inplace operation").
+        for pos, v in out_pass:
+            out[pos] = held[v]
+        for pos, idx, sizes, strides, off in inview:
+            t = held[idx]
+            out[pos] = _over_storage(
+                t,
+                (t.storage_offset() + off) * t.element_size(),
+                t.dtype,
+                sizes,
+                strides,
+            )
 
         if ref is not None:
             if not _same_values(out, ref, self.exact):

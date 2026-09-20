@@ -2144,6 +2144,16 @@ class triton:
         os.environ.get("TORCHINDUCTOR_DYNAGRAPH_MAX_GRAPHS", "8")
     )
 
+    # How many times a DynaGraph region may be called within one step (one
+    # forward and its backward, or one inference invocation) and keep every
+    # call's outputs alive: each call in a step writes an arena of its own,
+    # since autograd holds the earlier calls' outputs for the backward. A
+    # decoder layer compiled as one frame and run for each of N layers needs
+    # N. Calls past this are served by per-shape recording.
+    dynagraph_max_lanes: int = int(
+        os.environ.get("TORCHINDUCTOR_DYNAGRAPH_MAX_LANES", "128")
+    )
+
     # How many distinct shapes a DynaGraph region is checked against eager before
     # its replays are trusted. The planner is built by reading the generated
     # wrapper, and a formula that happens to be right at the shape the graph was

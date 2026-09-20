@@ -597,6 +597,11 @@ def _maybe_build_dynagraph(
         if not src:
             return dg._fallback("no-wrapper-source")
         runner = dg.DynaGraphRunner(model, src, _inputs_device(inputs))
+        runner.mode = (
+            "backward"
+            if kwargs.get("is_backward")
+            else ("inference" if kwargs.get("is_inference") else "forward")
+        )
         reason = runner.unusable_reason()
         if reason:
             return dg._fallback(reason)
