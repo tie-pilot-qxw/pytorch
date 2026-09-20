@@ -11216,6 +11216,27 @@ class Scheduler:
         if node.node is None:
             raise AssertionError("expected node.node to be set")
 
+        # DynaGraph resolving unbacked sizes on the device: the `.item()`
+        # (a DynamicScalar, a CPU op to the partitioner) and the slice size
+        # derived from it stay in the region, and so do the ops whose sizes
+        # depend on them; a planner node in the graph reads the value. Only
+        # for the symbols every use of which stays on the GPU
+        # (`_device_resolved_unbacked`); the rest are cut as always.
+        device_syms = self._device_resolved_unbacked()
+        if device_syms and isinstance(
+            node.node, (ir.DynamicScalar, ir.DynamicSliceSize)
+        ):
+            if node.node.get_unbacked_symbol_defs() <= device_syms:
+                return None
+        if device_syms and isinstance(node.node, ir.AssertScalar):
+            unbacked = [
+                s
+                for s in node.node.scalar.free_symbols
+                if symbol_is_type(s, SymT.UNBACKED_INT)
+            ]
+            if unbacked and all(s in device_syms for s in unbacked):
+                return None
+
         if not node.is_gpu():
             return f"{node.get_device()} ops"
 
@@ -11225,13 +11246,14 @@ class Scheduler:
         if isinstance(node.node, ir.Switch):
             return "Switch ops"
 
-        if getattr(node.node, "unbacked_bindings", None):
+        bindings = getattr(node.node, "unbacked_bindings", None)
+        if bindings and not all(s in device_syms for s in bindings):
             return "unbacked binding ops"
 
         if is_cudagraph_unsafe_op(node.node):
             return "CUDAGraph-unsafe custom ops"
 
-        if reason := self._uses_cudagraph_unsafe_unbacked_symint(node):
+        if reason := self._uses_cudagraph_unsafe_unbacked_symint(node, device_syms):
             return reason
 
         # Partition around nodes with dynamic shapes when cudagraph_skip_dynamic_graphs is enabled
@@ -11277,10 +11299,96 @@ class Scheduler:
 
         return unsafe_symints
 
+    @cache_on_self
+    def _device_resolved_unbacked(self) -> OrderedSet[sympy.Symbol]:
+        """The unbacked symbols DynaGraph resolves on the device
+        (`dynagraph_unbacked="device"`): defined by a `.item()` or a slice
+        size in this graph, never returned by the graph, and used by no node
+        that leaves the partition for another reason (a CPU op, a device
+        copy, an unsafe custom op). A symbol the host needs drags along the
+        ones it is derived from, since that arithmetic runs on the host.
+        """
+        out: OrderedSet[sympy.Symbol] = OrderedSet()
+        if not (
+            config.triton.dynagraph and config.triton.dynagraph_unbacked == "device"
+        ):
+            return out
+        defs: OrderedSet[sympy.Symbol] = OrderedSet()
+        deps_of: dict[sympy.Symbol, OrderedSet[sympy.Symbol]] = {}
+        for node in self.nodes:
+            for snode in node.get_nodes():
+                ir_node = snode.node
+                if not isinstance(ir_node, (ir.DynamicScalar, ir.DynamicSliceSize)):
+                    continue
+                for s in ir_node.get_unbacked_symbol_defs():
+                    defs.add(s)
+                    used: OrderedSet[sympy.Symbol] = OrderedSet()
+                    if isinstance(ir_node, ir.DynamicSliceSize):
+                        for e in (
+                            ir_node.start,
+                            ir_node.end,
+                            ir_node.size,
+                            ir_node.step,
+                        ):
+                            if isinstance(e, sympy.Expr):
+                                used.update(e.free_symbols)
+                    deps_of[s] = used
+        if not defs:
+            return out
+        bad: OrderedSet[sympy.Symbol] = OrderedSet()
+        for o in V.graph.graph_outputs:
+            # A symbolic scalar the graph returns is a ShapeAsConstantBuffer
+            # around its expression; the host needs its value.
+            e = o if isinstance(o, sympy.Basic) else getattr(o, "expr", None)
+            if isinstance(e, sympy.Basic):
+                bad.update(x for x in e.free_symbols if x in defs)
+        for node in self.nodes:
+            for snode in node.get_nodes():
+                ir_node = snode.node
+                if ir_node is None or isinstance(
+                    ir_node, (ir.DynamicScalar, ir.DynamicSliceSize, ir.AssertScalar)
+                ):
+                    continue
+                cut = (
+                    not snode.is_gpu()
+                    or isinstance(ir_node, (ir.DeviceCopy, ir.Switch))
+                    or is_cudagraph_unsafe_op(ir_node)
+                )
+                if (
+                    not cut
+                    and isinstance(ir_node, ir.FallbackKernel)
+                    and (op := ir_node.op_overload)
+                ):
+                    packet, name = get_op_names(op)
+                    cut = (
+                        packet in config.custom_should_partition_ops
+                        or name in config.custom_should_partition_ops
+                    )
+                if cut:
+                    bad.update(
+                        x for x in get_scheduler_node_symbol_uses(snode) if x in defs
+                    )
+        changed = True
+        while changed:
+            changed = False
+            for s in list(bad):
+                for d in deps_of.get(s, ()):
+                    if d in defs and d not in bad:
+                        bad.add(d)
+                        changed = True
+        out.update(s for s in defs if s not in bad)
+        return out
+
     def _uses_cudagraph_unsafe_unbacked_symint(
-        self, node: BaseSchedulerNode
+        self,
+        node: BaseSchedulerNode,
+        device_syms: OrderedSet[sympy.Symbol] | None = None,
     ) -> str | None:
         unsafe_symints = self._get_cudagraph_unsafe_unbacked_symints()
+        if device_syms:
+            unsafe_symints = OrderedSet(
+                s for s in unsafe_symints if s not in device_syms
+            )
         if not unsafe_symints:
             return None
 
@@ -11418,6 +11526,27 @@ class Scheduler:
             symplified_s = V.graph.sizevars.simplify(s)
             # use free_symbols only when s is simplified to an Integer or expr
             res.update(symplified_s.free_symbols)
+
+        # A runtime assert or slice size kept in the partition (DynaGraph's
+        # device-side unbacked handling) is host arithmetic over symbols the
+        # read/write sets do not mention; an unbacked symbol a node of the
+        # partition defines is bound in its own body, not passed in.
+        for node in partition:
+            if isinstance(node.node, ir.AssertScalar):
+                res.update(filter_symbols(OrderedSet(node.node.scalar.free_symbols)))
+            elif isinstance(node.node, ir.DynamicSliceSize):
+                for e in (
+                    node.node.start,
+                    node.node.end,
+                    node.node.size,
+                    node.node.step,
+                ):
+                    if isinstance(e, sympy.Expr):
+                        res.update(filter_symbols(OrderedSet(e.free_symbols)))
+        for node in partition:
+            defs = getattr(node.node, "get_unbacked_symbol_defs", None)
+            if defs is not None:
+                res -= defs()
 
         return OrderedSet(sorted(res, key=operator.attrgetter("name")))
 
