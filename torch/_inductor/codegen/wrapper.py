@@ -3407,6 +3407,7 @@ class PythonWrapperCodegen(CodeGen):
         with_step = codegen_with_step(f"{sym}_start", f"{sym}_end", node.step)
         self.writeline(f"{sym} = max(0, {with_step})")
         self.unbacked_symbol_decls.add(str(node.unbacked_size_symbol))
+        self.codegen_unbacked_range_comment(node.unbacked_size_symbol)
         # Bind the buffer name like DynamicScalar and AssertScalar do: a
         # NoneLayout buffer is still named by the nodes that depend on it.
         self.writeline(f"{node.get_name()} = None")
@@ -3431,9 +3432,19 @@ class PythonWrapperCodegen(CodeGen):
             )
         else:
             raise AssertionError(f"unrecognized keypath {node.keypath}")
+        self.codegen_unbacked_range_comment(node.sym)
         # No one should ever use this buffer, but for uniformity
         # define the variable and assign it None
         self.writeline(f"{node.get_name()} = None")
+
+    def codegen_unbacked_range_comment(self, sym) -> None:
+        """A comment with the value range of an unbacked symbol, for a reader
+        of the wrapper that sizes buffers by the bound instead of the value
+        (DynaGraph's device-side unbacked handling)."""
+        vr = V.graph.sizevars.shape_env.var_to_range.get(sym)
+        if vr is None:
+            return
+        self.writeline(f"# unbacked {sym} in [{vr.lower}, {vr.upper}]")
 
     def _coor_device_type_str(self, device: torch.device) -> str:
         """Render a device for the benchmark harness rank-agnostically: the bare device type

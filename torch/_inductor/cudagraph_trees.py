@@ -513,6 +513,15 @@ def cudagraphify_impl(
                     # A replay stopped matching eager, so the region retires and
                     # recording takes over from here. `inputs` is untouched.
                     dynagraph_runner = False
+            from torch._inductor import dynagraph as dg
+
+            if config.triton.dynagraph_unbacked == "device" and dg.device_scalar_region(
+                model
+            ):
+                # The region keeps its `.item()` inside; recording it would
+                # sync in the capture, so what DynaGraph does not serve runs
+                # eagerly.
+                return model(inputs)
 
         fn = fn_cache.get(int_key)
         if fn is not None:
@@ -596,12 +605,12 @@ def _maybe_build_dynagraph(
         src = dg._wrapper_source(model)
         if not src:
             return dg._fallback("no-wrapper-source")
-        runner = dg.DynaGraphRunner(model, src, _inputs_device(inputs))
-        runner.mode = (
+        mode = (
             "backward"
             if kwargs.get("is_backward")
             else ("inference" if kwargs.get("is_inference") else "forward")
         )
+        runner = dg.DynaGraphRunner(model, src, _inputs_device(inputs), mode)
         reason = runner.unusable_reason()
         if reason:
             return dg._fallback(reason)
@@ -610,9 +619,10 @@ def _maybe_build_dynagraph(
             v = inputs[i] if i < len(inputs) else None
             if isinstance(v, int):
                 env[sym] = v
-        if len(env) != len(runner.symbols):
+        if len(env) != len(runner.host_symbols):
             return dg._fallback(
-                "symbol-not-an-argument", f"resolved {sorted(env)} of {runner.symbols}"
+                "symbol-not-an-argument",
+                f"resolved {sorted(env)} of {runner.host_symbols}",
             )
         # `runner.body` rather than `src`: under graph partitioning the file
         # holds every partition, and only this one's buffers go in the arena.

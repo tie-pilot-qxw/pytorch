@@ -84,6 +84,15 @@ def _cuda() -> Any:
             ctypes.c_void_p,
         ]
         lib.cuMemcpyDtoDAsync_v2.restype = ctypes.c_int
+        lib.cuMemcpyDtoHAsync_v2.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+        ]
+        lib.cuMemcpyDtoHAsync_v2.restype = ctypes.c_int
+        lib.cuStreamSynchronize.argtypes = [ctypes.c_void_p]
+        lib.cuStreamSynchronize.restype = ctypes.c_int
         _libcuda = lib
     return _libcuda
 
@@ -450,7 +459,7 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
 
 
 # --------------------------------------------------------------- codegen
-def _expr_to_c(expr: str, sym_index: dict[str, int]) -> str:
+def _expr_to_c(expr: str, sym_index: dict[str, int], local_names: Any = ()) -> str:
     """Translate a wrapper expression to C.
 
     Parsed rather than string-substituted: these expressions contain Python's
@@ -473,9 +482,24 @@ def _expr_to_c(expr: str, sym_index: dict[str, int]) -> str:
                 return f"(int64_t){n.value}", False
             return f"((double){n.value!r})", True
         if isinstance(n, ast.Name):
+            if n.id in local_names:
+                return n.id, False
             if n.id not in sym_index:
                 raise KeyError(f"unknown symbol {n.id}")
             return f"S({sym_index[n.id]})", False
+        if isinstance(n, ast.IfExp):
+            (c, _fc), (a, fa), (b, fb) = go(n.test), go(n.body), go(n.orelse)
+            return f"(({c}) ? ({a}) : ({b}))", fa or fb
+        if isinstance(n, ast.Compare) and len(n.ops) == 1:
+            cop = _C_COMPARE.get(type(n.ops[0]))
+            if cop is None:
+                raise NotImplementedError(f"comparison {type(n.ops[0]).__name__}")
+            (a, _fa), (b, _fb) = go(n.left), go(n.comparators[0])
+            return f"(int64_t)({a} {cop} {b})", False
+        if isinstance(n, ast.BoolOp):
+            parts = [go(v)[0] for v in n.values]
+            join = " && " if isinstance(n.op, ast.And) else " || "
+            return "(int64_t)(" + join.join(f"({x})" for x in parts) + ")", False
         if isinstance(n, ast.BinOp):
             (a, fa), (b, fb) = go(n.left), go(n.right)
             op = n.op
@@ -524,6 +548,16 @@ def _expr_to_c(expr: str, sym_index: dict[str, int]) -> str:
     if is_float:
         raise Unsupported(f"non-integer expression {expr!r}")
     return code
+
+
+_C_COMPARE: dict[Any, str] = {
+    ast.GtE: ">=",
+    ast.Gt: ">",
+    ast.LtE: "<=",
+    ast.Lt: "<",
+    ast.Eq: "==",
+    ast.NotEq: "!=",
+}
 
 
 _PLANNER_TEMPLATE = r"""
@@ -846,6 +880,7 @@ def generate_planner(
     input_addr: dict[int, int] | None = None,
     sizes: dict[str, tuple[str, int]] | None = None,
     fixed_off: Sequence[int] | None = None,
+    dev: Any = None,
 ) -> str:
     """The device-side planner: CUDA source with a kernel that patches the graph.
 
@@ -859,6 +894,12 @@ def generate_planner(
     `sizes` (element span and item size per buffer) with `slot_of` is what
     the `setctx` kernel lays the arena out from on every shape; `fixed_off`
     instead bakes a layout chosen at build (`dynagraph_layout="fixed"`).
+
+    `dev` (a `_DevScalars`) adds one kernel per `.item()` of the region,
+    `dynagraph_planner_u<j>`, launched in the graph right after the kernel
+    that wrote the value: it reads the value, derives the other unbacked
+    symbols from it and patches the grid and scalar arguments of the nodes
+    after it that depend on them, which the main planner then leaves alone.
     """
     n_ext = n_sites if n_ext is None else n_ext
     n_in = len(argv) if argv else 0
@@ -981,6 +1022,43 @@ def generate_planner(
                 f"    case {i}:\n" + "\n".join(patches) + "\n      break;"
             )
 
+    dev_grid: dict[int, list[str]] = {}
+    dev_param: dict[int, list[str]] = {}
+    if dev is not None:
+        for i, k in enumerate(kernels):
+            texts = list(k["grid"] or []) + list(k["exprs"].values())
+            texts += [
+                e
+                for e in (
+                    k["exprs"].get(n) or k["consts"].get(n)
+                    for n in _grid_numel_names(k)
+                )
+                if e is not None
+            ]
+            deps = OrderedSet(
+                u for t in texts for u in _UNBACKED.findall(str(t)) if u in dev.point_of
+            )
+            if not deps:
+                continue
+            point = max(dev.point_of[u] for u in deps)
+            if i < dev.items[point][3]:
+                raise Unsupported(
+                    f"{k['name']} depends on {sorted(deps)} before its .item()"
+                )
+            head = f"    case {i}:"
+            for pos, case in enumerate(grid_cases):
+                if case.startswith(head):
+                    dev_grid.setdefault(point, []).append(case)
+                    grid_cases[pos] = (
+                        f"{head} static_grid = true; break;"
+                        f"  // {k['name']}: planner_u{point}"
+                    )
+                    break
+            for pos, case in enumerate(param_cases):
+                if case.startswith(head + "\n"):
+                    dev_param.setdefault(point, []).append(param_cases.pop(pos))
+                    break
+
     n_sym = len(symbols)
     ext0 = n_sym + 2 + len(kernels)
     body0 = ext0 + n_ext
@@ -1085,7 +1163,124 @@ def generate_planner(
         ),
     ):
         out = out.replace(tag, val)
+    if dev is not None:
+        out += _planner_u_source(
+            dev,
+            kernels,
+            symbols,
+            sym_index,
+            slot_of or {},
+            alias or {},
+            dev_grid,
+            dev_param,
+        )
     return out
+
+
+_C_SCALAR = {
+    "torch.int64": "long long",
+    "torch.int32": "int",
+    "torch.int16": "short",
+    "torch.int8": "signed char",
+    "torch.uint8": "unsigned char",
+    "torch.bool": "unsigned char",
+}
+
+
+def _planner_u_source(
+    dev: Any,
+    kernels: list[dict[str, Any]],
+    symbols: list[str],
+    sym_index: dict[str, int],
+    slot_of: dict[str, int],
+    alias: dict[str, str],
+    dev_grid: dict[int, list[str]],
+    dev_param: dict[int, list[str]],
+) -> str:
+    """One kernel per `.item()` point: read the value where the kernel before
+    it left it, derive the symbols that follow from it, and patch the nodes
+    after it that depend on them (see `generate_planner`)."""
+    n_sym, n_k = len(symbols), len(kernels)
+    out = ["\n#define S(i) (ctx[(i)])"]
+    for j, (name, buf, form, _k) in enumerate(dev.items):
+        root = buf
+        seen: OrderedSet[str] = OrderedSet()
+        while root in alias and root not in seen:
+            seen.add(root)
+            root = alias[root]
+        if root not in slot_of:
+            raise Unsupported(
+                f"unbacked-source: {name} is read off {buf}, not an arena buffer"
+            )
+        ctype = _C_SCALAR.get(dev.item_dtype.get(name, ""))
+        if ctype is None:
+            raise Unsupported(
+                f"unbacked-source: {name} is read off a {dev.item_dtype.get(name)}"
+            )
+        read = f"(int64_t)(*(const {ctype}*)(ARENA + SLOT_OFF({slot_of[root]})))"
+        if form == "bool":
+            read = f"({read} != 0 ? 1 : 0)"
+        lines: list[str] = []
+        local_names: OrderedSet[str] = OrderedSet()
+
+        def assign(nm: str, expr_c: str) -> None:
+            if nm in sym_index:
+                lines.append(
+                    f"    {{ int64_t nv = {expr_c}; if (ctx[{sym_index[nm]}] != nv)"
+                    f" {{ ctx[{sym_index[nm]}] = nv; c = 1; }} }}  // {nm}"
+                )
+            else:
+                local_names.add(nm)
+                lines.append(f"    int64_t {nm} = {expr_c};")
+
+        assign(name, read)
+        for nm, expr, point in dev.derived:
+            if point == j:
+                assign(nm, _expr_to_c(expr, sym_index, local_names))
+        grid = "\n".join(dev_grid.get(j, []))
+        params = "\n".join(dev_param.get(j, []))
+        body = "\n".join(lines)
+        out.append(
+            f"""
+extern "C" __global__ void dynagraph_planner_u{j}(
+    const cudaGraphDeviceNode_t* __restrict__ handles,
+    int64_t* __restrict__ ctx)
+{{
+  __shared__ int changed;
+  if (threadIdx.x == 0) {{
+    int c = ctx[{n_sym}] != 0 ? 1 : 0;
+{body}
+    changed = c;
+  }}
+  __syncthreads();
+  if (!changed) return;
+  for (int i = threadIdx.x; i < {n_k}; i += blockDim.x) {{
+    int64_t gx = 1, gy = 1, gz = 1;
+    bool static_grid = false;
+    switch (i) {{
+{grid}
+      default: static_grid = true; break;
+    }}
+    if (!static_grid) {{
+      int64_t* en = ctx + {n_sym + 2} + i;
+      if (gx <= 0 || gy <= 0 || gz <= 0) {{
+        if (*en) {{ cudaGraphKernelNodeSetEnabled(handles[i], 0); *en = 0; }}
+        continue;
+      }}
+      if (!*en) {{ cudaGraphKernelNodeSetEnabled(handles[i], 1); *en = 1; }}
+      cudaGraphKernelNodeSetGridDim(handles[i],
+          dim3((unsigned)gx, (unsigned)gy, (unsigned)gz));
+    }}
+    switch (i) {{
+{params}
+      default: break;
+    }}
+  }}
+}}
+"""
+        )
+    out.append("#undef S\n")
+    return "\n".join(out)
 
 
 _HOST_TEMPLATE = r"""
@@ -1650,6 +1845,16 @@ def _parse_expr(expr: str) -> Any:
         return None
 
 
+_PY_COMPARE: dict[Any, Any] = {
+    ast.GtE: lambda a, b: a >= b,
+    ast.Gt: lambda a, b: a > b,
+    ast.LtE: lambda a, b: a <= b,
+    ast.Lt: lambda a, b: a < b,
+    ast.Eq: lambda a, b: a == b,
+    ast.NotEq: lambda a, b: a != b,
+}
+
+
 def _eval_int(expr: str, env: dict[str, int]) -> int | None:
     """Evaluate an arithmetic expression over symbol values, or None if it is
     not a plain arithmetic expression."""
@@ -1691,6 +1896,21 @@ def _eval_int(expr: str, env: dict[str, int]) -> int | None:
         if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub):
             v = go(n.operand)
             return None if v is None else -v
+        if isinstance(n, ast.IfExp):
+            c = go(n.test)
+            if c is None:
+                return None
+            return go(n.body) if c else go(n.orelse)
+        if isinstance(n, ast.Compare) and len(n.ops) == 1:
+            a, b = go(n.left), go(n.comparators[0])
+            if a is None or b is None or type(n.ops[0]) not in _PY_COMPARE:
+                return None
+            return int(_PY_COMPARE[type(n.ops[0])](a, b))
+        if isinstance(n, ast.BoolOp):
+            vs = [go(v) for v in n.values]
+            if any(v is None for v in vs):
+                return None
+            return int(all(vs) if isinstance(n.op, ast.And) else any(vs))
         if isinstance(n, ast.Call):
             f = n.func
             if isinstance(f, ast.Name) and f.id in ("min", "max"):
@@ -2175,6 +2395,26 @@ def generate_pointer_patches(
 
 
 # --------------------------------------------------------------- runner
+_dev_region_cache: dict[int, bool] = {}
+
+
+def device_scalar_region(model: Any) -> bool:
+    """Whether the wrapper cudagraphify was handed keeps a `.item()` inside
+    (`dynagraph_unbacked="device"`). Such a region cannot be recorded the
+    ordinary way (the read would sync inside the capture), so when DynaGraph
+    does not serve it, it runs eagerly."""
+    key = id(model)
+    v = _dev_region_cache.get(key)
+    if v is None:
+        src = _wrapper_source(model)
+        body = _entry_source(src, getattr(model, "__name__", None)) if src else None
+        v = bool(body) and body is not src and ".item()" in body
+        if len(_dev_region_cache) >= 4096:
+            _dev_region_cache.clear()
+        _dev_region_cache[key] = v
+    return v
+
+
 def _wrapper_source(model: Any) -> str | None:
     g = getattr(model, "__globals__", None)
     path = (g or {}).get("__file__")
@@ -2792,6 +3032,152 @@ class _Exec:
             pass
 
 
+_ITEM_LINE = re.compile(r"^\s*(u\d+(?:_undivided)?)\s*=\s*(\w+)\.item\(\)\s*$")
+_ITEM_BOOL_LINE = re.compile(r"^\s*(u\d+)\s*=\s*1 if (\w+)\.item\(\) else 0\s*$")
+_DEV_ASSIGN = re.compile(r"^\s*(u\d+(?:_\w+)?)\s*=\s*(.+?)\s*$")
+_RANGE_LINE = re.compile(r"^\s*# unbacked (u\d+) in \[(\S+), (\S+)\]\s*$")
+_CHECK_LINE = re.compile(r"^\s*if not \((.+)\):\s*$")
+_UNBACKED = re.compile(r"\bu\d+\b")
+_INT_DTYPES = (
+    "torch.int64",
+    "torch.int32",
+    "torch.int16",
+    "torch.int8",
+    "torch.uint8",
+    "torch.bool",
+)
+
+
+class _DevScalars:
+    """The unbacked symbols a region resolves on the device.
+
+    With `dynagraph_unbacked="device"` Inductor keeps a `.item()` and the
+    sizes derived from it inside the partition. Read off the wrapper here:
+    the item lines (symbol, the buffer read, the form), the host arithmetic
+    that derives further symbols from them, the value ranges Inductor wrote
+    as comments and the runtime checks it emitted, which together bound
+    each symbol above. A buffer sized by such a symbol takes the bound; a
+    planner node placed right after the kernel that wrote the buffer reads
+    the value and patches what depends on it.
+    """
+
+    def __init__(self) -> None:
+        # (symbol, buffer read, "int" | "bool", kernel launches before the line)
+        self.items: list[tuple[str, str, str, int]] = []
+        # (name, expression, item point it follows); a name that is not a
+        # symbol (`u1_start`) is a temporary of the arithmetic.
+        self.derived: list[tuple[str, str, int]] = []
+        self.ranges: dict[str, tuple[str, str]] = {}
+        self.uppers: dict[str, list[str]] = {}
+        self.bounds: dict[str, str | None] = {}
+        self.syms: list[str] = []
+        self.point_of: dict[str, int] = {}
+        # Symbols that appear outside the item/derived/check lines: sizes,
+        # views, extern shapes, kernel scalars. These need a value at
+        # capture, so they need a bound.
+        self.used: OrderedSet[str] = OrderedSet()
+        self.problem: str | None = None
+        # Item name -> its point (the planner_u kernel that reads it), and
+        # the dtype of the buffer it reads (set by the runner from the
+        # allocation lines).
+        self.item_index: dict[str, int] = {}
+        self.item_dtype: dict[str, str] = {}
+
+    @property
+    def names(self) -> OrderedSet[str]:
+        return OrderedSet(self.syms)
+
+
+def _device_scalars(body: str) -> _DevScalars | None:
+    """Parse the unbacked-symbol lines of a wrapper body; None if it has none."""
+    if not re.search(r"\.item\(\)", body):
+        return None
+    d = _DevScalars()
+    n_run = 0
+    point = -1
+    for line in body.splitlines():
+        m = _RANGE_LINE.match(line)
+        if m:
+            d.ranges[m.group(1)] = (m.group(2), m.group(3))
+            continue
+        code = "" if line.lstrip().startswith("#") else line.split("#", 1)[0]
+        m = _ITEM_LINE.match(code)
+        form = "int"
+        if m is None:
+            m = _ITEM_BOOL_LINE.match(code)
+            form = "bool"
+        if m:
+            name, buf = m.group(1), m.group(2)
+            point = len(d.items)
+            d.items.append((name, buf, form, n_run))
+            d.point_of[name] = point
+            d.item_index[name] = point
+            if re.fullmatch(r"u\d+", name):
+                d.syms.append(name)
+            continue
+        m = _DEV_ASSIGN.match(code)
+        if m and not code.lstrip().startswith("if "):
+            name, expr = m.group(1), m.group(2)
+            if point < 0:
+                d.problem = f"unbacked-order: {name} assigned before any .item()"
+                return d
+            d.derived.append((name, expr, point))
+            if re.fullmatch(r"u\d+", name):
+                d.syms.append(name)
+                d.point_of[name] = point
+            continue
+        m = _CHECK_LINE.match(code)
+        if m:
+            _record_upper(d, m.group(1))
+            continue
+        if re.match(r"^\s*(raise |assert |del |return\b)", code):
+            continue
+        n_run += code.count(".run(")
+        for u in _UNBACKED.findall(code):
+            d.used.add(u)
+    for u in d.syms:
+        cands = []
+        _lo, hi = d.ranges.get(u, ("-int_oo", "int_oo"))
+        if re.fullmatch(r"-?\d+", hi):
+            cands.append(hi)
+        cands += d.uppers.get(u, [])
+        bound: str | None = None
+        for c in cands:
+            bound = c if bound is None else f"min({bound}, {c})"
+        d.bounds[u] = bound
+        if bound is None and u in d.used:
+            d.problem = f"unbacked-unbounded: {u} has no upper bound"
+    for u in d.used:
+        if u not in d.syms:
+            d.problem = f"unbacked-undefined: {u} is not assigned in the body"
+    return d
+
+
+def _record_upper(d: _DevScalars, cond: str) -> None:
+    """`u <= expr` / `expr >= u` from a runtime check: an upper bound of `u`
+    in terms of the region's other symbols."""
+    try:
+        node = ast.parse(cond.strip(), mode="eval").body
+    except SyntaxError:
+        return
+    if not (isinstance(node, ast.Compare) and len(node.ops) == 1):
+        return
+    left, right, op = node.left, node.comparators[0], node.ops[0]
+    u, other, strict = None, None, False
+    if isinstance(left, ast.Name) and re.fullmatch(r"u\d+", left.id):
+        if isinstance(op, (ast.LtE, ast.Lt)):
+            u, other, strict = left.id, right, isinstance(op, ast.Lt)
+    elif isinstance(right, ast.Name) and re.fullmatch(r"u\d+", right.id):
+        if isinstance(op, (ast.GtE, ast.Gt)):
+            u, other, strict = right.id, left, isinstance(op, ast.Gt)
+    if u is None or other is None:
+        return
+    text = ast.unparse(other)
+    if _UNBACKED.search(text):
+        return
+    d.uppers.setdefault(u, []).append(f"({text}) - 1" if strict else text)
+
+
 class _LazyAllocs:
     """Sequence that performs the wrapper's real allocation on demand.
 
@@ -2829,14 +3215,16 @@ class DynaGraphRunner:
     understood, so the caller falls back to the ordinary path.
     """
 
-    def __init__(self, model: Any, src: str, device: Any) -> None:
+    def __init__(
+        self, model: Any, src: str, device: Any, mode: str = "inference"
+    ) -> None:
         import torch
         from torch._inductor import config
 
         self.model = model
         # "forward", "backward" or "inference": what the region is to autograd,
         # which is what tells a step boundary from a call within one.
-        self.mode = "inference"
+        self.mode = mode
         # The arenas: one per call of a step (`_Steps`), `self.arena` being
         # the one the current call uses.
         self.lanes: list[Any] = []
@@ -2910,6 +3298,17 @@ class DynaGraphRunner:
         # Every view assigned in the wrapper, with its composed element
         # offset: a call-site argument may be one (`_view_of`).
         self.views = _buffer_views(body)
+        # Unbacked symbols resolved on the device (`dynagraph_unbacked="device"`).
+        self.dev: _DevScalars | None = _device_scalars(body)
+        self.dev_model: Any = None
+        self.dev_out_syms: list[str] = []
+        self.dev_out_idx: list[int] = []
+        self._bounds_now: dict[str, int] = {}
+        self._capturing = False
+        self.bound_env: dict[Any, Any] = {}
+        self.f_planner_u: list[int] = []
+        self._u_pin: Any = None
+        self._u_view: Any = None
         # A returned buffer is often a rename of one that owns the allocation.
         # What comes back is a mix: arena buffers, and inputs handed straight
         # through. `out_order` keeps the caller's order across both, since the
@@ -3022,7 +3421,157 @@ class DynaGraphRunner:
         # Per shape: the output tensors that do not depend on the call.
         # key -> (the outputs fixed per shape, the input-view outputs' geometry)
         self.out_cache: dict[Any, Any] = {}
+        if self.dev is not None:
+            self._dev_check(body, src)
         self.sym_index = {s: i for i, s in enumerate(self.symbols or [])}
+
+    @property
+    def host_symbols(self) -> list[str]:
+        """The symbols that arrive as arguments: all of them, less the ones
+        the region reads off the device."""
+        if self.dev is None:
+            return list(self.symbols)
+        names = self.dev.names
+        return [s for s in self.symbols if s not in names]
+
+    def _dev_check(self, body: str, src: str) -> None:
+        """What rules out serving a region's `.item()` on the device, and the
+        wrapper rewritten for the intercepted runs (harvest, capture): every
+        assignment of an unbacked symbol becomes a call handing back the
+        symbol's bound, and at capture the item's planner is launched."""
+        dev = self.dev
+        if dev is None or dev.problem:
+            return
+        if body is src:
+            dev.problem = "unbacked-no-partition"
+            return
+        for name, buf, _form, _k in dev.items:
+            root = buf
+            seen: OrderedSet[str] = OrderedSet()
+            while root in self.alias and root not in seen:
+                seen.add(root)
+                root = self.alias[root]
+            lay = self.layouts.get(root)
+            if lay is None:
+                dev.problem = (
+                    f"unbacked-source: {name} is read off {buf}, not an allocation"
+                )
+                return
+            if lay[2] not in _INT_DTYPES:
+                dev.problem = f"unbacked-source: {name} is read off a {lay[2]} buffer"
+                return
+            dev.item_dtype[name] = lay[2]
+
+        def u_sized(nm: str) -> bool:
+            lay = self.layouts.get(nm)
+            span = self.sizes.get(nm)
+            texts = [span[0]] if span else []
+            if lay:
+                texts += list(lay[0]) + list(lay[1])
+            return any(_UNBACKED.search(str(t)) for t in texts)
+
+        site_lines = [
+            line.split("#", 1)[0]
+            for line in body.splitlines()
+            if _SITE_CALL.search(line.split("#", 1)[0])
+        ]
+        for code in site_lines:
+            if not _UNBACKED.search(code):
+                continue
+            m = _SITE_CALL.search(code)
+            out = m.group("out") if m else None
+            mo = re.search(r"\bout\s*=\s*(\w+)", code)
+            if mo:
+                out = mo.group(1)
+            if out is None or not u_sized(out):
+                dev.problem = "unbacked-extern-reduce: an extern call reduces over an unbacked size"
+                return
+            for nm in re.findall(r"\bbuf\d+\b", code):
+                lay = self.layouts.get(nm)
+                if (
+                    nm != out
+                    and u_sized(nm)
+                    and lay is not None
+                    and lay[2] in _INT_DTYPES
+                ):
+                    dev.problem = (
+                        f"unbacked-extern-index: {nm} holds indices of an unbacked size"
+                    )
+                    return
+        if any(ok == "extern" for ok, _v in self.out_order) and any(
+            _UNBACKED.search(code) for code in site_lines
+        ):
+            dev.problem = "unbacked-extern-output: an extern output sized by an unbacked symbol is returned"
+            return
+        lines = []
+        for line in body.splitlines():
+            code = "" if line.lstrip().startswith("#") else line.split("#", 1)[0]
+            indent = line[: len(line) - len(line.lstrip())]
+            m = _ITEM_LINE.match(code) or _ITEM_BOOL_LINE.match(code)
+            if m:
+                lines.append(
+                    f"{indent}{m.group(1)} = __dg_item({m.group(1)!r}, {m.group(2)})"
+                )
+                continue
+            m = _DEV_ASSIGN.match(code)
+            if (
+                m
+                and re.fullmatch(r"u\d+", m.group(1))
+                and not code.lstrip().startswith("if ")
+            ):
+                lines.append(f"{indent}{m.group(1)} = __dg_item({m.group(1)!r}, None)")
+                continue
+            lines.append(line)
+        fname = f"__dg_dev_{id(self)}"
+        text = f"def {fname}(args):\n" + "\n".join(lines) + "\n"
+        g = self.model.__globals__
+        try:
+            exec(compile(text, f"<dynagraph {fname}>", "exec"), g)
+        except SyntaxError as exc:
+            dev.problem = f"unbacked-rewrite: {exc}"
+            return
+        self.dev_model = g[fname]
+
+    def _with_bounds(self, env: dict[str, int]) -> dict[str, int] | None:
+        """`env` with every device-resolved symbol at its upper bound (0 for
+        one that has none and is never used in a size)."""
+        if self.dev is None:
+            return env
+        out = dict(env)
+        for u in self.dev.syms:
+            b = self.dev.bounds.get(u)
+            if b is None:
+                out[u] = 0
+                continue
+            v = _eval_int(b, out)
+            if v is None:
+                return None
+            out[u] = max(int(v), 0)
+        return out
+
+    def _dev_item(self, name: str, buf: Any) -> int:
+        """What the rewritten wrapper gets for an unbacked symbol: its bound
+        (the intercepted runs lay buffers out and run externs at the bound);
+        at capture, the item's planner is launched here, so it lands in the
+        graph right after the kernel that writes the value."""
+        import torch
+
+        b = self._bounds_now.get(name)
+        if self._capturing:
+            j = self.dev.item_index.get(name) if self.dev is not None else None
+            if j is not None and j < len(self.f_planner_u):
+                n = max(len(self.kernels), 1)
+                _launch(
+                    self.f_planner_u[j],
+                    [self.ex.handles.data_ptr(), self.ex.ctx.data_ptr()],
+                    1,
+                    min(1024, ((n + 31) // 32) * 32),
+                    torch.cuda.current_stream().cuda_stream,
+                )
+            return b if b is not None else 0
+        if b is not None:
+            return b
+        return int(buf.item()) if buf is not None else 0
 
     def unusable_reason(self) -> str | None:
         """The first thing that rules this graph out, or None to go ahead.
@@ -3038,6 +3587,8 @@ class DynaGraphRunner:
             return "multi-partition"
         if not self.kernels and not self.extern_sites:
             return "no-kernels"
+        if self.dev is not None and self.dev.problem:
+            return self.dev.problem
         if not self.symbols:
             return "no-symbols"
         # `out_order`, not `outputs`: a partition can legitimately return only
@@ -3055,7 +3606,15 @@ class DynaGraphRunner:
             return "no-symbol-args"
         from torch._inductor import config
 
-        if unreachable_launch(self.body, config.triton.dynagraph_extern_child):
+        body = self.body or ""
+        if self.dev is not None:
+            # The `.item()` lines are the region's own business here.
+            body = "\n".join(
+                line
+                for line in body.splitlines()
+                if not (_ITEM_LINE.match(line) or _ITEM_BOOL_LINE.match(line))
+            )
+        if unreachable_launch(body, config.triton.dynagraph_extern_child):
             return "extern-launch"
         return None
 
@@ -3206,6 +3765,14 @@ class DynaGraphRunner:
             if k["blocks"] is None:
                 return _fallback("unsettled-config", k["name"])
 
+        if self.dev is not None:
+            bounded = self._with_bounds(env)
+            if bounded is None:
+                return _fallback("unevaluable-size", "unbacked bounds at build")
+            env = bounded
+            self._bounds_now = env
+            self.dev_out_syms = self._dev_output_symbols()
+            self.dev_out_idx = [self.symbols.index(u) for u in self.dev_out_syms]
         sz = self._slot_sizes(env)
         if sz is None:
             return _fallback("unevaluable-size", "at build")
@@ -3228,6 +3795,13 @@ class DynaGraphRunner:
             self.fixed_size, self.fixed_off = fixed_slot_offsets(sz, headroom, per_slot)
         if self.update == "auto":
             self.update = self._pick_update()
+        if self.dev is not None and self.update != "device":
+            # A value read on the device can only be patched from there.
+            log.info(
+                "DynaGraph update %s -> device: the region reads an unbacked value",
+                self.update,
+            )
+            self.update = "device"
         # Item sizes of everything a view can be taken of, for the pointer
         # patches of offset views.
         self.itemsize_of = {
@@ -3315,6 +3889,7 @@ class DynaGraphRunner:
                     itemsize_of=self.itemsize_of,
                     sizes=self.sizes,
                     fixed_off=self.fixed_off,
+                    dev=self.dev,
                 )
         except Unsupported as exc:
             return _fallback("unmodelled", str(exc))
@@ -3342,12 +3917,14 @@ class DynaGraphRunner:
                 *[len(k["funcs"]) for k in self.kernels]
             )
         else:
-            funcs = _compile_module(
-                planner_src or "", ["dynagraph_planner", "dynagraph_setctx"]
-            )
+            names = ["dynagraph_planner", "dynagraph_setctx"]
+            if self.dev is not None:
+                names += [f"dynagraph_planner_u{j}" for j in range(len(self.dev.items))]
+            funcs = _compile_module(planner_src or "", names)
             if funcs is None:
                 return _fallback("planner-build")
-            self.f_planner, self.f_setctx = funcs
+            self.f_planner, self.f_setctx = funcs[0], funcs[1]
+            self.f_planner_u = list(funcs[2:])
 
         offsets = self.slot_offsets(env)
         if offsets is None:
@@ -3360,7 +3937,9 @@ class DynaGraphRunner:
         )
         self.lanes, self.lane = [self.arena], 0
         if self.extern_sites:
-            key = tuple(sorted(env.items()))
+            key = tuple(
+                sorted((s, v) for s, v in env.items() if s in self.sym_from_input)
+            )
             if not self._harvest(env, key, self._hkey(key), inputs):
                 return False
 
@@ -3668,6 +4247,9 @@ class DynaGraphRunner:
         g["empty_strided_cuda"] = alloc
         old_torch = g.get("torch")
         old_aten = g.get("aten")
+        old_item = g.get("__dg_item")
+        if self.dev_model is not None:
+            g["__dg_item"] = self._dev_item
         ops_calls = {}
         try:
             for name in OrderedSet(self.extern_sites):
@@ -3680,12 +4262,17 @@ class DynaGraphRunner:
                 g["torch"] = _TorchProxy(old_torch, ops_calls)
                 if old_aten is not None:
                     g["aten"] = _OpsLevel(old_aten, ops_calls, "aten")
-            out = self.model(list(args))
+            out = (self.dev_model or self.model)(list(args))
         finally:
             for name, fn in saved.items():
                 setattr(extern_kernels, name, fn)
             if old_alloc is not None:
                 g["empty_strided_cuda"] = old_alloc
+            if self.dev_model is not None:
+                if old_item is None:
+                    g.pop("__dg_item", None)
+                else:
+                    g["__dg_item"] = old_item
             if ops_calls:
                 g["torch"] = old_torch
                 if old_aten is not None:
@@ -4027,10 +4614,72 @@ class DynaGraphRunner:
     def _slot_sizes(self, env: dict[str, int]) -> list[int] | None:
         return slot_sizes(self.sizes, self.slot_of, self.n_slots, env)
 
+    def _read_symbols(self, cu: Any, stream: int) -> tuple[int, ...] | None:
+        """The device-resolved symbols an output needs, read back from the
+        exec's ctx: one copy of the symbol block into pinned memory and one
+        wait on the stream, which is the region finishing. A gather and
+        `tolist` here cost 80 us more than this on the bench."""
+        import torch
+
+        pin = self._u_pin
+        if pin is None:
+            n = max(len(self.symbols), 1)
+            pin = self._u_pin = torch.empty(n, dtype=torch.int64, pin_memory=True)
+            self._u_view = (ctypes.c_int64 * n).from_address(pin.data_ptr())
+        rc = cu.cuMemcpyDtoHAsync_v2(
+            pin.data_ptr(), self.ex.ctx.data_ptr(), len(self.symbols) * 8, stream
+        )
+        if rc != 0 or cu.cuStreamSynchronize(stream) != 0:
+            return None
+        view = self._u_view
+        return tuple(int(view[i]) for i in self.dev_out_idx)
+
+    def _dev_output_symbols(self) -> list[str]:
+        """The device-resolved symbols an output's geometry mentions."""
+        if self.dev is None:
+            return []
+        texts: list[str] = []
+        for is_arena, v in self.out_order:
+            if is_arena is True:
+                name = self.outputs[v]
+                texts.append(self.sizes[name][0])
+                sizes_e, strides_e, _d = self.layouts[name]
+                texts += list(sizes_e) + list(strides_e)
+                view = self.output_views[v]
+                if view is not None:
+                    texts += list(view[0]) + list(view[1]) + [view[2]]
+            elif is_arena == "inview":
+                _idx, (sizes_e, strides_e, off_e) = v
+                texts += list(sizes_e) + list(strides_e) + [off_e]
+        found = OrderedSet(u for t in texts for u in _UNBACKED.findall(str(t)))
+        return [u for u in self.dev.syms if u in found]
+
+    def _dev_out_geom(self, v: int, env: dict[str, int], offsets: list[int]) -> Any:
+        """An arena output's geometry at the values read back: sizes and
+        strides from their expressions, the base from the slot layout
+        (which is by the bounds)."""
+        import torch
+
+        name = self.outputs[v]
+        _span, itemsize = self.sizes[name]
+        sizes_e, strides_e, dtype_name = self.layouts[name]
+        off_e = "0"
+        view = self.output_views[v]
+        if view is not None:
+            sizes_e, strides_e, off_e = view
+        vals = [_eval_int(e, env) for e in (off_e, *sizes_e, *strides_e)]
+        if any(x is None for x in vals):
+            return None
+        ints = [int(x) for x in vals if x is not None]
+        base = offsets[self.slot_of[name]] + ints[0] * itemsize
+        n_s = len(sizes_e)
+        dtype = getattr(torch, dtype_name.split(".")[-1])
+        return ("arena", base, dtype, ints[1 : 1 + n_s], ints[1 + n_s :])
+
     def _make_plan(self, env: dict[str, int]) -> Any:
         """Where each output lands in the arena at this shape, with the
-        arena bytes the shape needs; None to retire, REBUILD when a fixed
-        layout cannot hold it."""
+        arena bytes the shape needs and the slot offsets; None to retire,
+        REBUILD when a fixed layout cannot hold it."""
         import torch
 
         sz = self._slot_sizes(env)
@@ -4071,7 +4720,7 @@ class DynaGraphRunner:
                     rest[len(sizes_e) :],
                 )
             )
-        return plan, offsets[-1]
+        return plan, offsets[-1], offsets
 
     def _host_step(self, env: dict[str, int], hkey: Any, stream: int) -> bool:
         """Patch the exec on the host for this call and launch it: one C++ call.
@@ -4208,6 +4857,9 @@ class DynaGraphRunner:
         step is launch-bound. A region with extern child sites is host-side
         regardless: swapping a child is 0.44 us in C++ and 2.4 us in Python.
         """
+        if self.dev is not None:
+            # A value read on the device can only be patched from there.
+            return "device"
         if self.extern_sites or any(
             k.get("cooperative") or k.get("user") for k in self.kernels
         ):
@@ -4466,6 +5118,7 @@ class DynaGraphRunner:
             graph = torch.cuda.CUDAGraph(keep_graph=True)
         if not host:
             launcher._begin_device_node_collection()
+        self._capturing = True
         try:
             with torch.cuda.graph(graph):
                 raw = torch.cuda.current_stream().cuda_stream
@@ -4477,11 +5130,13 @@ class DynaGraphRunner:
                         self.ex.ctx.data_ptr(),
                         raw,
                     )
-                if with_children:
+                if with_children or self.dev is not None:
                     # Allocations still come from the graph pool here; only
                     # the extern calls are redirected. Their harvested graphs
                     # already carry arena addresses, and the Triton nodes are
-                    # repointed into the arena by the planner as always.
+                    # repointed into the arena by the planner as always. A
+                    # region with a `.item()` goes this way too, for the
+                    # rewritten wrapper that does not sync in the capture.
                     self._run_intercepted(list(args), self._pool_allocs(), on_extern)
                 else:
                     self.model(list(args))
@@ -4493,6 +5148,8 @@ class DynaGraphRunner:
                 with contextlib.suppress(Exception):
                     launcher._end_device_node_collection()
             return _fallback("capture-failed", f"{type(exc).__name__}: {exc}")
+        finally:
+            self._capturing = False
         if with_children:
             self.ex.child_applied = build_key
             # What each body holds right now, and the conditional handles the
@@ -4638,6 +5295,18 @@ class DynaGraphRunner:
             if i < n_in and isinstance((v := inputs[i]), int)
         )
         env = dict(key)
+        if self.dev is not None:
+            bounded = self.bound_env.get(key)
+            if bounded is None:
+                bounded = self._with_bounds(env)
+                if bounded is None:
+                    _fallback("unevaluable-size", f"unbacked bounds at {env}")
+                    return None
+                if len(self.bound_env) >= 4096:
+                    self.bound_env.clear()
+                self.bound_env[key] = bounded
+            env = bounded
+            self._bounds_now = env
 
         # The lane: this call's arena. Every call of a step gets its own,
         # since the outputs of the earlier ones are still out there.
@@ -4749,7 +5418,7 @@ class DynaGraphRunner:
             if len(self.plans) >= 4096:
                 self.plans.clear()
             self.plans[key] = planned
-        plan, total = planned
+        plan, total, offsets = planned
         if total > self.arena.numel():
             # Only under the dynamic layout (a fixed one refused above).
             self._grow_arena(total)
@@ -4834,8 +5503,19 @@ class DynaGraphRunner:
 
         # The geometry of every output is per shape and cached; the tensors
         # are per call, since the arena is this call's lane and an extern
-        # output is this call's harvest.
-        cached = self.out_cache.get(key)
+        # output is this call's harvest. An output sized by a value read on
+        # the device is the one place the host reads that value back: once,
+        # here, after the whole region was launched.
+        ukey = key
+        if self.dev_out_idx:
+            vals = self._read_symbols(cu, stream)
+            if vals is None:
+                _fallback("symbol-read", f"at {env}")
+                return None
+            env = dict(env)
+            env.update(zip(self.dev_out_syms, vals))
+            ukey = (key, vals)
+        cached = self.out_cache.get(ukey)
         if cached is None:
             geom: list[Any] = []
             # Outputs that are a view of an input: geometry per shape, base
@@ -4856,12 +5536,18 @@ class DynaGraphRunner:
                     geom.append(None)
                 elif not is_arena:
                     geom.append(None)
+                elif self.dev_out_idx:
+                    g_dev = self._dev_out_geom(v, env, offsets)
+                    if g_dev is None:
+                        _fallback("unevaluable-size", f"output {v} at {env}")
+                        return None
+                    geom.append(g_dev)
                 else:
                     base, _nbytes, dtype, sizes, strides = plan[v]
                     geom.append(("arena", base, dtype, sizes, strides))
             if len(self.out_cache) >= 4096:
                 self.out_cache.clear()
-            cached = self.out_cache[key] = (geom, inview)
+            cached = self.out_cache[ukey] = (geom, inview)
         geom, inview = cached
         arena = self.arena
         out: list[Any] = []

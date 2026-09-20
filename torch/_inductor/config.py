@@ -2154,6 +2154,19 @@ class triton:
         os.environ.get("TORCHINDUCTOR_DYNAGRAPH_MAX_LANES", "128")
     )
 
+    # Where a data-dependent size (an unbacked symint: `.item()`, a slice by
+    # a Python int read off a tensor) is resolved. "host": the graph is cut
+    # at the op that produces it, the value is read back to the host and the
+    # rest of the graph is a region of its own keyed on it (upstream's way).
+    # "device": no cut; the value stays in device memory, a planner node
+    # placed right after the producing kernel reads it and patches the
+    # grids and scalar arguments of the nodes that depend on it, buffers
+    # sized by it take their upper bound, and the host reads it back once,
+    # at the region's exit, only if an output's size depends on it.
+    dynagraph_unbacked: Literal["host", "device"] = os.environ.get(  # type: ignore[assignment]
+        "TORCHINDUCTOR_DYNAGRAPH_UNBACKED", "host"
+    )
+
     # How many distinct shapes a DynaGraph region is checked against eager before
     # its replays are trusted. The planner is built by reading the generated
     # wrapper, and a formula that happens to be right at the shape the graph was
