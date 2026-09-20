@@ -59,7 +59,7 @@ from torch.utils._ordered_set import OrderedSet
 
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
 
 log = logging.getLogger(__name__)
@@ -418,6 +418,9 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
                 blocks=blocks,
                 grid=grid,
                 grid_type=meta.get("grid_type"),
+                # A combo (horizontally fused) kernel's grid is a formula over
+                # its sub-kernels' numels; this is the meta that formula reads.
+                combo=meta.get("combo_grid_meta"),
                 # A split scan's decoupled look-back (atomic_cas, not add, so
                 # Inductor's flag misses it) and any atomic add make the
                 # result differ bit for bit between two runs of the same
@@ -672,6 +675,107 @@ _GRID_AXES = {
 _YZ_AXES = (("cdiv", "xnumel", "XBLOCK"), ("cdiv", "ynumel", "YBLOCK"))
 
 
+def _grid_numel_names(k: dict[str, Any]) -> list[str]:
+    """The numel arguments a kernel's grid is a function of.
+
+    Read off the axis table for the plain grids, and off the combo meta for a
+    horizontally fused kernel, whose grid sums or maxes its sub-kernels'
+    numels. If none of them is symbolic the grid is fixed at capture.
+    """
+    combo = k.get("combo")
+    if combo:
+        names = []
+        for i in range(int(combo.get("num_kernels", 0))):
+            names.append(f"xnumel_{i}")
+            if f"ynumel_{i}" in combo:
+                names.append(f"ynumel_{i}")
+        return names
+    axes = _GRID_AXES.get(k.get("grid_type") or "") or _YZ_AXES
+    return [n for _, n, _ in axes if n]
+
+
+def _combo_grid_stmt(k: dict[str, Any], ev: Callable[[str], str]) -> str:
+    """C statements setting gx, gy, gz for a combo kernel.
+
+    Mirrors Inductor's SequentialComboKernelGrid (x is the sum of the
+    sub-kernels' block counts) and RoundRobinComboKernelGrid (x is the largest
+    block count times the kernel count); a sub-kernel with no x dimension
+    contributes its numel as is. When any sub-kernel is tiled, y is the largest
+    y block count folded into z past the launch limit, as Grid2DWithYZOverflow
+    does. `ev` turns a wrapper expression into the C that evaluates it, which
+    differs between the host patcher and the planner. The per-sub-kernel block
+    variant (SequentialFlattenComboKernelGrid, off by default) is not modelled.
+    """
+    combo = k["combo"]
+    gt = k.get("grid_type") or ""
+    blocks = k["blocks"] or {}
+    n = int(combo["num_kernels"])
+
+    def numel(name: str) -> str:
+        c = combo.get(name)
+        if c is not None:
+            return str(int(c))  # baked into the meta at codegen: not an argument
+        e = k["exprs"].get(name) or k["consts"].get(name)
+        if e is None:
+            raise Unsupported(f"{k['name']}: no {name} to size a grid")
+        return ev(e)
+
+    def block(bk: str) -> int:
+        v = blocks.get(bk)
+        if v is None and combo.get("default_config"):
+            v = combo["default_config"].get(bk)
+        if v is None:
+            raise Unsupported(f"{k['name']}: no {bk} to size a grid")
+        return int(v)
+
+    def cdiv(e: str, b: int) -> str:
+        return f"dg_floordiv({e} + {b} - 1, {b})"
+
+    stmts = []
+    if gt == "SequentialComboKernelGrid":
+        parts = []
+        for i in range(n):
+            x = numel(f"xnumel_{i}")
+            parts.append(
+                f"({x})" if combo.get(f"no_x_dim_{i}") else cdiv(x, block("XBLOCK"))
+            )
+        stmts.append(f"gx = {' + '.join(parts)};")
+    elif gt == "RoundRobinComboKernelGrid":
+        flat = [numel(f"xnumel_{i}") for i in range(n) if combo.get(f"no_x_dim_{i}")]
+        tiled = [
+            numel(f"xnumel_{i}") for i in range(n) if not combo.get(f"no_x_dim_{i}")
+        ]
+        if tiled:
+            stmts.append(f"int64_t xm = {tiled[0]};")
+            for e in tiled[1:]:
+                stmts.append(f"{{ int64_t t = {e}; if (t > xm) xm = t; }}")
+            flat.append(cdiv("xm", block("XBLOCK")))
+        stmts.append(f"int64_t m = {flat[0]};")
+        for e in flat[1:]:
+            stmts.append(f"{{ int64_t t = {e}; if (t > m) m = t; }}")
+        stmts.append(f"gx = m * {n};")
+    else:
+        raise Unsupported(f"{k['name']}: grid type {gt} is not modelled")
+    if combo.get("min_blocks"):
+        stmts.append(
+            f"if (gx < {int(combo['min_blocks'])}) gx = {int(combo['min_blocks'])};"
+        )
+    ys = [numel(f"ynumel_{i}") for i in range(n) if f"ynumel_{i}" in combo]
+    if ys:
+        yb = block("YBLOCK")
+        stmts.append(f"int64_t ym = {ys[0]};")
+        for e in ys[1:]:
+            stmts.append(f"{{ int64_t t = {e}; if (t > ym) ym = t; }}")
+        stmts.append(
+            f"int64_t raw = {cdiv('ym', yb)};"
+            f" int64_t div = dg_floordiv(raw + {_MAX_Y_GRID} - 1, {_MAX_Y_GRID});"
+            " gy = (div == 0) ? 0 : dg_floordiv(raw + div - 1, div); gz = div;"
+        )
+    else:
+        stmts.append("gy = 1; gz = 1;")
+    return "{ " + " ".join(stmts) + " }"
+
+
 def generate_planner(
     kernels: list[dict[str, Any]],
     symbols: list[str],
@@ -741,11 +845,7 @@ def generate_planner(
                     if e is not None
                 ]
 
-            axes_for_static = _GRID_AXES.get(gt) or _YZ_AXES
-            if not any(
-                _is_symbolic(e)
-                for e in numel_exprs(*(n for _, n, _ in axes_for_static if n))
-            ):
+            if not any(_is_symbolic(e) for e in numel_exprs(*_grid_numel_names(k))):
                 grid_cases.append(
                     f"    case {i}: static_grid = true; break;  // {k['name']}"
                 )
@@ -755,6 +855,12 @@ def generate_planner(
                 patches_only = False
             if patches_only:
                 pass
+            elif k.get("combo"):
+                grid_cases.append(
+                    f"    case {i}: "
+                    + _combo_grid_stmt(k, lambda e: f"dg_eval({idx(e)},ctx)")
+                    + f" break;  // {k['name']}"
+                )
             elif gt == "Grid2DWithYZOverflow":
                 # What Inductor actually emits for a tiled pointwise: the y tiles
                 # are folded into z once they would pass the 65535 limit on the y
@@ -1106,16 +1212,18 @@ def generate_host_patcher(
                     raise Unsupported(f"{k['name']}: no {numel}/{bk} to size a grid")
                 return _expr_to_c(e, sym_index), blocks[bk]
 
-            axes = _GRID_AXES.get(gt) or _YZ_AXES
             numels = [
                 e
                 for e in (
-                    k["exprs"].get(n) or k["consts"].get(n) for _, n, _ in axes if n
+                    k["exprs"].get(n) or k["consts"].get(n)
+                    for n in _grid_numel_names(k)
                 )
                 if e is not None
             ]
             if any(_is_symbolic(e) for e in numels):
-                if gt == "Grid2DWithYZOverflow":
+                if k.get("combo"):
+                    grid_stmt = _combo_grid_stmt(k, lambda e: _expr_to_c(e, sym_index))
+                elif gt == "Grid2DWithYZOverflow":
                     (xe, xb), (ye, yb) = (
                         extent("xnumel", "XBLOCK"),
                         extent("ynumel", "YBLOCK"),
