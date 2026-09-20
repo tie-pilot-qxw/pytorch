@@ -11184,6 +11184,19 @@ class Scheduler:
                     raise AssertionError("expected op to be a torch._ops.OpOverload")
                 return f"custom partition op: {op_overload_name}"
 
+        # DynaGraph cannot re-parameterize an extern kernel, so without this one
+        # such call refuses the whole region. Cutting here instead leaves every
+        # Triton region servable and runs the extern call eagerly in between.
+        # Broader than `custom_should_partition_ops` above on purpose: that one
+        # only reaches `ir.FallbackKernel`, while mm/addmm/bmm are
+        # `ir.ExternKernelOut`.
+        if (
+            config.triton.dynagraph
+            and config.triton.dynagraph_partition_extern
+            and isinstance(ir_node, torch._inductor.ir.ExternKernel)
+        ):
+            return "DynaGraph: extern kernel"
+
         # When not using cudagraphs, keep all kernels in the `call` function
         # instead of graph partition functions, since graph partition only brings
         # benefit to cudagraph

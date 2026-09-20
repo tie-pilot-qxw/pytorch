@@ -446,6 +446,13 @@ def cudagraphify_impl(
     *args: Any,
     **kwargs: Any,
 ) -> ModelType:
+    """Wrap `model` so each distinct set of int inputs gets its own cudagraph tree.
+
+    With `config.triton.dynagraph` a single DynaGraph runner serves every shape
+    of the region first; it hands a shape back here (SKIP_SHAPE), asks to be
+    rebuilt on it (REBUILD, bounded), or retires (None), and this then records
+    the ordinary way.
+    """
     fn_cache: dict[tuple[int, ...], Callable[..., Any]] = {}
 
     # Detect int inputs: we need to index on these
@@ -459,9 +466,10 @@ def cudagraphify_impl(
     # DynaGraph keeps one entry here for every shape rather than one per shape.
     # None means "not tried yet", False means "tried and not applicable".
     dynagraph_runner: Any = None
+    dynagraph_rebuilds = 0
 
     def deferred_cudagraphify(inputs: list[InputType]) -> OutputType:
-        nonlocal has_warn, dynagraph_runner
+        nonlocal has_warn, dynagraph_runner, dynagraph_rebuilds
 
         int_key = get_ints(inputs)
 
@@ -470,14 +478,40 @@ def cudagraphify_impl(
 
         if config.triton.dynagraph and int_key is not None:
             if dynagraph_runner is None:
-                dynagraph_runner = _maybe_build_dynagraph(model, inputs, kwargs)
+                dynagraph_runner = _maybe_build_dynagraph(
+                    model, inputs, kwargs, static_input_idxs
+                )
             if dynagraph_runner is not False:
                 out = dynagraph_runner(inputs)
-                if out is not None:
+                if (
+                    out is dg_rebuild
+                    and dynagraph_rebuilds < config.triton.dynagraph_rebuilds
+                ):
+                    # The region was built on a smaller shape than this one,
+                    # or a static input it reads in place has moved (a forward
+                    # rebuilt on a larger shape hands its backward saved
+                    # activations from a new arena). Build again here, so this
+                    # call sizes the storage and fixes the addresses, and serve
+                    # from the new runner; the old one is dropped.
+                    dynagraph_rebuilds += 1
+                    dynagraph_runner = _maybe_build_dynagraph(
+                        model, inputs, kwargs, static_input_idxs
+                    )
+                    out = (
+                        dynagraph_runner(inputs)
+                        if dynagraph_runner is not False
+                        else None
+                    )
+                if out is dg_skip_shape or out is dg_rebuild:
+                    # This one shape is recorded the ordinary way below; the
+                    # runner keeps serving the rest. `inputs` is untouched.
+                    pass
+                elif out is not None:
                     return out
-                # A replay stopped matching eager, so the region retires and
-                # recording takes over from here. `inputs` is untouched.
-                dynagraph_runner = False
+                else:
+                    # A replay stopped matching eager, so the region retires and
+                    # recording takes over from here. `inputs` is untouched.
+                    dynagraph_runner = False
 
         fn = fn_cache.get(int_key)
         if fn is not None:
@@ -537,8 +571,14 @@ def dynamo_timed_cudagraph(
         yield
 
 
+from torch._inductor.dynagraph import REBUILD as dg_rebuild, SKIP_SHAPE as dg_skip_shape
+
+
 def _maybe_build_dynagraph(
-    model: ModelType, inputs: list[InputType], kwargs: dict[str, Any]
+    model: ModelType,
+    inputs: list[InputType],
+    kwargs: dict[str, Any],
+    static_input_idxs: Sequence[int] = (),
 ) -> Any:
     """Try to serve every shape from one recorded graph; return False if not possible.
 
@@ -568,7 +608,15 @@ def _maybe_build_dynagraph(
             return dg._fallback(
                 "symbol-not-an-argument", f"resolved {sorted(env)} of {runner.symbols}"
             )
-        if not runner.build(inputs, dg.lifetimes_from_source(src), env):
+        # `runner.body` rather than `src`: under graph partitioning the file
+        # holds every partition, and only this one's buffers go in the arena.
+        if not runner.build(
+            inputs,
+            dg.lifetimes_from_source(runner.body or ""),
+            env,
+            static_input_idxs,
+            kwargs.get("mutated_input_idxs", ()),
+        ):
             return False
         log.info("DynaGraph served: one graph now covers all shapes for this region")
         return runner

@@ -2092,13 +2092,21 @@ class triton:
     # one buffer grow as another shrinks.
     dynagraph: bool = os.environ.get("TORCHINDUCTOR_DYNAGRAPH", "0") == "1"
 
-    # How much spare room DynaGraph leaves in the arena and in the storage holding
-    # graph inputs, as a multiple of what the recorded shape needs. Inputs cannot
-    # move once the graph is captured, since only extents are patched and not
-    # pointers, and the recorded shape is just whichever one arrived first -- so a
-    # shape needing more than this retires the region and recording resumes.
+    # How much spare room DynaGraph leaves in each arena slot and in the storage
+    # holding graph inputs, as a multiple of what the recorded shape needs. Slot
+    # offsets are fixed at build so buffer pointers are patched once rather than
+    # on every replay, and inputs cannot move once the graph is captured; the
+    # recorded shape is just whichever one arrived first -- so a shape needing
+    # more than this in any one slot retires the region and recording resumes.
     dynagraph_headroom: float = float(
         os.environ.get("TORCHINDUCTOR_DYNAGRAPH_HEADROOM", "2.0")
+    )
+
+    # How many times a DynaGraph region may be rebuilt on a shape that outgrew
+    # the storage it was built with, before such shapes are simply recorded the
+    # ordinary way. Each rebuild costs one recording and a planner build.
+    dynagraph_rebuilds: int = int(
+        os.environ.get("TORCHINDUCTOR_DYNAGRAPH_REBUILDS", "3")
     )
 
     # How many distinct shapes a DynaGraph region is checked against eager before
@@ -2108,6 +2116,67 @@ class triton:
     # recording resumes. Costs one eager run per new shape, only while checking.
     dynagraph_verify_shapes: int = int(
         os.environ.get("TORCHINDUCTOR_DYNAGRAPH_VERIFY_SHAPES", "3")
+    )
+
+    # Cut the graph at every extern kernel so DynaGraph can serve what is left.
+    # cuBLAS and cuDNN nodes cannot be re-parameterized -- their kernels are
+    # closed source, so neither the parameter layout nor which variant a new
+    # shape selects is knowable -- and today one such call refuses the whole
+    # region as `extern-launch`. Partitioning around them instead runs the extern
+    # call eagerly between replays and leaves every Triton region served. The
+    # cost is one graph break per extern call, which is cheap for a model whose
+    # extern calls are clustered and expensive for one where they are everywhere,
+    # so this is off until measured on the model at hand.
+    #
+    # `custom_should_partition_ops` already does this, but only for
+    # `ir.FallbackKernel`; mm/addmm/bmm are `ir.ExternKernelOut`, a different
+    # branch of `ir.ExternKernel`, so the case that matters most is out of its
+    # reach.
+    dynagraph_partition_extern: bool = (
+        os.environ.get("TORCHINDUCTOR_DYNAGRAPH_PARTITION_EXTERN", "0") == "1"
+    )
+
+    # Keep extern kernels (cuBLAS via `extern_kernels.*`) inside the one
+    # DynaGraph graph instead of refusing the region or cutting around them.
+    # Each extern call site becomes a child-graph node. The call is captured on
+    # its own, per shape, the first time that shape is seen ("harvested") with
+    # the arena already laid out for that shape, so the pointers baked into it
+    # are right; on a shape change the node's child graph is swapped with
+    # cudaGraphExecChildGraphNodeSetParams, which changes kernel, cluster and
+    # parameters together without any of them being decoded. Requires the
+    # call to produce the same node topology at every shape; a topology change
+    # is refused at harvest.
+    dynagraph_extern_child: bool = (
+        os.environ.get("TORCHINDUCTOR_DYNAGRAPH_EXTERN_CHILD", "0") == "1"
+    )
+
+    # How a region follows an extern site whose node structure changes with
+    # the shape (cuDNN conv tiers by batch, cuBLAS splitK by M). "host": one
+    # graph per combination of topologies met, picked by shape before the
+    # launch, nothing per replay. "switch": one graph with a SWITCH node per
+    # such site, about 9 us per site per replay, but right even if the
+    # topology were not a function of the shape.
+    dynagraph_topology: Literal["host", "switch"] = os.environ.get(  # type: ignore[assignment]
+        "TORCHINDUCTOR_DYNAGRAPH_TOPOLOGY", "host"
+    )
+
+    # Who patches a region's graph for a new shape. "device": a planner kernel
+    # inside the graph (device graph update API; no host work, but on the
+    # GPU's critical path). "host": generated C++ on the host before the
+    # launch (`cuGraphExecKernelNodeSetParams`; overlaps with the step before,
+    # costs host time). "auto": host for regions with extern child sites,
+    # device otherwise.
+    dynagraph_update: Literal["auto", "host", "device"] = os.environ.get(  # type: ignore[assignment]
+        "TORCHINDUCTOR_DYNAGRAPH_UPDATE", "auto"
+    )
+
+    # Device path: an input of at least this many bytes (at the build shape)
+    # is read where it is -- the planner repoints the nodes that read it when
+    # its address moves -- instead of being copied into the region's storage
+    # on every call. Smaller ones are copied (one driver call; cheaper than a
+    # planner run). 0 copies every input.
+    dynagraph_patch_bytes: int = int(
+        os.environ.get("TORCHINDUCTOR_DYNAGRAPH_PATCH_BYTES", str(16 << 20))
     )
 
     # Should we skip cudagraphing graphs with dynamic shape inputs
