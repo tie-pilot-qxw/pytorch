@@ -2743,6 +2743,7 @@ class DynaGraphRunner:
             self.ext_slots = []
             self.exact = True
             self.child_graphs, self.child_holds = {}, {}
+            self.harvest_addr = {}
             self.harvests = 0
             self.tick = 0
             self.n_slots, self.n_ptr = 0, 0
@@ -2846,6 +2847,8 @@ class DynaGraphRunner:
         self.site_graphs: list[list[int | None]] = [[] for _ in self.extern_sites]
         self.site_holds: list[list[Any]] = [[] for _ in self.extern_sites]
         self.key_bodies: dict[Any, list[int]] = {}
+        # key -> (arena base, extern-read input addresses) the harvest saw.
+        self.harvest_addr: dict[Any, tuple[int, ...]] = {}
         self.recaptures = 0
         # One memory pool for every harvested graph of this region. Each
         # capture otherwise gets a private pool of its own, and a pool
@@ -3195,6 +3198,38 @@ class DynaGraphRunner:
                             out.add(self.argv[nm])
         return out
 
+    def _harvest_addr(self) -> tuple[int, ...]:
+        """What a harvest bakes in: the arena base and the address of every
+        input an extern call reads (the copy held here, or the tensor itself
+        when static). A harvest is only valid for a call that sees the same."""
+        return (
+            self.arena.data_ptr(),
+            *[self.in_ptrs[j] or 0 for j in self.extern_read],
+        )
+
+    def _drop_harvest(self, key: Any) -> None:
+        """Forget one shape's harvest: its child graphs hold addresses this
+        call does not use. The exec holding its children swaps them again
+        whatever handle value the new graphs get."""
+        for d in (
+            self.child_graphs,
+            self.child_holds,
+            self.extern_outs,
+            self.key_bodies,
+            self.eager_calls,
+            self.harvest_addr,
+            self.host_args,
+            self.ctx_args,
+            self.out_cache,
+        ):
+            d.pop(key, None)
+        ex = self._ex_of.pop(key, None)
+        if ex is not None:
+            ex.child_applied = None
+            ex.applied = None
+            ex.ptr_dirty = True
+            ex.site_applied_raw = [[None] * len(h) for h in ex.site_held]
+
     def _invalidate_harvests(self) -> None:
         """Forget every harvested extern graph: the addresses they hold are
         stale (the arena or a copied input moved). Shapes are harvested again
@@ -3205,6 +3240,7 @@ class DynaGraphRunner:
         self.extern_outs.clear()
         self.key_bodies.clear()
         self.eager_calls.clear()
+        self.harvest_addr.clear()
         self.host_args.clear()
         self.ctx_args.clear()
         self._ex_of.clear()
@@ -3258,8 +3294,8 @@ class DynaGraphRunner:
         self.input_store[j] = store
         self.static_inputs[j] = _store_view(store, x)
         self.in_ptrs[j] = store.data_ptr()
-        if j in self.extern_read:
-            self._invalidate_harvests()
+        # A harvest that captured the old copy is found stale by its
+        # address record when its shape recurs (`_harvest_addr`).
 
     def _inputs_by_address(self, inputs: list[Any], static: Any) -> OrderedSet[int]:
         """Argument positions to read through their own address, no copy.
@@ -3323,9 +3359,11 @@ class DynaGraphRunner:
             self.static_ptrs[i] = ptr
             self.static_inputs[i] = inputs[i]
             self.in_ptrs[i] = ptr
-        if any(i in self.extern_read for i in moved):
-            self._invalidate_harvests()
-        log.info("DynaGraph static inputs moved, repointed: %s", moved)
+        # Under the dynamic layout this is every shape change for a backward:
+        # its static inputs are the forward's outputs, laid out per shape. A
+        # harvest that captured another address for one an extern reads is
+        # found stale by its record when its shape recurs.
+        log.debug("DynaGraph static inputs moved, repointed: %s", moved)
         return True
 
     def _shape_inputs(self, inputs: list[Any]) -> list[Any]:
@@ -3658,6 +3696,7 @@ class DynaGraphRunner:
         if len(self.child_graphs) >= 1024:
             self._invalidate_harvests()
         self.child_graphs[key] = raws
+        self.harvest_addr[key] = self._harvest_addr()
         self.child_holds[key] = graphs
         self.extern_outs[key] = results
         self.key_bodies[key] = bodies
@@ -4516,6 +4555,13 @@ class DynaGraphRunner:
         if self.extern_sites:
             if key in self.skip_keys:
                 return SKIP_SHAPE
+            if (
+                key in self.child_graphs
+                and self.harvest_addr.get(key) != self._harvest_addr()
+            ):
+                # Harvested when an input it reads, or the arena, sat
+                # elsewhere: a copy since replaced, a static input moved.
+                self._drop_harvest(key)
             ex = self._ex_of.get(key)
             if ex is None:
                 if key not in self.child_graphs and not self._harvest(env, key, inputs):
