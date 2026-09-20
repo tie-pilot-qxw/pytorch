@@ -333,10 +333,17 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
         #     .run(arg1_1, buf0, buf2, s77, 1, ..._r0_numel, stream=...)
         # where reading r0_numel off the shorter list yields the literal 1.
         args = [k for k, v in sig.items() if v != "constexpr"]
+        # A user-defined kernel's own constexpr (`BLOCK: tl.constexpr` in its
+        # signature, `declared_constexpr_names`) is dropped from the call
+        # site as an autotuned block size is; only a scalar Inductor itself
+        # specialized stays there.
+        names: Any = meta.get("declared_constexpr_names")
+        declared: OrderedSet[str] = OrderedSet(str(n) for n in (names or ()))
         call_order = [
             k
             for k, v in sig.items()
-            if v != "constexpr" or (k in constants and k not in _TUNED)
+            if v != "constexpr"
+            or (k in constants and k not in _TUNED and k not in declared)
         ]
         # Only integer scalars are patched. Pointers live at fixed addresses in
         # the graph's private pool; expanding their names would yield an
@@ -431,6 +438,10 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
                 # `obj` is the autotuner; `k` above is one compiled variant.
                 cooperative=bool((obj.triton_meta or {}).get("launch_cooperative_grid"))
                 or meta.get("grid_type") == "CooperativeReductionGrid",
+                # A user-defined kernel (`user_autotune`) is launched through
+                # Triton's own launcher, so its node has no device handle and
+                # only the host path can patch it.
+                user=str(getattr(obj, "heuristic_type", "")).endswith("USER_AUTOTUNE"),
             )
         )
 
@@ -2427,8 +2438,11 @@ def _buffer_aliases(src: str) -> dict[str, str]:
     resolved back to the one that does.
     """
     alias: dict[str, str] = {}
+    # The source may be an input rather than a buffer: a backward reuses a
+    # saved activation's storage under a buffer name
+    # (`buf15 = reinterpret_tensor(mm_26, ...); del mm_26  # reuse`).
     for m in re.finditer(
-        r"^\s*(buf\d+)\s*=\s*(?:reinterpret_tensor\(\s*)?(buf\d+)\s*(?:;|$|,)",
+        r"^\s*(buf\d+)\s*=\s*(?:reinterpret_tensor\(\s*)?([A-Za-z_]\w*)\s*(?:;|$|,)",
         src,
         re.MULTILINE,
     ):
@@ -2785,7 +2799,10 @@ class DynaGraphRunner:
                 self.out_order.append((True, len(self.outputs)))
                 self.outputs.append(owner)
                 self.output_views.append(views.get(name))
-            elif name in argv or owner in argv:
+            elif name in argv or (owner in argv and views.get(name) is None):
+                # An input handed straight through (a rename at most: a
+                # `reinterpret_tensor` view of an input would need its own
+                # geometry, which the pass-through does not carry).
                 self.out_order.append((False, argv.get(name, argv.get(owner))))
             elif owner in self.extern_outs_of:
                 # Handed back from the harvest for the current shape.
@@ -3485,6 +3502,15 @@ class DynaGraphRunner:
             return tuple(self.key_bodies[key])
         return ()
 
+    def _harvest_stream(self) -> Any:
+        """The side stream every extern call is warmed up and captured on."""
+        import torch
+
+        st = getattr(self, "_side_stream", None)
+        if st is None:
+            st = self._side_stream = torch.cuda.Stream()
+        return st
+
     def _harvest(self, env: dict[str, int], key: Any, inputs: list[Any]) -> bool:
         """Capture every extern call at this shape into its own small graph.
 
@@ -3519,14 +3545,15 @@ class DynaGraphRunner:
                 graphs.append(None)
                 results.append(kw.get("out", r))
                 return results[-1]
-            s = torch.cuda.Stream()
+            s = self._harvest_stream()
             s.wait_stream(torch.cuda.current_stream())
             gen = torch.cuda.default_generators[self.device_index]
             offset = gen.get_offset()
             with torch.cuda.stream(s):
                 r = fn(*a, **kw)
             torch.cuda.current_stream().wait_stream(s)
-            torch.cuda.synchronize()
+            # The generator offset moves when the op is enqueued, not when it
+            # runs, so no synchronize is needed to read it.
             if gen.get_offset() != offset:
                 # The warm-up drew from the CUDA generator: a random op the
                 # name list did not know (a custom op, a new overload).
@@ -3546,9 +3573,18 @@ class DynaGraphRunner:
             ):
                 self.harvest_pool = torch.cuda.graph_pool_handle()
             g = torch.cuda.CUDAGraph(keep_graph=True)
-            with torch.cuda.graph(g, stream=s, pool=self.harvest_pool):
-                r = fn(*a, **kw)
-            torch.cuda.synchronize()
+            # The capture primitives directly, not `torch.cuda.graph`: that
+            # context manager synchronizes the device and empties the
+            # allocator cache before every capture, which cost 14 ms per
+            # site here (a Llama backward has 62 sites per shape) and made
+            # every later allocation a cudaMalloc. The warm-up above ran on
+            # this stream, so the capture is ordered after it as it is.
+            with torch.cuda.stream(s):
+                g.capture_begin(pool=self.harvest_pool, capture_error_mode="global")
+                try:
+                    r = fn(*a, **kw)
+                finally:
+                    g.capture_end()
             graphs.append(g)
             results.append(r)
             return r
@@ -3964,9 +4000,12 @@ class DynaGraphRunner:
         step is launch-bound. A region with extern child sites is host-side
         regardless: swapping a child is 0.44 us in C++ and 2.4 us in Python.
         """
-        if self.extern_sites or any(k.get("cooperative") for k in self.kernels):
-            # A cooperative launch does not go through the static launcher,
-            # so its node has no device handle for a planner to reach.
+        if self.extern_sites or any(
+            k.get("cooperative") or k.get("user") for k in self.kernels
+        ):
+            # A cooperative launch, and a user-defined kernel, do not go
+            # through the static launcher, so their nodes have no device
+            # handle for a planner to reach.
             return "host"
         gpu_us = self._gpu_time_us()
         host_us = 0.5 * len(self.kernels) + 60.0
@@ -4626,30 +4665,40 @@ def _same_values(got: list[Any], ref: Any, exact: bool = True) -> bool:
     all means the planner changed something it should not have. A region
     with a kernel that is not repeatable itself (atomics, a split scan's
     look-back) is compared with a tolerance instead.
+
+    Every output's verdict is a device-side flag and the flags come back in
+    one read: a `torch.equal` per output synchronized once per output, which
+    for a backward returning sixty gradients was most of a verified step.
     """
     import torch
 
     flat = list(ref) if isinstance(ref, (list, tuple)) else [ref]
     if len(got) != len(flat):
         return False
+    flags = []
     for g, r in zip(got, flat):
         if not isinstance(r, torch.Tensor) or g.numel() != r.numel():
             return False
+        if g.numel() == 0:
+            continue
+        if g.device != r.device:
+            return False
         a, b = g.reshape(-1), r.reshape(-1)
         if exact:
-            if not torch.equal(a, b):
+            if a.dtype != b.dtype:
                 return False
+            flags.append((a != b).any())
         else:
             # Run-to-run noise of such a kernel is absolute and shows up at
             # the zero crossings, so the bound is relative to the largest
             # magnitude in the reference, not element-wise.
             af, bf = a.float(), b.float()
-            if bf.numel():
-                tol = 1e-3 * max(1.0, float(bf.abs().max()))
-                close = ((af - bf).abs() <= tol) | (torch.isnan(af) & torch.isnan(bf))
-                if not bool(close.all()):
-                    return False
-    return True
+            tol = 1e-3 * bf.abs().max().clamp_min(1.0)
+            close = ((af - bf).abs() <= tol) | (torch.isnan(af) & torch.isnan(bf))
+            flags.append(~close.all())
+    if not flags:
+        return True
+    return not bool(torch.stack(flags).any())
 
 
 # Loaded modules by (source, arch). A region that Dynamo recompiles on every
