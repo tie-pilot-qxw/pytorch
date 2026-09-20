@@ -3407,6 +3407,9 @@ class PythonWrapperCodegen(CodeGen):
         with_step = codegen_with_step(f"{sym}_start", f"{sym}_end", node.step)
         self.writeline(f"{sym} = max(0, {with_step})")
         self.unbacked_symbol_decls.add(str(node.unbacked_size_symbol))
+        # Bind the buffer name like DynamicScalar and AssertScalar do: a
+        # NoneLayout buffer is still named by the nodes that depend on it.
+        self.writeline(f"{node.get_name()} = None")
 
     def codegen_dynamic_scalar(self, node):
         self.writeline(DynamicScalarLine(self, node))

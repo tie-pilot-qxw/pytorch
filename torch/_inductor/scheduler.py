@@ -11480,6 +11480,11 @@ class Scheduler:
             partition_input_names = OrderedSet(
                 self.mutation_real_name.get(name, name)
                 for name in partition_input_names
+                # A NoneLayout buffer (a DynamicScalar, DynamicSliceSize or
+                # AssertScalar) is a dependency, not data: nothing is
+                # allocated for it, and the wrapper binds it at the top level
+                # only, so a partition must not take it as an argument.
+                if not is_unallocated_buffer(name)
             )
 
             buffer_names_to_free: OrderedSet[str] = OrderedSet()
