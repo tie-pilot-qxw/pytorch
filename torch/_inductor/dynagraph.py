@@ -940,6 +940,7 @@ def generate_planner(
     sizes: dict[str, tuple[str, int]] | None = None,
     fixed_off: Sequence[int] | None = None,
     dev: Any = None,
+    pad_of: dict[int, list[tuple[int, str, str, int]]] | None = None,
 ) -> str:
     """The device-side planner: CUDA source with a kernel that patches the graph.
 
@@ -1237,6 +1238,8 @@ def generate_planner(
             body0 + n_sites,
             lastp0 + _n_ptr,
         )
+        if pad_of:
+            out += _zeropad_source(pad_of, sym_index, dev)
     return out
 
 
@@ -1248,6 +1251,52 @@ _C_SCALAR = {
     "torch.uint8": "unsigned char",
     "torch.bool": "unsigned char",
 }
+
+
+_PAD_CTYPE = {
+    1: "unsigned char",
+    2: "unsigned short",
+    4: "unsigned int",
+    8: "unsigned long long",
+}
+
+
+def _zeropad_source(
+    pad_of: dict[int, list[tuple[int, str, str, int]]],
+    sym_index: dict[str, int],
+    dev: Any,
+) -> str:
+    """One kernel per extern site that reduces over an unbacked size: zero
+    the part of each operand past the true size, so the sum over the bound is
+    the sum over the true size. Fixed grid with a grid-stride loop, so the
+    node itself never needs patching."""
+    out = ["\n#define S(i) (ctx[(i)])"]
+    for i, plan in sorted(pad_of.items()):
+        body = []
+        for slot, u, span, item in plan:
+            bound = dev.bounds.get(u)
+            if bound is None:
+                continue
+            ctype = _PAD_CTYPE.get(item)
+            if ctype is None:
+                continue
+            hi_expr = re.sub(rf"\b{re.escape(u)}\b", "__ub", span)
+            body.append(
+                f"  {{ int64_t __ub = {_expr_to_c(bound, sym_index)};"
+                f" int64_t lo = {_expr_to_c(span, sym_index)};"
+                f" int64_t hi = {_expr_to_c(hi_expr, sym_index, ('__ub',))};"
+                f" {ctype}* p = ({ctype}*)(ARENA + SLOT_OFF({slot}));"
+                f" for (int64_t k = lo + t; k < hi; k += step) p[k] = 0; }}"
+            )
+        out.append(
+            f'\nextern "C" __global__ void dynagraph_zeropad{i}(int64_t* ctx)\n{{\n'
+            "  int64_t t = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;\n"
+            "  int64_t step = (int64_t)gridDim.x * blockDim.x;\n"
+            + "\n".join(body)
+            + "\n}\n"
+        )
+    out.append("\n#undef S\n")
+    return "".join(out)
 
 
 def _planner_u_source(
@@ -3177,6 +3226,9 @@ class _DevScalars:
         self.uppers: dict[str, list[str]] = {}
         self.bounds: dict[str, str | None] = {}
         self.syms: list[str] = []
+        # Unbacked symbols this partition is handed as arguments: resolved by
+        # whichever partition ran the `.item()`, ordinary symbols here.
+        self.from_args: OrderedSet[str] = OrderedSet()
         self.point_of: dict[str, int] = {}
         # Symbols that appear outside the item/derived/check lines: sizes,
         # views, extern shapes, kernel scalars. These need a value at
@@ -3323,8 +3375,25 @@ def _fold_branches(body: str, src: str, conds: list[_Cond]) -> str | None:
                     allocs.append(ma.group(1))
                 folded.append(indent + t)
             cond.branch_allocs.append(allocs)
-        lines[cond.sel_line : cond.block_end + 1] = folded
+        # From after the selector: its `.item()` line stays, so the folded body
+        # still places each planner by the launch it follows.
+        lines[cond.sel_line + 1 : cond.block_end + 1] = folded
     return "\n".join(lines)
+
+
+# Extern calls that sum over one of their arguments' dimensions, so a
+# padded row contributes nothing once it is zeroed: argument index -> the
+# dimension of that argument the op reduces over. Anything not here keeps the
+# `unbacked-extern-reduce` refusal, because zero is not the identity of a max
+# and nothing is the identity of a non-linear op.
+_ADDITIVE_REDUCE = {
+    "mm": {0: 1, 1: 0},
+    "addmm": {1: 1, 2: 0},
+    "bmm": {0: 2, 1: 1},
+    "baddbmm": {1: 2, 2: 1},
+    "ops:aten.mm.out": {0: 1, 1: 0},
+    "ops:aten.bmm.out": {0: 2, 1: 1},
+}
 
 
 def _sites_in_order(body: str, conds: list[_Cond]) -> list[tuple[str, str | None]]:
@@ -3388,6 +3457,12 @@ def _device_scalars(body: str) -> _DevScalars | None:
         m = _DEV_ASSIGN.match(code)
         if m and not code.lstrip().startswith("if "):
             name, expr = m.group(1), m.group(2)
+            if name == expr.strip():
+                # `u1 = u1`: the symbol arrived as an argument of this
+                # partition, resolved by whichever one ran the .item(). Here
+                # it is an ordinary symbol, like any backed size.
+                d.from_args.add(name)
+                continue
             if point < 0:
                 d.problem = f"unbacked-order: {name} assigned before any .item()"
                 return d
@@ -3418,7 +3493,7 @@ def _device_scalars(body: str) -> _DevScalars | None:
         if bound is None and u in d.used:
             d.problem = f"unbacked-unbounded: {u} has no upper bound"
     for u in d.used:
-        if u not in d.syms:
+        if u not in d.syms and u not in d.from_args:
             d.problem = f"unbacked-undefined: {u} is not assigned in the body"
     return d
 
@@ -3571,20 +3646,12 @@ class DynaGraphRunner:
             self.plans = {}
             self.sym_index = {}
             return
-        try:
-            kernels, symbols = extract_kernel_table(
-                body, getattr(model, "__globals__", {})
-            )
-        except Unsupported as exc:
-            kernels, symbols = None, None
-            self.parse_problem = f"unparsed: {exc}"
-        self.kernels: list[dict[str, Any]] = kernels or []
-        self.symbols: list[str] = symbols or []
-        self.exact = not any(k.get("atomic") for k in self.kernels)
         # Unbacked symbols resolved on the device (`dynagraph_unbacked="device"`).
         self.dev = _device_scalars(body)
-        # What the allocation, layout and lifetime parsers read: the body,
-        # with each torch.cond's branches folded in (`_fold_branches`).
+        # What the allocation, layout, lifetime and kernel parsers read: the
+        # body with each torch.cond's branches folded in (`_fold_branches`).
+        # The branches' kernels are captured into the conditional's bodies and
+        # patched like any other, so they belong in the table.
         self.alloc_body = body
         if self.dev is not None and self.dev.conds:
             folded = _fold_branches(body, src, self.dev.conds)
@@ -3592,6 +3659,17 @@ class DynaGraphRunner:
                 self.dev.problem = "cond-branch: a branch subgraph could not be read"
             else:
                 self.alloc_body = folded
+        try:
+            kernels, symbols = extract_kernel_table(
+                self.alloc_body, getattr(model, "__globals__", {})
+            )
+        except Unsupported as exc:
+            kernels, symbols = None, None
+            self.parse_problem = f"unparsed: {exc}"
+        self.kernels: list[dict[str, Any]] = kernels or []
+        self.symbols: list[str] = symbols or []
+        self.exact = not any(k.get("atomic") for k in self.kernels)
+        if self.dev is not None:
             for c in self.dev.conds:
                 if c.sel not in self.symbols:
                     self.symbols.append(c.sel)
@@ -3612,11 +3690,17 @@ class DynaGraphRunner:
         self._capturing = False
         self.bound_env = {}
         self.f_planner_u: list[int] = []
+        self.f_zeropad: dict[int, int] = {}
         self._u_pin: Any = None
         self._u_view: Any = None
         self._on_extern_cb: Any = None
         self._alloc_cb: Any = None
         self._real_alloc: Any = None
+        self._body_st: Any = None
+        # Extern sites whose operands need their padding zeroed first, and
+        # what to zero: (buffer, the symbol, the span expression, item size).
+        # `build` turns the buffer into its arena slot.
+        self.pad_of: dict[int, list[tuple[Any, str, str, int]]] = {}
         self._cond_bodies: dict[int, Any] = {}
         # A returned buffer is often a rename of one that owns the allocation.
         # What comes back is a mix: arena buffers, and inputs handed straight
@@ -3683,6 +3767,10 @@ class DynaGraphRunner:
         # extern_kernels.* call sites, in order. Each becomes a child-graph
         # node; see `_harvest` and `_capture`.
         self.extern_sites = [n for n, _o in sites]
+        # The sites that own a child graph. A torch.cond branch is captured
+        # into the conditional's body instead, so its nodes are patched per
+        # shape like any other and a new shape needs no harvest of it.
+        self.child_sites = [n for n in self.extern_sites if not n.startswith("cond:")]
         # Device path: where in the `setctx` values the "inputs moved" flag
         # sits (the input addresses follow it, one per argument position).
         self._ctx_in0 = (
@@ -3793,7 +3881,12 @@ class DynaGraphRunner:
             for line in body.splitlines()
             if _SITE_CALL.search(line.split("#", 1)[0])
         ]
-        for code in site_lines:
+        # The sites here are the extern calls only, in the same order as in
+        # `extern_sites` minus the cond branches.
+        site_index = [
+            i for i, nm in enumerate(self.extern_sites) if not nm.startswith("cond:")
+        ]
+        for at, code in enumerate(site_lines):
             if not _UNBACKED.search(code):
                 continue
             m = _SITE_CALL.search(code)
@@ -3802,8 +3895,12 @@ class DynaGraphRunner:
             if mo:
                 out = mo.group(1)
             if out is None or not u_sized(out):
-                dev.problem = "unbacked-extern-reduce: an extern call reduces over an unbacked size"
-                return
+                i = site_index[at] if at < len(site_index) else None
+                why = self._pad_plan(i, code, m) if i is not None else "no site"
+                if why is not None:
+                    dev.problem = f"unbacked-extern-reduce: {why}"
+                    return
+                continue
             for nm in re.findall(r"\bbuf\d+\b", code):
                 lay = self.layouts.get(nm)
                 if (
@@ -3933,41 +4030,95 @@ class DynaGraphRunner:
         return out
 
     def _dev_cond(self, site0: int, fns: Any) -> Any:
-        """The rewritten wrapper's torch.cond: every branch is a site. At
-        harvest each branch runs and is captured on its own; at capture each
-        becomes a body of one conditional node, and the branch allocations
-        the run would have made are made here so the count agrees."""
+        """The rewritten wrapper's torch.cond: every branch is a site.
+
+        Every branch runs on every pass -- at harvest to lay its buffers out,
+        at capture into its own body of the conditional node -- so the two
+        agree on how many arena views the region takes.
+        """
         wrap = self._on_extern_cb
         out = None
         g = self.model.__globals__
         for b, fn in enumerate(fns):
             if not self._capturing and self._real_alloc is not None:
-                # Warm-up with the module's own allocator: the branch's
-                # kernels get compiled and tuned before the capture, and
-                # the arena views by position stay for the captured run.
+                # Warm-up with the module's own allocator, before anything is
+                # captured: compiling or autotuning a branch's kernel inside a
+                # capture would be fatal.
                 patched = g.get("empty_strided_cuda")
                 g["empty_strided_cuda"] = self._real_alloc
                 try:
                     fn()
                 finally:
                     g["empty_strided_cuda"] = patched
-            if self._capturing and self._alloc_cb is not None:
-                _ci, _b, _n = self.cond_of[site0 + b]
-                cond = self.dev.conds[_ci] if self.dev is not None else None
-                for nm in cond.branch_allocs[b] if cond is not None else []:
-                    sizes_e, strides_e, dtype_name = self.layouts[nm]
-                    env = self._bounds_now
-                    sizes = [int(_eval_int(e, env) or 0) for e in sizes_e]
-                    strides = [int(_eval_int(e, env) or 0) for e in strides_e]
-                    self._alloc_cb(
-                        tuple(sizes),
-                        tuple(strides),
-                        getattr(__import__("torch"), dtype_name.split(".")[-1]),
-                    )
             # Through the site-counting wrapper, so the branch lands on
             # site `site0 + b` like an extern call at the selector line.
             out = wrap(fn)()
         return out
+
+    def _body_stream(self) -> Any:
+        """The side stream a conditional body is captured on: the wrapper
+        reaches for the current stream, so the branch has to be run on one
+        that is capturing into the body rather than into the parent."""
+        import torch
+
+        if self._body_st is None:
+            self._body_st = torch.cuda.Stream(device=self.device)
+        return self._body_st
+
+    def _pad_plan(self, i: int, code: str, m: Any) -> str | None:
+        """Plan the zeroing that makes an extern reducing over an unbacked
+        size exact, or say why it cannot be done.
+
+        On the device path an extern runs at the bound of the unbacked size:
+        rows [u, bound) hold whatever the slot held before. When the op sums
+        over that dimension the garbage is summed in -- but zero is the
+        identity of a sum, so zeroing those rows first makes the result
+        exactly the one the true size would have given. The zeroing is a
+        kernel node in the graph whose extent the planner computes from u.
+        """
+        name = m.group("ek") or (
+            "ops:" + re.sub(r"\s+", "", m.group("ops") or "")
+            if m.group("ops")
+            else "ops:aten." + re.sub(r"\s+", "", m.group("aten") or "")
+        )
+        red = _ADDITIVE_REDUCE.get(name)
+        if red is None:
+            return f"{name} does not reduce with zero for an identity"
+        args = _split_args(code[m.end() : code.rindex(")")])
+        plan = []
+        for j in red:
+            if j >= len(args):
+                return f"{name} has no argument {j}"
+            raw = args[j].strip()
+            owner, off = _view_of(raw, self.alias, self.views)
+            lay = self.layouts.get(owner)
+            span = self.sizes.get(owner)
+            if lay is None or span is None or owner in self.argv:
+                # A graph input, or something with no allocation of its own:
+                # the padding is not ours to write over.
+                if not _UNBACKED.search(raw):
+                    continue
+                return f"{name} argument {j} is {owner}, which owns no allocation"
+            sizes_e, strides_e, _dtype = lay
+            if not any(
+                _UNBACKED.search(str(t)) for t in list(sizes_e) + list(strides_e)
+            ):
+                continue
+            if any(_UNBACKED.search(str(t)) for t in strides_e):
+                return f"{owner} carries an unbacked symbol in its strides"
+            us = [t for t in sizes_e if re.fullmatch(r"u\d+", str(t).strip())]
+            if len(us) != 1 or str(sizes_e[0]).strip() != us[0]:
+                return f"{owner} is not a prefix of its allocation"
+            if any(_UNBACKED.search(str(t)) for t in sizes_e[1:]):
+                return f"{owner} carries an unbacked symbol past its first size"
+            if not _off_is_zero(off):
+                return f"{owner} is used at an offset"
+            # The slot is settled in `build`, after the layout is planned.
+            plan.append((owner, us[0], span[0], int(span[1])))
+        if not plan:
+            return None
+        self.pad_of[i] = plan
+        return None
 
     def _dev_item(self, name: str, buf: Any) -> int:
         """What the rewritten wrapper gets for an unbacked symbol: its bound
@@ -4259,6 +4410,16 @@ class DynaGraphRunner:
             )
         # Of those, the ones read where they are, no copy (`__call__`).
         self.inplace: OrderedSet[int] = OrderedSet()
+        for i, plan in list(self.pad_of.items()):
+            if any(nm not in self.slot_of for nm, _u, _s, _it in plan):
+                # Its buffer did not end up with a slot of its own after all.
+                del self.pad_of[i]
+                return _fallback("unbacked-extern-reduce", f"site {i} owns no slot")
+            self.pad_of[i] = [(self.slot_of[nm], u, sp, it) for nm, u, sp, it in plan]
+        # cuBLAS may split K differently at the bound than at the true size,
+        # so a padded reduction agrees to rounding, not to the bit.
+        if self.pad_of:
+            self.exact = False
         host_src: str | None = None
         planner_src: str | None = None
         try:
@@ -4319,6 +4480,7 @@ class DynaGraphRunner:
                     sizes=self.sizes,
                     fixed_off=self.fixed_off,
                     dev=self.dev,
+                    pad_of=self.pad_of,
                 )
         except Unsupported as exc:
             return _fallback("unmodelled", str(exc))
@@ -4347,13 +4509,17 @@ class DynaGraphRunner:
             )
         else:
             names = ["dynagraph_planner", "dynagraph_setctx"]
+            n_u = len(self.dev.items) if self.dev is not None else 0
             if self.dev is not None:
-                names += [f"dynagraph_planner_u{j}" for j in range(len(self.dev.items))]
+                names += [f"dynagraph_planner_u{j}" for j in range(n_u)]
+            pads = sorted(self.pad_of)
+            names += [f"dynagraph_zeropad{i}" for i in pads]
             funcs = _compile_module(planner_src or "", names)
             if funcs is None:
                 return _fallback("planner-build")
             self.f_planner, self.f_setctx = funcs[0], funcs[1]
-            self.f_planner_u = list(funcs[2:])
+            self.f_planner_u = list(funcs[2 : 2 + n_u])
+            self.f_zeropad = dict(zip(pads, funcs[2 + n_u :]))
 
         offsets = self.slot_offsets(env)
         if offsets is None:
@@ -4795,13 +4961,16 @@ class DynaGraphRunner:
             s.wait_stream(torch.cuda.current_stream())
             gen = torch.cuda.default_generators[self.device_index]
             offset = gen.get_offset()
-            r = None
-            if not self.extern_sites[i].startswith("cond:"):
-                # Warmed up here; a cond branch was warmed up by `_dev_cond`
-                # with real allocations, since a run of it here would take
-                # the arena views meant for the captured run.
-                with torch.cuda.stream(s):
-                    r = fn(*a, **kw)
+            if i in self.cond_of:
+                # A cond branch is captured into the conditional's body at
+                # capture, not into a graph of its own, so there is nothing to
+                # harvest: run it where it is, to lay out its buffers.
+                r = fn(*a, **kw)
+                graphs.append(None)
+                results.append(r)
+                return r
+            with torch.cuda.stream(s):
+                r = fn(*a, **kw)
             torch.cuda.current_stream().wait_stream(s)
             # The generator offset moves when the op is enqueued, not when it
             # runs, so no synchronize is needed to read it.
@@ -5394,6 +5563,19 @@ class DynaGraphRunner:
         with torch.cuda.stream(stream):
             for _ in range(3):
                 self.model(self._eager_args(self.static_inputs))
+            # The data takes one branch of a torch.cond, and the kernels of the
+            # other one would never settle on a config. Every branch is in the
+            # table now, so every branch has to be warmed.
+            for ci, c in enumerate(self.dev.conds if self.dev is not None else []):
+                if self.force_model is None:
+                    break
+                for b in range(len(c.branches)):
+                    self._force_sel = {ci: b}
+                    try:
+                        for _ in range(3):
+                            self.force_model(self._eager_args(self.static_inputs))
+                    finally:
+                        self._force_sel = {}
         torch.cuda.current_stream().wait_stream(stream)
         torch.cuda.synchronize()
 
@@ -5558,7 +5740,6 @@ class DynaGraphRunner:
             cinfo = self.cond_of.get(i)
             if cinfo is not None:
                 ci, b, n_b = cinfo
-                g_raw = self.child_graphs[build_key][i]
                 st = torch.cuda.current_stream().cuda_stream
                 if b == 0:
                     info = ck(cr.cudaStreamGetCaptureInfo(st))
@@ -5574,33 +5755,57 @@ class DynaGraphRunner:
                     node = ck(
                         cr.cudaGraphAddNode(cap_graph, deps, None, len(deps), params)
                     )
-                    self._cond_bodies[ci] = (params, params.conditional.phGraph_out)
-                    child = ck(
-                        cr.cudaGraphAddChildGraphNode(
-                            self._cond_bodies[ci][1][0], None, 0, g_raw
-                        )
+                    self._cond_bodies[ci] = (
+                        params,
+                        params.conditional.phGraph_out,
+                        node,
                     )
                     self.ex.site_cond.append(int(handle))
+                else:
+                    self.ex.site_cond.append(0)
+                # Captured into the body itself, not added to it as a child
+                # graph: the branch's kernels are then ordinary nodes of this
+                # graph, they hand back device handles like any other, and the
+                # planner patches their grids per shape -- so a new shape needs
+                # no re-harvest of the branch.
+                body = self._cond_bodies[ci][1][b]
+                # No wait_stream onto it: an event recorded on the capturing
+                # stream would pull this one into the parent capture, and the
+                # body capture would then be refused. Ordering comes from the
+                # conditional node, not from the stream.
+                side = self._body_stream()
+                with torch.cuda.stream(side):
+                    raw = torch.cuda.current_stream().cuda_stream
+                    ck(
+                        cr.cudaStreamBeginCaptureToGraph(
+                            raw,
+                            body,
+                            None,
+                            None,
+                            0,
+                            cr.cudaStreamCaptureMode.cudaStreamCaptureModeRelaxed,
+                        )
+                    )
+                    try:
+                        out = fn(*a, **kw)
+                    finally:
+                        ck(cr.cudaStreamEndCapture(raw))
+                if b == n_b - 1:
+                    # Once every body is filled: what the wrapper does next
+                    # depends on the conditional node.
                     ck(
                         cr.cudaStreamUpdateCaptureDependencies(
                             st,
-                            [node],
+                            [self._cond_bodies[ci][2]],
                             None,
                             1,
                             cr.cudaStreamUpdateCaptureDependenciesFlags.cudaStreamSetCaptureDependencies,
                         )
                     )
-                else:
-                    child = ck(
-                        cr.cudaGraphAddChildGraphNode(
-                            self._cond_bodies[ci][1][b], None, 0, g_raw
-                        )
-                    )
-                    self.ex.site_cond.append(0)
-                self.ex.site_held.append([g_raw])
-                self.ex.site_body_nodes.append([child])
-                self.ex.child_nodes.append(child)
-                return self._harvest_result(build_key, i, a, kw)
+                self.ex.site_held.append([None])
+                self.ex.site_body_nodes.append([None])
+                self.ex.child_nodes.append(None)
+                return out
             graphs_i = self.site_graphs[i]
             if self.child_graphs[build_key][i] is None:
                 # Nothing to launch (a stream-ordering op): the wrapper just
@@ -5612,6 +5817,13 @@ class DynaGraphRunner:
                 self.ex.site_held.append([None])
                 return self._harvest_result(build_key, i, a, kw)
             st = torch.cuda.current_stream().cuda_stream
+            f_pad = self.f_zeropad.get(i)
+            if f_pad is not None:
+                # A node of this graph, so the child node added below depends
+                # on it: the operand's padding is zero before the extern reads
+                # it. Raw, not through the static launcher -- it must not take
+                # a device handle, which is counted against the kernel table.
+                _launch(f_pad, [self.ex.ctx.data_ptr()], 256, 256, st)
             info = ck(cr.cudaStreamGetCaptureInfo(st))
             cap_graph, deps = info[2], list(info[3] or [])
             # What each body holds at capture: this shape's own graph in the
@@ -5980,7 +6192,7 @@ class DynaGraphRunner:
 
         ex = self.ex
         hkey = self._hkey(key)
-        if self.extern_sites:
+        if self.extern_sites and self.child_sites:
             if key in self.skip_keys:
                 return SKIP_SHAPE
             ex = self._ex_of.get(hkey)
@@ -6012,7 +6224,7 @@ class DynaGraphRunner:
                     if (in_ptrs[j] or 0) != last[j]:
                         in_changed.append(j)
             self._write_ctx(env, hkey, stream, in_changed)
-            if self.extern_sites and not self._swap_children(hkey):
+            if self.child_sites and not self._swap_children(hkey):
                 return None
 
         if self.extern_sites:
