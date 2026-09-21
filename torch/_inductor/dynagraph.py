@@ -2699,6 +2699,28 @@ _NOOP_OPS = OrderedSet(["ops:_c10d_functional.wait_tensor.default"])
 _TK_CALL = re.compile(r"(?<![\w.])(?P<tk>[A-Za-z_]\w*)\s*\.\s*run\s*\(")
 
 
+# A TMA descriptor the wrapper builds on the host, and the tensor it was built
+# from. The descriptor bakes that tensor's address, so a call that is handed the
+# descriptor is reading that tensor even though the call site does not name it.
+_TMA_BUILD = re.compile(
+    r"^\s*(?P<name>\w+)\s*=\s*"
+    r"(?:[\w.]*\btensor_descriptor\.TensorDescriptor\.from_tensor"
+    r"|[\w.]*\bcreate_\dd_tma_descriptor)\s*\(\s*(?P<src>[^,()]+(?:\([^()]*\))?)"
+)
+
+
+def _tma_sources(body: str) -> dict[str, str]:
+    """Descriptor variable -> the argument it was built from, per wrapper line."""
+    out: dict[str, str] = {}
+    for line in body.splitlines():
+        m = _TMA_BUILD.match(line.split("#", 1)[0])
+        if m:
+            src = m.group("src").strip()
+            # `create_2d_tma_descriptor(x.data_ptr(), ...)` names the tensor too.
+            out[m.group("name")] = src.split(".data_ptr")[0].strip()
+    return out
+
+
 def _scan_line(code: str, opaque: Any = ()) -> list[tuple[int, str, str | None, str]]:
     """(position, site name, buffer assigned, argument text) per site on a line.
 
@@ -3807,6 +3829,8 @@ class DynaGraphRunner:
         # Every view assigned in the wrapper, with its composed element
         # offset: a call-site argument may be one (`_view_of`).
         self.views = _buffer_views(self.alloc_body)
+        # Host-built TMA descriptor -> the tensor it was built from.
+        self.tma_of = _tma_sources(self.alloc_body)
         self.dev_model = None
         # The same wrapper with `__dg_sel` in front of each selector, and what
         # to force it to (`_branches_match`).
@@ -4705,8 +4729,23 @@ class DynaGraphRunner:
             for line in self.body.splitlines():
                 code = line.split("#", 1)[0]
                 if _scan_line(code, self.opaque_kernels):
-                    for nm in re.findall(r"\b[A-Za-z_]\w*\b", code):
-                        if nm in self.argv:
+                    names = list(re.findall(r"\b[A-Za-z_]\w*\b", code))
+                    # A TMA descriptor handed to the call carries the address of
+                    # the tensor it was built from, and the call site names only
+                    # the descriptor. Follow it, or an input whose descriptor was
+                    # built on an earlier line is read without being tracked and
+                    # a later call at the same shape replays a stale address.
+                    for _ in range(4):
+                        grown = [self.tma_of[nm] for nm in names if nm in self.tma_of]
+                        fresh = [g for g in grown if g not in names]
+                        if not fresh:
+                            break
+                        names += fresh
+                    for nm in names:
+                        owner = _view_of(nm, self.alias, self.views)[0]
+                        if owner in self.argv:
+                            out.add(self.argv[owner])
+                        elif nm in self.argv:
                             out.add(self.argv[nm])
         if self.dev is not None:
             # A branch's captured graph holds the addresses of what it is
