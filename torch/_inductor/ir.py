@@ -89,7 +89,7 @@ from torch.utils._sympy.functions import (
     Mod,
     ModularIndexing,
 )
-from torch.utils._sympy.symbol import SymT
+from torch.utils._sympy.symbol import symbol_is_type, SymT
 
 from . import config, dependencies
 from .codegen.common import (
@@ -9491,6 +9491,20 @@ class AssertScalar(ExternKernel):
         # simplify(u0 == 0), you will get True (because we've already runtime assert'ed
         # that it's true).  But we're code generating the actual runtime assert here!!
         symbol = next(iter(self.get_free_symbol_uses(unbacked_only=False)))
+        if (
+            getattr(wrapper, "parent_wrapper", None) is not None
+            # A graph partition is generated through the same wrapper, and it
+            # does get every symbol it asserts on.
+            and getattr(wrapper, "partition_signatures", None) is None
+            and any(
+                not symbol_is_type(s, SymT.UNBACKED_INT)
+                and s not in wrapper.bound_symbols
+                for s in self.get_free_symbol_uses(unbacked_only=False)
+            )
+        ):
+            # In a subgraph, over a size symbol the subgraph was never handed.
+            # The enclosing graph is where that assert can run, and does.
+            return
         if V.graph.fx_wrapper:
             # TODO fix
             pass

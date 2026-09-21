@@ -1658,6 +1658,8 @@ class PythonWrapperCodegen(CodeGen):
     supports_caching: bool = True  # Whether the output code is cacheable.
 
     def __init__(self):
+        # Filled by `codegen_inputs`; read by AssertScalar.codegen.
+        self.bound_symbols: OrderedSet[sympy.Symbol] = OrderedSet()
         super().__init__()
         self._last_default_stream_device: int | None = None
         self._pending_input_asserts: dict[str, tuple[str, str]] = {}
@@ -3074,8 +3076,12 @@ class PythonWrapperCodegen(CodeGen):
         self.maybe_emit_replacement_aliases(sym, bound_vars)
 
     def codegen_inputs(self):
+        # Kept for AssertScalar: a subgraph is only handed the symbols its
+        # tensors are shaped by, so an assert over one it never received
+        # cannot be generated there.
         """Assign input symbolic shapes to wrapper-local variables."""
         bound_vars = OrderedSet[sympy.Symbol]()
+        self.bound_symbols = bound_vars
         # There is a subtle case in the cpp wrapper codegen which requires generating
         # symbol inputs first followed by non-symbol ones.
         #
