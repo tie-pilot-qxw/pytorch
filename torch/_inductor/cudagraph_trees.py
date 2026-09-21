@@ -628,7 +628,7 @@ def _maybe_build_dynagraph(
         # holds every partition, and only this one's buffers go in the arena.
         if not runner.build(
             inputs,
-            dg.lifetimes_from_source(runner.body or ""),
+            dg.lifetimes_from_source(runner.alloc_body or runner.body or ""),
             env,
             static_input_idxs,
             kwargs.get("mutated_input_idxs", ()),

@@ -9210,7 +9210,17 @@ def cond(
 ) -> list[ir.TensorBox | ir.ShapeAsConstantBuffer]:
     # TODO: when graph_partition is enabled, skip - partitioning handles control flow
     # we run into memory cleanup issue
-    if any(isinstance(x, IRNode) and is_triton(x) for x in [pred, *operands]):
+    # Under DynaGraph's device-side unbacked handling the cond stays in its
+    # partition as a conditional node (see scheduler.should_partition), so
+    # the graph is not turned away here.
+    device_cond = (
+        config.graph_partition
+        and config.triton.dynagraph
+        and config.triton.dynagraph_unbacked == "device"
+    )
+    if not device_cond and any(
+        isinstance(x, IRNode) and is_triton(x) for x in [pred, *operands]
+    ):
         msg = "control flow operator: torch.cond."
         if stack_trace := V.graph.current_node.meta.get("stack_trace", None):
             msg = f"{msg} Found from : \n {stack_trace}"

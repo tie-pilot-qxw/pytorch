@@ -11244,6 +11244,19 @@ class Scheduler:
             return "DeviceCopy ops"
 
         if isinstance(node.node, ir.Switch):
+            # Under DynaGraph's device-side unbacked handling a torch.cond
+            # stays in the partition: the branches become the bodies of a
+            # conditional node and a planner node sets its selector from the
+            # predicate on the device. Not when a branch defines an unbacked
+            # size; the host would need that.
+            if (
+                config.triton.dynagraph
+                and config.triton.dynagraph_unbacked == "device"
+                and node.node.is_cond
+                and not getattr(node.node, "unbacked_bindings", None)
+                and not isinstance(node.node.selector, ir.ShapeAsConstantBuffer)
+            ):
+                return None
             return "Switch ops"
 
         bindings = getattr(node.node, "unbacked_bindings", None)
