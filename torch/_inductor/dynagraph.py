@@ -306,12 +306,47 @@ def settled_blocks(obj: Any) -> dict[str, int] | None:
     return {bk: kwargs[bk] for bk in _TUNED if bk in kwargs}
 
 
+_LAUNCHER_ARG = re.compile(r"\b_launcher_s\d+\b")
+
+
+def precomputed_grid(k: dict[str, Any], obj: Any) -> list[str] | None:
+    """The grid of the config this kernel settled on, in wrapper symbols.
+
+    Inductor evaluates a user kernel's grid lambda once per config at codegen
+    time and stores the results; which one applies is decided by the config the
+    autotuner commits to, so this is only meaningful after the warmup.
+    """
+    from torch._inductor.runtime.triton_heuristics import GridExpr
+
+    launchers = getattr(obj, "launchers", None) or []
+    if len(launchers) != 1:
+        return None
+    pgrids, la = k["pgrid"]
+    try:
+        g = GridExpr.from_meta(
+            {"grid_type": "PrecomputedGrid", "precomputed_grids": pgrids},
+            launchers[0].config,
+            mode="python",
+        )
+    except Exception:
+        return None  # settled on a config the table has no grid for
+    # Parenthesized: a launcher symbol stands for a whole call-site expression,
+    # and `a*b` spliced bare into `(127 + X) // 128` is a different grid.
+    return [
+        _LAUNCHER_ARG.sub(lambda m: f"({la[m.group(0)]})", str(e))
+        for e in (g.x_grid, g.y_grid, g.z_grid)
+    ]
+
+
 def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
     """Return (kernels, symbols) for the kernels this wrapper actually launches.
 
     ``call_globals`` is the wrapper module's namespace. Its CachingAutotuner
     values are the kernels that enter the graph; the autotuner *candidates* live
     in other modules and must not be collected.
+
+    Raises ``Unsupported`` when a call site cannot be read, rather than
+    returning an empty table that reads as a region with nothing to serve.
     """
     from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 
@@ -325,8 +360,9 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
     for gname, pos in run_calls:
         obj = autotuners.get(gname)
         if obj is None:
-            return None, None  # a .run on something not introspectable
+            raise Unsupported(f"{gname}: .run() on something that is not a kernel")
         meta = obj.inductor_meta or {}
+        kname = meta.get("kernel_name", gname)
         sig = (obj.triton_meta or {}).get("signature", {})
         constants = (obj.triton_meta or {}).get("constants", {}) or {}
         # Two different orderings, and conflating them slides every argument
@@ -375,14 +411,22 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
         cands = list(dict.fromkeys(cands))
         func = cands[0] if cands else None
         if not func:
-            return None, None  # kernel not statically launched; bail out
+            raise Unsupported(f"{kname}: no cubin handle; not statically launched")
 
-        n_grid = 3 if meta.get("grid_type") == "FixedGrid" else 0
+        # The grid can arrive as trailing positionals. FixedGrid passes
+        # _grid_0/1/2; PrecomputedGrid passes the size symbols its per-config
+        # formulas are written in. Neither is a kernel parameter, so they come
+        # off before the signature and the call site are lined up.
+        extra = list(meta.get("extra_launcher_args") or ())
+        n_grid = len(extra)
         if len(call_order) != len(pos) - n_grid:
             # Nothing here can say which positional is which, and reading them
             # by a guessed offset is how a node ends up patched with another
             # argument's value.
-            return None, None
+            raise Unsupported(
+                f"{kname}: signature takes {len(call_order)} arguments, the call "
+                f"site passes {len(pos) - n_grid}: {call_order} vs {pos}"
+            )
         at = {nm: call_order.index(nm) for nm in args if nm in call_order}
         exprs = {
             nm: _resolve(pos[at[nm]], source_code, symbols)
@@ -409,22 +453,31 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
         offsets = {
             nm: _param_info(func, args.index(nm)) for nm in list(exprs) + list(ptrs)
         }
-        if any(v is None for v in offsets.values()):
-            return None, None
+        bad = [nm for nm, v in offsets.items() if v is None]
+        if bad:
+            raise Unsupported(f"{kname}: no parameter offset for {bad}")
 
-        grid = None
-        if meta.get("grid_type") == "FixedGrid":
-            grid = [
-                _resolve(e, source_code, symbols)
-                for e in pos[len(call_order) : len(call_order) + 3]
-            ]
-            if len(grid) != 3:
-                return None, None
+        tail = [
+            _resolve(e, source_code, symbols)
+            for e in pos[len(call_order) : len(call_order) + n_grid]
+        ]
+        grid, pgrid = None, None
+        gt = meta.get("grid_type")
+        if gt == "FixedGrid":
+            grid = tail
+        elif gt == "PrecomputedGrid":
+            pgrids = meta.get("precomputed_grids")
+            if not pgrids:
+                raise Unsupported(f"{kname}: a precomputed grid with no table")
+            # Which entry applies is the config the autotuner has not committed
+            # to yet, so only the table and what its symbols stand for are kept
+            # here; `build` resolves the grid after the warmup.
+            pgrid = (pgrids, dict(zip(extra, tail)))
 
         kernels.append(
             dict(
                 gname=gname,
-                name=meta.get("kernel_name", gname),
+                name=kname,
                 func=int(func),
                 funcs=cands,
                 exprs=exprs,
@@ -433,6 +486,7 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
                 offsets=offsets,
                 blocks=blocks,
                 grid=grid,
+                pgrid=pgrid,
                 grid_type=meta.get("grid_type"),
                 # A combo (horizontally fused) kernel's grid is a formula over
                 # its sub-kernels' numels; this is the meta that formula reads.
@@ -922,15 +976,17 @@ def generate_planner(
     for i, k in enumerate(kernels):
         if k["grid"]:
             if not any(_is_symbolic(e) for e in k["grid"]):
+                # No `continue`: a grid that does not move says nothing about
+                # the scalar arguments, which are patched below.
                 grid_cases.append(
                     f"    case {i}: static_grid = true; break;  // {k['name']}"
                 )
-                continue
-            gx, gy, gz = (idx(e) for e in k["grid"])
-            grid_cases.append(
-                f"    case {i}: gx=dg_eval({gx},ctx); gy=dg_eval({gy},ctx); "
-                f"gz=dg_eval({gz},ctx); break;  // {k['name']}"
-            )
+            else:
+                gx, gy, gz = (idx(e) for e in k["grid"])
+                grid_cases.append(
+                    f"    case {i}: gx=dg_eval({gx},ctx); gy=dg_eval({gy},ctx); "
+                    f"gz=dg_eval({gz},ctx); break;  // {k['name']}"
+                )
         else:
             gt = k.get("grid_type") or ""
             blocks = k["blocks"]
@@ -1179,6 +1235,7 @@ def generate_planner(
             dev_grid,
             dev_param,
             body0 + n_sites,
+            lastp0 + _n_ptr,
         )
     return out
 
@@ -1203,14 +1260,16 @@ def _planner_u_source(
     dev_grid: dict[int, list[str]],
     dev_param: dict[int, list[str]],
     cond0: int = 0,
+    force0: int = 0,
 ) -> str:
     """One kernel per `.item()` point: read the value where the kernel before
     it left it, derive the symbols that follow from it, and patch the nodes
     after it that depend on them (see `generate_planner`). A point that is a
     torch.cond's selector sets the conditional node's value from it
-    (`cond0` is where the handles sit in ctx)."""
+    (`cond0` is where the handles sit in ctx, `force0` the slot per cond that
+    pins a branch for the build-time check)."""
     n_sym, n_k = len(symbols), len(kernels)
-    cond_site = {c.sel: c.site0 for c in getattr(dev, "conds", [])}
+    cond_site = {c.sel: (ci, c.site0) for ci, c in enumerate(getattr(dev, "conds", []))}
     out = ["\n#define S(i) (ctx[(i)])"]
     for j, (name, buf, form, _k) in enumerate(dev.items):
         root = buf
@@ -1245,8 +1304,14 @@ def _planner_u_source(
 
         assign(name, read)
         if name in cond_site:
+            ci, site0 = cond_site[name]
             lines.append(
-                f"    if (c) cudaGraphSetConditional((cudaGraphConditionalHandle)ctx[{cond0 + cond_site[name]}],"
+                f"    {{ int64_t pin = ctx[{force0 + ci}];"
+                f" if (pin) {{ ctx[{sym_index[name]}] = pin - 1; c = 1; }} }}"
+                f"  // forced branch of {name}"
+            )
+            lines.append(
+                f"    if (c) cudaGraphSetConditional((cudaGraphConditionalHandle)ctx[{cond0 + site0}],"
                 f" (unsigned)ctx[{sym_index[name]}]);  // {name}"
             )
         for nm, expr, point in dev.derived:
@@ -3000,8 +3065,13 @@ class _Exec:
         _arena_i, _off0, lastp0 = ctx_layout(
             n_sym, n_k, len(runner.ext_slots), n_s, len(runner.argv), runner.n_slots
         )
+        # Last, one slot per torch.cond: zero normally, b+1 to pin the graph
+        # to branch b for the build-time check of the branch the data did not
+        # take. Past LASTP, which is as far as either planner writes.
+        dev = getattr(runner, "dev", None)
+        self.force0 = lastp0 + max(int(getattr(runner, "n_ptr", 0)), 0)
         self.ctx = torch.zeros(
-            lastp0 + max(int(getattr(runner, "n_ptr", 0)), 0),
+            self.force0 + (len(dev.conds) if dev is not None else 0),
             dtype=torch.int64,
             device=runner.device,
         )
@@ -3475,6 +3545,9 @@ class DynaGraphRunner:
         self.entry = getattr(model, "__name__", None)
         body = _entry_source(src, self.entry)
         self.body = body
+        # Why the wrapper could not be parsed, if it could not: an empty kernel
+        # table otherwise looks exactly like a region with nothing to serve.
+        self.parse_problem: str | None = None
         if body is None:
             self.kernels, self.symbols = [], []
             self.sizes, self.layouts, self.alias = {}, {}, {}
@@ -3498,7 +3571,13 @@ class DynaGraphRunner:
             self.plans = {}
             self.sym_index = {}
             return
-        kernels, symbols = extract_kernel_table(body, getattr(model, "__globals__", {}))
+        try:
+            kernels, symbols = extract_kernel_table(
+                body, getattr(model, "__globals__", {})
+            )
+        except Unsupported as exc:
+            kernels, symbols = None, None
+            self.parse_problem = f"unparsed: {exc}"
         self.kernels: list[dict[str, Any]] = kernels or []
         self.symbols: list[str] = symbols or []
         self.exact = not any(k.get("atomic") for k in self.kernels)
@@ -3523,6 +3602,10 @@ class DynaGraphRunner:
         # offset: a call-site argument may be one (`_view_of`).
         self.views = _buffer_views(self.alloc_body)
         self.dev_model = None
+        # The same wrapper with `__dg_sel` in front of each selector, and what
+        # to force it to (`_branches_match`).
+        self.force_model: Any = None
+        self._force_sel: dict[int, int] = {}
         self.dev_out_syms = []
         self.dev_out_idx = []
         self._bounds_now = {}
@@ -3799,6 +3882,38 @@ class DynaGraphRunner:
             dev.problem = f"unbacked-rewrite: {exc}"
             return
         self.dev_model = g[fname]
+        if dev.conds:
+            # The wrapper again, unchanged except that each selector can be
+            # overridden: the reference for a branch the data did not take has
+            # to be the region's own generated kernels, since a hand-written
+            # equivalent does not match bit for bit.
+            sel_of = {c.sel: ci for ci, c in enumerate(dev.conds)}
+            forced = []
+            for line in body.splitlines():
+                m = _SEL_LINE.match(line.split("#", 1)[0])
+                ci = sel_of.get(m.group(1)) if m else None
+                if m is None or ci is None:
+                    forced.append(line)
+                    continue
+                indent = line[: len(line) - len(line.lstrip())]
+                forced.append(
+                    f"{indent}{m.group(1)} = __dg_sel({ci}, int({m.group(2)}.item()))"
+                )
+            fforce = f"__dg_force_{id(self)}"
+            g["__dg_sel"] = lambda i, real: self._force_sel.get(i, real)
+            try:
+                exec(
+                    compile(
+                        f"def {fforce}(args):\n" + "\n".join(forced) + "\n",
+                        f"<dynagraph {fforce}>",
+                        "exec",
+                    ),
+                    g,
+                )
+            except SyntaxError as exc:
+                dev.problem = f"unbacked-rewrite: {exc}"
+                return
+            self.force_model = g[fforce]
 
     def _with_bounds(self, env: dict[str, int]) -> dict[str, int] | None:
         """`env` with every device-resolved symbol at its upper bound (0 for
@@ -3890,6 +4005,10 @@ class DynaGraphRunner:
         # name its partition, which nothing observed does.
         if self.body is None:
             return "multi-partition"
+        # Before the counts below: a parse that gave up leaves them all empty
+        # and would be reported as a region with nothing in it.
+        if self.parse_problem:
+            return self.parse_problem
         if not self.kernels and not self.extern_sites:
             return "no-kernels"
         if self.dev is not None and self.dev.problem:
@@ -4066,9 +4185,14 @@ class DynaGraphRunner:
         # config's block sizes.
         self._warmup()
         for k in self.kernels:
-            k["blocks"] = settled_blocks(self.model.__globals__.get(k["gname"]))
+            obj = self.model.__globals__.get(k["gname"])
+            k["blocks"] = settled_blocks(obj)
             if k["blocks"] is None:
                 return _fallback("unsettled-config", k["name"])
+            if k.get("pgrid") and not k["grid"]:
+                k["grid"] = precomputed_grid(k, obj)
+                if k["grid"] is None:
+                    return _fallback("unsettled-config", k["name"])
 
         if self.dev is not None:
             bounded = self._with_bounds(env)
@@ -4248,7 +4372,9 @@ class DynaGraphRunner:
             if not self._harvest(env, key, self._hkey(key), inputs):
                 return False
 
-        return self._capture() and self._replays_match(env)
+        return (
+            self._capture() and self._replays_match(env) and self._branches_match(env)
+        )
 
     # ------------------------------------------------------------ extern
     def _extern_read_positions(self) -> OrderedSet[int]:
@@ -5296,6 +5422,49 @@ class DynaGraphRunner:
             if os.environ.get("TORCHINDUCTOR_DYNAGRAPH_DEBUG"):
                 self._debug_mismatch(env)
             return _fallback("selfcheck-mismatch", f"at {env}")
+        return True
+
+    def _branches_match(self, env: dict[str, int]) -> bool:
+        """Every branch of every torch.cond, not just the one the data took.
+
+        A conditional node's bodies are wired at capture and the selector is
+        set on the device, so a branch the build's input did not select is
+        never exercised -- the two bodies could be swapped and the ordinary
+        self-check would pass. Forcing the selector through a ctx slot the
+        planner reads makes the graph take each branch in turn; the reference
+        is the wrapper itself with the same selector forced, which keeps the
+        comparison bit for bit.
+
+        Runs after `_replays_match`: both branches share the arena slots of the
+        cond's output, so each forced replay overwrites the last.
+        """
+        if self.dev is None or not self.dev.conds or self.force_model is None:
+            return True
+        for ci, c in enumerate(self.dev.conds):
+            for b in range(len(c.branches)):
+                self._force_sel = {ci: b}
+                try:
+                    with self._rng_kept():
+                        ref = self.force_model(self._eager_args(self.static_inputs))
+                finally:
+                    self._force_sel = {}
+                self.ex.ctx[self.ex.force0 + ci] = b + 1
+                try:
+                    with self._unwritten(self.static_inputs):
+                        step_seen, calls = self.step_seen, self.calls_in_step
+                        got = self(list(self.static_inputs))
+                        self.step_seen, self.calls_in_step = step_seen, calls
+                finally:
+                    self.ex.ctx[self.ex.force0 + ci] = 0
+                if got is None or not _same_values(got, ref, self.exact):
+                    if got is not None:
+                        log.info(
+                            "DynaGraph branch selfcheck: %s", _mismatch_report(got, ref)
+                        )
+                    return _fallback(
+                        "cond-branch-mismatch",
+                        f"{c.name} branch {b} ({c.branches[b][0]}) at {env}",
+                    )
         return True
 
     def _debug_mismatch(self, env: dict[str, int]) -> None:

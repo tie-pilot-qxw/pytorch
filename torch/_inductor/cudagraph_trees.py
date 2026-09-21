@@ -613,7 +613,10 @@ def _maybe_build_dynagraph(
         runner = dg.DynaGraphRunner(model, src, _inputs_device(inputs), mode)
         reason = runner.unusable_reason()
         if reason:
-            return dg._fallback(reason)
+            # "tag: detail", so a sweep tallying tags is not defeated by a
+            # detail that names a kernel.
+            tag, _, detail = reason.partition(": ")
+            return dg._fallback(tag, detail)
         env = {}
         for sym, i in runner.sym_from_input.items():
             v = inputs[i] if i < len(inputs) else None
