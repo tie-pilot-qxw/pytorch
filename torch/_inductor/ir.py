@@ -8780,6 +8780,17 @@ class UserDefinedTritonKernel(ExternKernel):
             epilogue_fusion,
             self.launch_kwargs,
         )
+        # Which parameter each host-built descriptor occupies, and the buffer it
+        # was built from: known here and nowhere else, so this is where it is
+        # declared for anything that has to rebuild it at another shape.
+        wrapper.codegen_tma_declaration(
+            new_name,
+            [
+                (k, v)
+                for k, v in self.kwargs.items()
+                if isinstance(v, TMADescriptorStable)
+            ],
+        )
         named_args = {
             k: self.get_kwargs_value(k) for k in self.ordered_kwargs_for_cpp_kernel
         }
