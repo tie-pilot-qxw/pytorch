@@ -345,8 +345,11 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
     values are the kernels that enter the graph; the autotuner *candidates* live
     in other modules and must not be collected.
 
-    Raises ``Unsupported`` when a call site cannot be read, rather than
-    returning an empty table that reads as a region with nothing to serve.
+    Returns the table, the size symbols it is written in, and the names of the
+    kernels that could not be read at all, which become opaque sites.
+
+    Raises ``Unsupported`` only when the wrapper itself cannot be read, rather
+    than returning an empty table that reads as a region with nothing to serve.
     """
     from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 
@@ -357,184 +360,205 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
     }
 
     kernels = []
+    opaque: OrderedSet[str] = OrderedSet()
     for gname, pos in run_calls:
-        obj = autotuners.get(gname)
-        if obj is None:
-            raise Unsupported(f"{gname}: .run() on something that is not a kernel")
-        meta = obj.inductor_meta or {}
-        kname = meta.get("kernel_name", gname)
-        sig = (obj.triton_meta or {}).get("signature", {})
-        constants = (obj.triton_meta or {}).get("constants", {}) or {}
-        # A TMA descriptor is neither a pointer nor a scalar. One signature
-        # entry becomes several cubin parameters (base pointer, global shape
-        # and strides, flags, block shape) or a CUtensorMap passed by value, so
-        # reading the signature position as a parameter index slides every
-        # argument after it onto another argument's bytes -- and
-        # cuFuncGetParamInfo answers for the shifted index just as happily.
-        # The descriptor also bakes in the address and the shape it was built
-        # for, which is the one thing a graph serving a shape space cannot
-        # freeze.
-        desc = [
-            k
-            for k, v in sig.items()
-            if isinstance(v, str) and (v == "nvTmaDesc" or v.startswith("tensordesc<"))
-        ]
-        if desc:
-            raise Unsupported(f"{kname}: TMA descriptor arguments {desc}")
-        # Two different orderings, and conflating them slides every argument
-        # after the first specialized one onto the wrong expression.
-        #
-        # `args` is the cubin's parameter list, which is what cuFuncGetParamInfo
-        # indexes: a constexpr is baked into the code and is not a parameter.
-        # `call_order` is what the wrapper actually passes to .run(), where a
-        # scalar that Inductor specialized to a constant is still present even
-        # though the signature now calls it constexpr -- only the autotuned block
-        # sizes drop out. Seen in the wild as
-        #     signature ... ks0:i64, xnumel:constexpr, r0_numel:i32 ...
-        #     .run(arg1_1, buf0, buf2, s77, 1, ..._r0_numel, stream=...)
-        # where reading r0_numel off the shorter list yields the literal 1.
-        args = [k for k, v in sig.items() if v != "constexpr"]
-        # A user-defined kernel's own constexpr (`BLOCK: tl.constexpr` in its
-        # signature, `declared_constexpr_names`) is dropped from the call
-        # site as an autotuned block size is; only a scalar Inductor itself
-        # specialized stays there.
-        names: Any = meta.get("declared_constexpr_names")
-        declared: OrderedSet[str] = OrderedSet(str(n) for n in (names or ()))
-        call_order = [
-            k
-            for k, v in sig.items()
-            if v != "constexpr"
-            or (k in constants and k not in _TUNED and k not in declared)
-        ]
-        # Only integer scalars are patched. Pointers live at fixed addresses in
-        # the graph's private pool; expanding their names would yield an
-        # empty_strided_cuda(...) expression that merely looks shape-dependent.
-        scalar = {
-            k: isinstance(sig.get(k), str) and not sig[k].startswith("*") for k in args
-        }
+        try:
+            obj = autotuners.get(gname)
+            if obj is None:
+                raise Unsupported(f"{gname}: .run() on something that is not a kernel")
+            meta = obj.inductor_meta or {}
+            kname = meta.get("kernel_name", gname)
+            sig = (obj.triton_meta or {}).get("signature", {})
+            constants = (obj.triton_meta or {}).get("constants", {}) or {}
+            # A TMA descriptor is neither a pointer nor a scalar. One signature
+            # entry becomes several cubin parameters (base pointer, global shape
+            # and strides, flags, block shape) or a CUtensorMap passed by value, so
+            # reading the signature position as a parameter index slides every
+            # argument after it onto another argument's bytes -- and
+            # cuFuncGetParamInfo answers for the shifted index just as happily.
+            # The descriptor also bakes in the address and the shape it was built
+            # for, which is the one thing a graph serving a shape space cannot
+            # freeze.
+            desc = [
+                k
+                for k, v in sig.items()
+                if isinstance(v, str)
+                and (v == "nvTmaDesc" or v.startswith("tensordesc<"))
+            ]
+            if desc:
+                raise Unsupported(f"{kname}: TMA descriptor arguments {desc}")
+            # Two different orderings, and conflating them slides every argument
+            # after the first specialized one onto the wrong expression.
+            #
+            # `args` is the cubin's parameter list, which is what cuFuncGetParamInfo
+            # indexes: a constexpr is baked into the code and is not a parameter.
+            # `call_order` is what the wrapper actually passes to .run(), where a
+            # scalar that Inductor specialized to a constant is still present even
+            # though the signature now calls it constexpr -- only the autotuned block
+            # sizes drop out. Seen in the wild as
+            #     signature ... ks0:i64, xnumel:constexpr, r0_numel:i32 ...
+            #     .run(arg1_1, buf0, buf2, s77, 1, ..._r0_numel, stream=...)
+            # where reading r0_numel off the shorter list yields the literal 1.
+            args = [k for k, v in sig.items() if v != "constexpr"]
+            # A user-defined kernel's own constexpr (`BLOCK: tl.constexpr` in its
+            # signature, `declared_constexpr_names`) is dropped from the call
+            # site as an autotuned block size is; only a scalar Inductor itself
+            # specialized stays there.
+            names: Any = meta.get("declared_constexpr_names")
+            declared: OrderedSet[str] = OrderedSet(str(n) for n in (names or ()))
+            call_order = [
+                k
+                for k, v in sig.items()
+                if v != "constexpr"
+                or (k in constants and k not in _TUNED and k not in declared)
+            ]
+            # Only integer scalars are patched. Pointers live at fixed addresses in
+            # the graph's private pool; expanding their names would yield an
+            # empty_strided_cuda(...) expression that merely looks shape-dependent.
+            scalar = {
+                k: isinstance(sig.get(k), str) and not sig[k].startswith("*")
+                for k in args
+            }
 
-        blocks = settled_blocks(obj)
+            blocks = settled_blocks(obj)
 
-        # Every compiled variant of this kernel: the autotuner launches the
-        # one it settled on, and the host patcher finds the node by function.
-        cands: list[int] = []
-        for cr in getattr(obj, "compile_results", []) or []:
-            k = getattr(cr, "kernel", None)
-            f = getattr(k, "function", None)
-            if f:
-                cands.append(int(f))
-            cands += [int(v) for v in (getattr(k, "functions", {}) or {}).values() if v]
-        cands = list(dict.fromkeys(cands))
-        func = cands[0] if cands else None
-        if not func:
-            raise Unsupported(f"{kname}: no cubin handle; not statically launched")
+            # Every compiled variant of this kernel: the autotuner launches the
+            # one it settled on, and the host patcher finds the node by function.
+            cands: list[int] = []
+            for cr in getattr(obj, "compile_results", []) or []:
+                k = getattr(cr, "kernel", None)
+                f = getattr(k, "function", None)
+                if f:
+                    cands.append(int(f))
+                cands += [
+                    int(v) for v in (getattr(k, "functions", {}) or {}).values() if v
+                ]
+            cands = list(dict.fromkeys(cands))
+            func = cands[0] if cands else None
+            if not func:
+                raise Unsupported(f"{kname}: no cubin handle; not statically launched")
 
-        # The grid can arrive as trailing positionals. FixedGrid passes
-        # _grid_0/1/2; PrecomputedGrid passes the size symbols its per-config
-        # formulas are written in. Neither is a kernel parameter, so they come
-        # off before the signature and the call site are lined up.
-        extra = list(meta.get("extra_launcher_args") or ())
-        n_grid = len(extra)
-        if len(call_order) != len(pos) - n_grid:
-            # Nothing here can say which positional is which, and reading them
-            # by a guessed offset is how a node ends up patched with another
-            # argument's value.
-            raise Unsupported(
-                f"{kname}: signature takes {len(call_order)} arguments, the call "
-                f"site passes {len(pos) - n_grid}: {call_order} vs {pos}"
+            # The grid can arrive as trailing positionals. FixedGrid passes
+            # _grid_0/1/2; PrecomputedGrid passes the size symbols its per-config
+            # formulas are written in. Neither is a kernel parameter, so they come
+            # off before the signature and the call site are lined up.
+            extra = list(meta.get("extra_launcher_args") or ())
+            n_grid = len(extra)
+            if len(call_order) != len(pos) - n_grid:
+                # Nothing here can say which positional is which, and reading them
+                # by a guessed offset is how a node ends up patched with another
+                # argument's value.
+                raise Unsupported(
+                    f"{kname}: signature takes {len(call_order)} arguments, the call "
+                    f"site passes {len(pos) - n_grid}: {call_order} vs {pos}"
+                )
+            at = {nm: call_order.index(nm) for nm in args if nm in call_order}
+            exprs = {
+                nm: _resolve(pos[at[nm]], source_code, symbols)
+                for nm in args
+                if scalar.get(nm) and nm in at
+            }
+            # Pointer arguments are recorded too, by the buffer name they carry. They
+            # are what the arena re-layout patches: which buffers share storage is
+            # fixed at compile time, but where each one sits is not, once the sizes
+            # are only known at replay.
+            ptrs = {
+                nm: pos[at[nm]].strip()
+                for nm in args
+                if not scalar.get(nm) and nm in at
+            }
+            # A scalar Inductor specialized to a constant is gone from the parameter
+            # list but still sits at the call site. It needs no patch -- it is baked
+            # into the cubin -- but a grid formula built on it still has to be able
+            # to read its value, or an otherwise ordinary kernel gets refused for
+            # having "no xnumel".
+            consts = {
+                nm: pos[i].strip()
+                for i, nm in enumerate(call_order)
+                if nm not in args and i < len(pos)
+            }
+            offsets = {
+                nm: _param_info(func, args.index(nm)) for nm in list(exprs) + list(ptrs)
+            }
+            bad = [nm for nm, v in offsets.items() if v is None]
+            if bad:
+                raise Unsupported(f"{kname}: no parameter offset for {bad}")
+
+            tail = [
+                _resolve(e, source_code, symbols)
+                for e in pos[len(call_order) : len(call_order) + n_grid]
+            ]
+            grid, pgrid = None, None
+            gt = meta.get("grid_type")
+            if gt == "FixedGrid":
+                grid = tail
+            elif gt == "PrecomputedGrid":
+                pgrids = meta.get("precomputed_grids")
+                if not pgrids:
+                    raise Unsupported(f"{kname}: a precomputed grid with no table")
+                # Which entry applies is the config the autotuner has not committed
+                # to yet, so only the table and what its symbols stand for are kept
+                # here; `build` resolves the grid after the warmup.
+                pgrid = (pgrids, dict(zip(extra, tail)))
+
+            kernels.append(
+                dict(
+                    gname=gname,
+                    name=kname,
+                    func=int(func),
+                    funcs=cands,
+                    exprs=exprs,
+                    consts=consts,
+                    ptrs=ptrs,
+                    offsets=offsets,
+                    blocks=blocks,
+                    grid=grid,
+                    pgrid=pgrid,
+                    # Which arguments the kernel writes, as Inductor recorded it.
+                    # A user-written kernel names its parameters whatever it likes,
+                    # so the `in_out_ptr` convention says nothing about it.
+                    mutated=tuple(meta.get("mutated_arg_names") or ()),
+                    grid_type=meta.get("grid_type"),
+                    # A combo (horizontally fused) kernel's grid is a formula over
+                    # its sub-kernels' numels; this is the meta that formula reads.
+                    combo=meta.get("combo_grid_meta"),
+                    # A split scan's decoupled look-back (atomic_cas, not add, so
+                    # Inductor's flag misses it) and any atomic add make the
+                    # result differ bit for bit between two runs of the same
+                    # kernel on the same input, so a region holding one is
+                    # checked with a tolerance, not for equality.
+                    atomic=bool(meta.get("atomic_add_found"))
+                    or meta.get("grid_type") == "SplitScanGrid",
+                    # `obj` is the autotuner; `k` above is one compiled variant.
+                    cooperative=bool(
+                        (obj.triton_meta or {}).get("launch_cooperative_grid")
+                    )
+                    or meta.get("grid_type") == "CooperativeReductionGrid",
+                    # A user-defined kernel (`user_autotune`) launched through
+                    # Triton's own launcher has no device handle, so only the
+                    # host path can patch it; through the static launcher (on for
+                    # them under DynaGraph) it is a kernel like any other.
+                    user=str(getattr(obj, "heuristic_type", "")).endswith(
+                        "USER_AUTOTUNE"
+                    )
+                    and not any(
+                        getattr(launcher, "_is_static", False)
+                        for launcher in getattr(obj, "launchers", None) or []
+                    ),
+                )
             )
-        at = {nm: call_order.index(nm) for nm in args if nm in call_order}
-        exprs = {
-            nm: _resolve(pos[at[nm]], source_code, symbols)
-            for nm in args
-            if scalar.get(nm) and nm in at
-        }
-        # Pointer arguments are recorded too, by the buffer name they carry. They
-        # are what the arena re-layout patches: which buffers share storage is
-        # fixed at compile time, but where each one sits is not, once the sizes
-        # are only known at replay.
-        ptrs = {
-            nm: pos[at[nm]].strip() for nm in args if not scalar.get(nm) and nm in at
-        }
-        # A scalar Inductor specialized to a constant is gone from the parameter
-        # list but still sits at the call site. It needs no patch -- it is baked
-        # into the cubin -- but a grid formula built on it still has to be able
-        # to read its value, or an otherwise ordinary kernel gets refused for
-        # having "no xnumel".
-        consts = {
-            nm: pos[i].strip()
-            for i, nm in enumerate(call_order)
-            if nm not in args and i < len(pos)
-        }
-        offsets = {
-            nm: _param_info(func, args.index(nm)) for nm in list(exprs) + list(ptrs)
-        }
-        bad = [nm for nm, v in offsets.items() if v is None]
-        if bad:
-            raise Unsupported(f"{kname}: no parameter offset for {bad}")
 
-        tail = [
-            _resolve(e, source_code, symbols)
-            for e in pos[len(call_order) : len(call_order) + n_grid]
-        ]
-        grid, pgrid = None, None
-        gt = meta.get("grid_type")
-        if gt == "FixedGrid":
-            grid = tail
-        elif gt == "PrecomputedGrid":
-            pgrids = meta.get("precomputed_grids")
-            if not pgrids:
-                raise Unsupported(f"{kname}: a precomputed grid with no table")
-            # Which entry applies is the config the autotuner has not committed
-            # to yet, so only the table and what its symbols stand for are kept
-            # here; `build` resolves the grid after the warmup.
-            pgrid = (pgrids, dict(zip(extra, tail)))
-
-        kernels.append(
-            dict(
-                gname=gname,
-                name=kname,
-                func=int(func),
-                funcs=cands,
-                exprs=exprs,
-                consts=consts,
-                ptrs=ptrs,
-                offsets=offsets,
-                blocks=blocks,
-                grid=grid,
-                pgrid=pgrid,
-                # Which arguments the kernel writes, as Inductor recorded it.
-                # A user-written kernel names its parameters whatever it likes,
-                # so the `in_out_ptr` convention says nothing about it.
-                mutated=tuple(meta.get("mutated_arg_names") or ()),
-                grid_type=meta.get("grid_type"),
-                # A combo (horizontally fused) kernel's grid is a formula over
-                # its sub-kernels' numels; this is the meta that formula reads.
-                combo=meta.get("combo_grid_meta"),
-                # A split scan's decoupled look-back (atomic_cas, not add, so
-                # Inductor's flag misses it) and any atomic add make the
-                # result differ bit for bit between two runs of the same
-                # kernel on the same input, so a region holding one is
-                # checked with a tolerance, not for equality.
-                atomic=bool(meta.get("atomic_add_found"))
-                or meta.get("grid_type") == "SplitScanGrid",
-                # `obj` is the autotuner; `k` above is one compiled variant.
-                cooperative=bool((obj.triton_meta or {}).get("launch_cooperative_grid"))
-                or meta.get("grid_type") == "CooperativeReductionGrid",
-                # A user-defined kernel (`user_autotune`) launched through
-                # Triton's own launcher has no device handle, so only the
-                # host path can patch it; through the static launcher (on for
-                # them under DynaGraph) it is a kernel like any other.
-                user=str(getattr(obj, "heuristic_type", "")).endswith("USER_AUTOTUNE")
-                and not any(
-                    getattr(launcher, "_is_static", False)
-                    for launcher in getattr(obj, "launchers", None) or []
-                ),
-            )
-        )
+        except Unsupported as exc:
+            # A kernel the table cannot read does not sink the region. Its
+            # launch becomes a site of its own: captured into a child graph and
+            # re-harvested per shape, which is what an opaque call such as a
+            # cuBLAS gemm already gets. Nothing about it is patched, so nothing
+            # about it can be patched wrong.
+            log.debug("DynaGraph opaque kernel %s: %s", gname, exc)
+            opaque.add(gname)
 
     # Already in launch order: the table is built by walking the call sites.
-    return kernels, sorted(symbols)
+    return kernels, sorted(symbols), opaque
 
 
 # --------------------------------------------------------------- codegen
@@ -2668,6 +2692,58 @@ _SITE_CALL = re.compile(
 # was captured they would wait on an event recorded inside a capture that has
 # ended, which is cudaErrorInvalidValue.
 _NOOP_OPS = OrderedSet(["ops:_c10d_functional.wait_tensor.default"])
+
+# A triton kernel launch. Only the kernels the table could not read become
+# sites of their own; the rest stay ordinary nodes of the one graph and are
+# patched in place.
+_TK_CALL = re.compile(r"(?<![\w.])(?P<tk>[A-Za-z_]\w*)\s*\.\s*run\s*\(")
+
+
+def _scan_line(code: str, opaque: Any = ()) -> list[tuple[int, str, str | None, str]]:
+    """(position, site name, buffer assigned, argument text) per site on a line.
+
+    One scanner for every pass that has to agree on what a site is and in what
+    order: the extern calls, and the launches of the kernels named in
+    `opaque`.
+    """
+    found = []
+    for m in _SITE_CALL.finditer(code):
+        if m.group("ek"):
+            name = m.group("ek")
+        elif m.group("ops"):
+            name = "ops:" + re.sub(r"\s+", "", m.group("ops"))
+        else:
+            name = "ops:aten." + re.sub(r"\s+", "", m.group("aten"))
+        found.append((m.start(), name, m.group("out"), code[m.end() :]))
+    for m in _TK_CALL.finditer(code):
+        if m.group("tk") in opaque:
+            found.append((m.start(), "tk:" + m.group("tk"), None, code[m.end() :]))
+    found.sort(key=lambda t: t[0])
+    return found
+
+
+def _on_current_stream(kw: Any) -> Any:
+    """A triton launch takes the stream to launch on as an argument, so it has
+    to be retargeted when a harvest moves to a stream of its own; an extern call
+    follows the current stream by itself and has no such argument."""
+    import torch
+
+    if "stream" not in kw:
+        return kw
+    return dict(kw, stream=torch.cuda.current_stream().cuda_stream)
+
+
+class _RunProxy:
+    """A triton kernel whose launch goes through the site wrapper."""
+
+    def __init__(self, real: Any, run: Any) -> None:
+        self._real = real
+        self.run = run
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+
 # Ops run on the host before every replay instead of being captured: their
 # value must differ per call, so a node replaying them would be wrong on the
 # second call. Random draws -- `aten.randint.low_out` is how Inductor seeds
@@ -2802,21 +2878,9 @@ def _declared_dep(site: str, argtext: str) -> tuple[str, Any] | None:
     return (qualname, tuple(named))
 
 
-def _site_deps(body: str, names: list[str]) -> list[tuple[str, Any] | None]:
-    """Per site, what it declared, or None when the operator declared nothing."""
-    out: list[tuple[str, Any] | None] = []
-    at = 0
-    for line in body.splitlines():
-        code = line.split("#", 1)[0]
-        for m in _SITE_CALL.finditer(code):
-            nm = names[at] if at < len(names) else ""
-            at += 1
-            out.append(_declared_dep(nm, code[m.end() :]))
-    out += [None] * (len(names) - len(out))
-    return out[: len(names)]
-
-
-def _site_calls(src: str, entry: str | None) -> list[tuple[str, str | None]]:
+def _site_calls(
+    src: str, entry: str | None, opaque: Any = ()
+) -> list[tuple[str, str | None]]:
     """(site name, buffer it assigns or None) per call in the entry, in order.
 
     `extern_kernels.mm` is named `mm`; `torch.ops._c10d_functional.all_reduce_
@@ -2831,24 +2895,19 @@ def _site_calls(src: str, entry: str | None) -> list[tuple[str, str | None]]:
         return []
     out = []
     for line in body.splitlines():
-        code = line.split("#", 1)[0]
-        for m in _SITE_CALL.finditer(code):
-            if m.group("ek"):
-                name = m.group("ek")
-            elif m.group("ops"):
-                name = "ops:" + re.sub(r"\s+", "", m.group("ops"))
-            else:
-                name = "ops:aten." + re.sub(r"\s+", "", m.group("aten"))
-            out.append((name, m.group("out")))
+        for _at, name, buf, _args in _scan_line(line.split("#", 1)[0], opaque):
+            out.append((name, buf))
     return out
 
 
-def extern_sites(src: str, entry: str | None = None) -> list[str]:
+def extern_sites(src: str, entry: str | None = None, opaque: Any = ()) -> list[str]:
     """Names of the extern call sites in the entry function, in order."""
-    return [name for name, _ in _site_calls(src, entry)]
+    return [name for name, _ in _site_calls(src, entry, opaque)]
 
 
-def extern_site_outputs(src: str, entry: str | None = None) -> list[str | None]:
+def extern_site_outputs(
+    src: str, entry: str | None = None, opaque: Any = ()
+) -> list[str | None]:
     """The wrapper buffer each site assigns its result to, or None.
 
     A call with `out=` writes into a buffer the wrapper allocated, which the
@@ -2856,7 +2915,7 @@ def extern_site_outputs(src: str, entry: str | None = None) -> list[str | None]:
     back storage of its own, and that buffer is wherever the harvested graph
     for the current shape put it.
     """
-    return [out for _, out in _site_calls(src, entry)]
+    return [out for _, out in _site_calls(src, entry, opaque)]
 
 
 def _resolve_op(path: str) -> Any:
@@ -3467,28 +3526,24 @@ _ADDITIVE_REDUCE = {
 }
 
 
-def _sites_in_order(body: str, conds: list[_Cond]) -> list[tuple[str, str | None]]:
-    """(site name, buffer it assigns or None) per site in the body, in
-    order: the extern calls as `_site_calls` names them, and per cond one
-    site per branch (`cond:<name>:<b>`) at the selector line."""
+def _sites_in_order(
+    body: str, conds: list[_Cond], opaque: Any = ()
+) -> list[tuple[str, str | None, str]]:
+    """(site name, buffer it assigns or None, argument text) per site in the
+    body, in order: the extern calls and the opaque kernel launches as
+    `_scan_line` names them, and per cond one site per branch
+    (`cond:<name>:<b>`) at the selector line."""
     by_line = {c.sel_line: c for c in conds}
-    out: list[tuple[str, str | None]] = []
+    out: list[tuple[str, str | None, str]] = []
     for ln, line in enumerate(body.splitlines()):
         c = by_line.get(ln)
         if c is not None:
             c.site0 = len(out)
             for b in range(len(c.branches)):
-                out.append((f"cond:{c.name}:{b}", None))
+                out.append((f"cond:{c.name}:{b}", None, ""))
             continue
-        code = line.split("#", 1)[0]
-        for m in _SITE_CALL.finditer(code):
-            if m.group("ek"):
-                name = m.group("ek")
-            elif m.group("ops"):
-                name = "ops:" + re.sub(r"\s+", "", m.group("ops"))
-            else:
-                name = "ops:aten." + re.sub(r"\s+", "", m.group("aten"))
-            out.append((name, m.group("out")))
+        for _at, name, buf, args in _scan_line(line.split("#", 1)[0], opaque):
+            out.append((name, buf, args))
     return out
 
 
@@ -3731,12 +3786,14 @@ class DynaGraphRunner:
             else:
                 self.alloc_body = folded
         try:
-            kernels, symbols = extract_kernel_table(
+            kernels, symbols, opaque = extract_kernel_table(
                 self.alloc_body, getattr(model, "__globals__", {})
             )
         except Unsupported as exc:
-            kernels, symbols = None, None
+            kernels, symbols, opaque = None, None, None
             self.parse_problem = f"unparsed: {exc}"
+        # Launched through a site of their own instead of patched in place.
+        self.opaque_kernels: OrderedSet[str] = opaque or OrderedSet()
         self.kernels: list[dict[str, Any]] = kernels or []
         self.symbols: list[str] = symbols or []
         self.exact = not any(k.get("atomic") for k in self.kernels)
@@ -3787,8 +3844,12 @@ class DynaGraphRunner:
         self.out_order: list[tuple[bool, Any]] = []
         # Buffers that are an extern call's own output, by site. The sites:
         # the extern calls, and one per torch.cond branch (`_sites_in_order`).
-        sites = _sites_in_order(body, self.dev.conds if self.dev is not None else [])
-        site_out = [o for _n, o in sites]
+        sites = _sites_in_order(
+            body,
+            self.dev.conds if self.dev is not None else [],
+            self.opaque_kernels,
+        )
+        site_out = [o for _n, o, _a in sites]
         # Site index -> (cond index, branch, number of branches) for the
         # branch sites; the first branch site owns the conditional node.
         self.cond_of: dict[int, tuple[int, int, int]] = {}
@@ -3837,11 +3898,11 @@ class DynaGraphRunner:
         self.sym_from_input = _input_symbol_map(body)
         # extern_kernels.* call sites, in order. Each becomes a child-graph
         # node; see `_harvest` and `_capture`.
-        self.extern_sites = [n for n, _o in sites]
+        self.extern_sites = [n for n, _o, _a in sites]
         # What each site's capture depends on beyond shapes and addresses,
         # as the operator declared it (`torch.utils._capture_deps`): named in
         # the wrapper, evaluated per call.
-        self.site_deps = _site_deps(body, self.extern_sites)
+        self.site_deps = [_declared_dep(n, a) for n, _o, a in sites]
         # The sites that own a child graph. A torch.cond branch is captured
         # into the conditional's body instead, so its nodes are patched per
         # shape like any other and a new shape needs no harvest of it.
@@ -4341,6 +4402,21 @@ class DynaGraphRunner:
             j = self.argv.get(_view_of(raw, self.alias, self.views)[0])
             if j is not None:
                 self.written_scan.add(j)
+        # An opaque kernel is not in the table, so nothing says which of its
+        # arguments it writes. Every input handed to one is treated as written:
+        # copying an input that was only read costs a copy, while missing one
+        # that was written hands the caller back a tensor the region changed
+        # under it.
+        for line in (self.body or "").splitlines():
+            code = line.split("#", 1)[0]
+            if any(
+                nm.startswith("tk:")
+                for _p, nm, _o, _a in _scan_line(code, self.opaque_kernels)
+            ):
+                for nm in re.findall(r"\b[A-Za-z_]\w*\b", code):
+                    j = self.argv.get(nm)
+                    if j is not None:
+                        self.written_scan.add(j)
         self.input_store: list[Any] = []
         self.static_inputs = []
         # Parallel to `inputs`, as `_tensors_data_ptrs_at_indices_equal` wants it.
@@ -4628,7 +4704,7 @@ class DynaGraphRunner:
         if self.extern_sites and self.body:
             for line in self.body.splitlines():
                 code = line.split("#", 1)[0]
-                if _SITE_CALL.search(code):
+                if _scan_line(code, self.opaque_kernels):
                     for nm in re.findall(r"\b[A-Za-z_]\w*\b", code):
                         if nm in self.argv:
                             out.add(self.argv[nm])
@@ -4967,6 +5043,7 @@ class DynaGraphRunner:
             self._alloc_cb = alloc
             self._real_alloc = old_alloc
         ops_calls = {}
+        tk_saved = {}
         try:
             for name in OrderedSet(self.extern_sites):
                 if name.startswith("cond:"):
@@ -4975,6 +5052,13 @@ class DynaGraphRunner:
                     continue
                 if name.startswith("ops:"):
                     ops_calls[name[4:]] = wrap(_resolve_op(name[4:]))
+                    continue
+                if name.startswith("tk:"):
+                    kernel = g.get(name[3:])
+                    if kernel is None:
+                        raise Unsupported(f"{name[3:]}: not in the wrapper globals")
+                    tk_saved[name[3:]] = kernel
+                    g[name[3:]] = _RunProxy(kernel, wrap(kernel.run))
                     continue
                 saved[name] = getattr(extern_kernels, name)
                 setattr(extern_kernels, name, wrap(saved[name]))
@@ -4986,6 +5070,8 @@ class DynaGraphRunner:
         finally:
             for name, fn in saved.items():
                 setattr(extern_kernels, name, fn)
+            for name, kernel in tk_saved.items():
+                g[name] = kernel
             if old_alloc is not None:
                 g["empty_strided_cuda"] = old_alloc
             if self.dev_model is not None:
@@ -5058,7 +5144,7 @@ class DynaGraphRunner:
                 # Run, not captured: replayed on the host before every
                 # launch with these very arguments (arena views and static
                 # inputs, whose addresses hold).
-                r = fn(*a, **kw)
+                r = fn(*a, **_on_current_stream(kw))
                 eager[i] = (fn, a, kw)
                 graphs.append(None)
                 results.append(kw.get("out", r))
@@ -5071,12 +5157,12 @@ class DynaGraphRunner:
                 # A cond branch is captured into the conditional's body at
                 # capture, not into a graph of its own, so there is nothing to
                 # harvest: run it where it is, to lay out its buffers.
-                r = fn(*a, **kw)
+                r = fn(*a, **_on_current_stream(kw))
                 graphs.append(None)
                 results.append(r)
                 return r
             with torch.cuda.stream(s):
-                r = fn(*a, **kw)
+                r = fn(*a, **_on_current_stream(kw))
             torch.cuda.current_stream().wait_stream(s)
             # The generator offset moves when the op is enqueued, not when it
             # runs, so no synchronize is needed to read it.
@@ -5108,7 +5194,7 @@ class DynaGraphRunner:
             with torch.cuda.stream(s):
                 g.capture_begin(pool=self.harvest_pool, capture_error_mode="global")
                 try:
-                    r = fn(*a, **kw)
+                    r = fn(*a, **_on_current_stream(kw))
                 finally:
                     g.capture_end()
             graphs.append(g)
