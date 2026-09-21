@@ -365,6 +365,22 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
         kname = meta.get("kernel_name", gname)
         sig = (obj.triton_meta or {}).get("signature", {})
         constants = (obj.triton_meta or {}).get("constants", {}) or {}
+        # A TMA descriptor is neither a pointer nor a scalar. One signature
+        # entry becomes several cubin parameters (base pointer, global shape
+        # and strides, flags, block shape) or a CUtensorMap passed by value, so
+        # reading the signature position as a parameter index slides every
+        # argument after it onto another argument's bytes -- and
+        # cuFuncGetParamInfo answers for the shifted index just as happily.
+        # The descriptor also bakes in the address and the shape it was built
+        # for, which is the one thing a graph serving a shape space cannot
+        # freeze.
+        desc = [
+            k
+            for k, v in sig.items()
+            if isinstance(v, str) and (v == "nvTmaDesc" or v.startswith("tensordesc<"))
+        ]
+        if desc:
+            raise Unsupported(f"{kname}: TMA descriptor arguments {desc}")
         # Two different orderings, and conflating them slides every argument
         # after the first specialized one onto the wrong expression.
         #
