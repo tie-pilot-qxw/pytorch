@@ -4058,15 +4058,19 @@ class TritonKernelVariable(VariableTracker):
         return dynamo_triton_hopifier_singleton.call_run(self, args, kwargs, tx)  # type: ignore[return-value]
 
     def specialize_symbolic(self, arg: Any) -> Any:
-        from .constant import ConstantVariable
-        from .tensor import SymNodeVariable
-
-        # See [Note: Specialize tl.constexpr args in user-defined triton kernels]
-        if isinstance(arg, SymNodeVariable):
-            return ConstantVariable.create(arg.evaluate_expr())
-        return arg
+        return specialize_symbolic_variable(arg)
 
     tp_methods = {"run": Method(run)}
+
+
+def specialize_symbolic_variable(arg: Any) -> Any:
+    from .constant import ConstantVariable
+    from .tensor import SymNodeVariable
+
+    # See [Note: Specialize tl.constexpr args in user-defined triton kernels]
+    if isinstance(arg, SymNodeVariable):
+        return ConstantVariable.create(arg.evaluate_expr())
+    return arg
 
 
 class TMADescriptorExperimentalVariable(VariableTracker):
@@ -4231,6 +4235,19 @@ class CreateTMADescriptorStableVariable(VariableTracker):
     ) -> VariableTracker:
         tensor = kwargs["tensor"] if "tensor" in kwargs else args[0]
         block_shape = kwargs["block_shape"] if "block_shape" in kwargs else args[1]
+
+        # The block shape is baked into the kernel's signature as
+        # tensordesc<dtype[block_shape]>, and triton parses it back out with
+        # int(), so a symbolic value here produces a signature that cannot be
+        # compiled. An int reaching this call carries no guard of its own when
+        # it came in as a dynamic scalar, which is how a plain `BLOCK = 32` in
+        # an enclosing scope ends up symbolic here while the same value passed
+        # as tl.constexpr is specialized.
+        # See [Note: Specialize tl.constexpr args in user-defined triton kernels]
+        if isinstance(block_shape, variables.BaseListVariable):
+            block_shape = variables.ListVariable(
+                [specialize_symbolic_variable(dim) for dim in block_shape.items]
+            )
 
         return TMADescriptorStableVariable(
             tensor=tensor,  # type: ignore[arg-type]
