@@ -487,6 +487,10 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
                 blocks=blocks,
                 grid=grid,
                 pgrid=pgrid,
+                # Which arguments the kernel writes, as Inductor recorded it.
+                # A user-written kernel names its parameters whatever it likes,
+                # so the `in_out_ptr` convention says nothing about it.
+                mutated=tuple(meta.get("mutated_arg_names") or ()),
                 grid_type=meta.get("grid_type"),
                 # A combo (horizontally fused) kernel's grid is a formula over
                 # its sub-kernels' numels; this is the meta that formula reads.
@@ -2745,6 +2749,57 @@ def _step_of(mode: str) -> int:
     return _Steps.step
 
 
+def _declared_dep(site: str, argtext: str) -> tuple[str, Any] | None:
+    """What this call declared its capture depends on, or None.
+
+    The operator registers the arguments that identify what it bakes in
+    (`torch.utils._capture_deps`); its schema says where those sit in the
+    call, and the generated call is straight-line, so the literal at that
+    position is what it named. Nothing here knows any operator.
+    """
+    from torch.utils import _capture_deps
+
+    if not site.startswith("ops:"):
+        return None
+    parts = site[4:].split(".")
+    if len(parts) < 2:
+        return None
+    qualname = f"{parts[0]}::{parts[1]}"
+    decl = _capture_deps.lookup(qualname)
+    if decl is None:
+        return None
+    arg_names, _resolve = decl
+    try:
+        op = _resolve_op(site[4:])
+        schema_args = [a.name for a in op._schema.arguments]
+    except Exception:
+        return None
+    pos = _split_args(argtext[: argtext.rindex(")")] if ")" in argtext else argtext)
+    named = []
+    for nm in arg_names:
+        if nm not in schema_args:
+            return None
+        at = schema_args.index(nm)
+        if at >= len(pos):
+            return None
+        named.append(pos[at].strip().strip("'\""))
+    return (qualname, tuple(named))
+
+
+def _site_deps(body: str, names: list[str]) -> list[tuple[str, Any] | None]:
+    """Per site, what it declared, or None when the operator declared nothing."""
+    out: list[tuple[str, Any] | None] = []
+    at = 0
+    for line in body.splitlines():
+        code = line.split("#", 1)[0]
+        for m in _SITE_CALL.finditer(code):
+            nm = names[at] if at < len(names) else ""
+            at += 1
+            out.append(_declared_dep(nm, code[m.end() :]))
+    out += [None] * (len(names) - len(out))
+    return out[: len(names)]
+
+
 def _site_calls(src: str, entry: str | None) -> list[tuple[str, str | None]]:
     """(site name, buffer it assigns or None) per call in the entry, in order.
 
@@ -3767,6 +3822,10 @@ class DynaGraphRunner:
         # extern_kernels.* call sites, in order. Each becomes a child-graph
         # node; see `_harvest` and `_capture`.
         self.extern_sites = [n for n, _o in sites]
+        # What each site's capture depends on beyond shapes and addresses,
+        # as the operator declared it (`torch.utils._capture_deps`): named in
+        # the wrapper, evaluated per call.
+        self.site_deps = _site_deps(body, self.extern_sites)
         # The sites that own a child graph. A torch.cond branch is captured
         # into the conditional's body instead, so its nodes are patched per
         # shape like any other and a new shape needs no harvest of it.
@@ -4256,7 +4315,9 @@ class DynaGraphRunner:
         self.written_scan: OrderedSet[int] = OrderedSet()
         for k in self.kernels:
             for nm, raw in (k.get("ptrs") or {}).items():
-                if nm.startswith(("in_out_ptr", "out_ptr")):
+                if nm.startswith(("in_out_ptr", "out_ptr")) or nm in k.get(
+                    "mutated", ()
+                ):
                     j = self.argv.get(_view_of(raw, self.alias, self.views)[0])
                     if j is not None:
                         self.written_scan.add(j)
@@ -4571,7 +4632,36 @@ class DynaGraphRunner:
         reads (the copy held here, or the tensor itself when static). A call
         that sees the same finds its harvest under this; one that does not
         harvests again, and the old entry stays for the call that recurs."""
-        return (key, self.lane, tuple(self.in_ptrs[j] or 0 for j in self.extern_read))
+        return (
+            key,
+            self.lane,
+            tuple(self.in_ptrs[j] or 0 for j in self.extern_read),
+            self._deps_key(),
+        )
+
+    def _deps_key(self) -> Any:
+        """What this region's sites depend on right now, beyond the shapes and
+        addresses the rest of the key covers.
+
+        A captured child graph can bake in something the wrapper only names:
+        a collective bakes the communicator its group name stood for at
+        capture. The name never changes, so nothing else in the key moves when
+        an elastic run rebuilds that group at another width, and the old
+        capture would be replayed against the old communicator without an
+        error. Evaluating the named thing per call makes that a new harvest,
+        and the existing child swap carries the new one in.
+        """
+        if not any(self.site_deps):
+            return ()
+        from torch.utils import _capture_deps
+
+        out = []
+        for qualname, named in [d for d in self.site_deps if d is not None]:
+            decl = _capture_deps.lookup(qualname)
+            if decl is None:
+                continue
+            out.append((qualname, named, decl[1](*named)))
+        return tuple(out)
 
     def _invalidate_harvests(self, lane: int | None = None) -> None:
         """Forget the harvested extern graphs of one lane, or all: the
