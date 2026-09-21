@@ -17,6 +17,7 @@ import time
 import traceback
 import types
 import warnings
+import weakref
 from collections.abc import Callable, Sequence
 from datetime import timedelta
 from typing import (
@@ -8185,3 +8186,64 @@ def _new_window(
     """
     pg = group or _get_default_group()
     return pg.new_window(tensor)
+
+
+# A serial per live process group. An address is not an identity here: once a
+# group is freed another can land where it was, and a group rebuilt at the same
+# size and the same address is exactly the case this has to tell apart. A weak
+# key gives the new group a new serial precisely when the old one is gone.
+_capture_group_serials: "weakref.WeakKeyDictionary[ProcessGroup, int]" = (
+    weakref.WeakKeyDictionary()
+)
+_capture_group_count = itertools.count()
+
+
+def _capture_identity_of_group(group_name: object) -> object:
+    """What a collective's group name stands for right now.
+
+    A collective captured into a CUDA graph bakes the communicator into the
+    captured kernel's own arguments, so a replay keeps doing the collective
+    the communicator was built for. The name in the captured source does not
+    move when an elastic run rebuilds the group at another size, which is why
+    this has to be evaluated rather than read.
+    """
+    try:
+        pg = (
+            _resolve_process_group(cast("GroupName", group_name))
+            if isinstance(group_name, str)
+            else cast("ProcessGroup", group_name)
+        )
+        serial = _capture_group_serials.get(pg)
+        if serial is None:
+            serial = next(_capture_group_count)
+            _capture_group_serials[pg] = serial
+        return (pg.size(), serial)
+    except Exception:
+        return None
+
+
+def _declare_capture_deps() -> None:
+    """Tell a graph-capturing consumer what our collectives bake in.
+
+    Here rather than in `_functional_collectives`, which `torch.distributed`
+    does not import, and next to `_resolve_process_group`, which is what the
+    declaration is about.
+    """
+    from torch.utils import _capture_deps
+
+    for op in (
+        "all_reduce",
+        "all_reduce_",
+        "all_gather_into_tensor",
+        "all_gather_into_tensor_out",
+        "reduce_scatter_tensor",
+        "all_to_all_single",
+        "broadcast",
+        "broadcast_",
+    ):
+        _capture_deps.register(
+            f"_c10d_functional::{op}", ("group_name",), _capture_identity_of_group
+        )
+
+
+_declare_capture_deps()
