@@ -3054,6 +3054,7 @@ class StaticTritonCompileResult(CompileResult[_T]):
             if (
                 heuristic_type == HeuristicType.USER_AUTOTUNE
                 and not torch._inductor.config.static_launch_user_defined_triton_kernels
+                and not inductor_meta.get("static_launch")
             ):
                 # Don't support user defined triton kernels yet
                 raise CannotStaticallyLaunchKernel("User defined triton kernel")

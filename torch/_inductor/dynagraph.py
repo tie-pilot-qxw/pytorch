@@ -447,10 +447,15 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
                 # `obj` is the autotuner; `k` above is one compiled variant.
                 cooperative=bool((obj.triton_meta or {}).get("launch_cooperative_grid"))
                 or meta.get("grid_type") == "CooperativeReductionGrid",
-                # A user-defined kernel (`user_autotune`) is launched through
-                # Triton's own launcher, so its node has no device handle and
-                # only the host path can patch it.
-                user=str(getattr(obj, "heuristic_type", "")).endswith("USER_AUTOTUNE"),
+                # A user-defined kernel (`user_autotune`) launched through
+                # Triton's own launcher has no device handle, so only the
+                # host path can patch it; through the static launcher (on for
+                # them under DynaGraph) it is a kernel like any other.
+                user=str(getattr(obj, "heuristic_type", "")).endswith("USER_AUTOTUNE")
+                and not any(
+                    getattr(launcher, "_is_static", False)
+                    for launcher in getattr(obj, "launchers", None) or []
+                ),
             )
         )
 
