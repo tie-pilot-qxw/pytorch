@@ -5410,6 +5410,57 @@ class CustomOpTests(torch._inductor.test_case.TestCase):
 
     @requires_cuda_tma
     @requires_gpu
+    def test_host_tma_descriptor_dynamic_block_shape(self):
+        # A block shape read from an enclosing scope is an unspecialized int
+        # under dynamic=True, so it reaches TensorDescriptor.from_tensor as a
+        # symbol. It is baked into the kernel's signature as
+        # tensordesc<dtype[block_shape]> and triton parses it back out with
+        # int(), so it has to be specialized the way the same value is when it
+        # is passed as tl.constexpr.
+        if not has_triton_tensor_descriptor_host_tma():
+            self.skipTest("requires triton.tools.tensor_descriptor TMA support")
+
+        from triton.tools.tensor_descriptor import TensorDescriptor
+
+        from torch._inductor.utils import run_and_get_code
+
+        def make_fn():
+            BLOCK_SIZE_X, BLOCK_SIZE_Y = 16, 32
+
+            def fn(x, y):
+                out = torch.zeros_like(x)
+                descs = [
+                    TensorDescriptor.from_tensor(t, [BLOCK_SIZE_X, BLOCK_SIZE_Y])
+                    for t in (x, y, out)
+                ]
+                add_kernel_with_tma_2d_new_api[
+                    (
+                        triton.cdiv(x.size(0), BLOCK_SIZE_X),
+                        triton.cdiv(x.size(1), BLOCK_SIZE_Y),
+                    )
+                ](
+                    *descs,
+                    BLOCK_SIZE_X=BLOCK_SIZE_X,
+                    BLOCK_SIZE_Y=BLOCK_SIZE_Y,
+                )
+                return out
+
+            return fn
+
+        compiled = torch.compile(make_fn(), fullgraph=True, dynamic=True)
+
+        x = torch.randn((32, 32), device=GPU_TYPE)
+        y = torch.randn((32, 32), device=GPU_TYPE)
+        out, codes = run_and_get_code(compiled, x, y)
+        self.assertIn("tensordesc<fp32[16, 32]>", codes[0])
+        self.assertEqual(out, x + y)
+
+        x2 = torch.randn((64, 32), device=GPU_TYPE)
+        y2 = torch.randn((64, 32), device=GPU_TYPE)
+        self.assertEqual(compiled(x2, y2), x2 + y2)
+
+    @requires_cuda_tma
+    @requires_gpu
     @common_utils.parametrize("backend", ["inductor", "aoti"])
     def test_host_tma_descriptor_wide_block_interleaved_args(self, backend):
         # A descriptor whose innermost block spans more than 128 bytes

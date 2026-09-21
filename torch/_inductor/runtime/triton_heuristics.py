@@ -2661,6 +2661,13 @@ class CachingAutotuner(KernelInterface):
                 return None
             if getattr(kernel, "global_scratch_size", 0):
                 return None
+            # The host_tma_descriptor_args check above only covers descriptors
+            # Inductor built itself. A user-defined kernel that takes a
+            # TensorDescriptor puts one in the signature without that meta key,
+            # and its arg_tys are already expanded, so the vectorcall would be
+            # handed one argument per descriptor and report a count mismatch.
+            if getattr(kernel, "_has_tensordesc", False):
+                return None
             cu_function = kernel.function
             num_warps = kernel.num_warps
             shared = kernel.shared
