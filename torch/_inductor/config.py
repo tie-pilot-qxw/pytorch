@@ -2218,6 +2218,16 @@ class triton:
         "TORCHINDUCTOR_DYNAGRAPH_TOPOLOGY", "host"
     )
 
+    # Whether a kernel taking a host-built TMA descriptor is patched like any
+    # other kernel (the descriptor is rebuilt per shape from the producer's
+    # declaration, `torch.utils._capture_tma`) instead of becoming an opaque
+    # site captured into its own child graph. Host update path only: rebuilding
+    # a descriptor needs the host, so a region that must patch on the device
+    # keeps the opaque site.
+    dynagraph_tma_patch: bool = (
+        os.environ.get("TORCHINDUCTOR_DYNAGRAPH_TMA_PATCH", "0") == "1"
+    )
+
     # Who patches a region's graph for a new shape. "device": a planner kernel
     # inside the graph (device graph update API; no host work, but on the
     # GPU's critical path). "host": generated C++ on the host before the

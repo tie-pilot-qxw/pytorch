@@ -338,7 +338,43 @@ def precomputed_grid(k: dict[str, Any], obj: Any) -> list[str] | None:
     ]
 
 
-def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
+_DESC_RANK = re.compile(r"tensordesc<([^\[>]*)\[([^\]]*)\]")
+
+
+def _desc_rank(sig_type: str) -> int:
+    """How many dimensions a `tensordesc<dtype[d0, d1]>` entry describes."""
+    m = _DESC_RANK.match(sig_type)
+    if m is None:
+        raise Unsupported(f"cannot read the rank of {sig_type}")
+    return m.group(2).count(",") + 1
+
+
+def _desc_width(sig_type: str, has_meta: bool) -> int:
+    """Cubin parameters one descriptor signature entry becomes.
+
+    Triton lowers a descriptor either to a CUtensorMap passed by value or,
+    before Hopper, to a base pointer with the shape and strides beside it;
+    both are then followed by the block shape and the strides again. The rule
+    is `StaticallyLaunchedTritonKernel._expand_tensordesc_type`. Counting a run
+    of integer parameter types in the expanded string instead would swallow an
+    ordinary integer argument that happens to follow a descriptor.
+    """
+    n = _desc_rank(sig_type)
+    return 1 + 2 * n if has_meta else 3 + 4 * n
+
+
+def _tensordesc_meta(obj: Any) -> Any:
+    """Triton's per-descriptor metadata for a compiled kernel, or ()."""
+    for cr in getattr(obj, "compile_results", []) or []:
+        meta = getattr(getattr(cr, "kernel", None), "tensordesc_meta", None)
+        if meta is not None:
+            return meta
+    return ()
+
+
+def extract_kernel_table(
+    source_code: str, call_globals: dict[str, Any], allow_desc: bool = False
+) -> Any:
     """Return (kernels, symbols) for the kernels this wrapper actually launches.
 
     ``call_globals`` is the wrapper module's namespace. Its CachingAutotuner
@@ -347,6 +383,10 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
 
     Returns the table, the size symbols it is written in, and the names of the
     kernels that could not be read at all, which become opaque sites.
+
+    `allow_desc` lets a kernel taking a host-built TMA descriptor into the
+    table, which only the host update path can then serve; without it such a
+    kernel is opaque.
 
     Raises ``Unsupported`` only when the wrapper itself cannot be read, rather
     than returning an empty table that reads as a region with nothing to serve.
@@ -379,14 +419,37 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
             # The descriptor also bakes in the address and the shape it was built
             # for, which is the one thing a graph serving a shape space cannot
             # freeze.
-            desc = [
+            # A TMA descriptor is neither a pointer nor a scalar, and one
+            # signature entry becomes several cubin parameters, so a signature
+            # position is not a parameter index. What a descriptor was built
+            # from is the producer's to declare (`torch.utils._capture_tma`);
+            # undeclared, the launch stays opaque, the way cuBLAS is.
+            from torch.utils import _capture_tma
+
+            stable = [
                 k
                 for k, v in sig.items()
-                if isinstance(v, str)
-                and (v == "nvTmaDesc" or v.startswith("tensordesc<"))
+                if isinstance(v, str) and v.startswith("tensordesc<")
             ]
-            if desc:
-                raise Unsupported(f"{kname}: TMA descriptor arguments {desc}")
+            old_api = [k for k, v in sig.items() if v == "nvTmaDesc"]
+            if old_api:
+                raise Unsupported(f"{kname}: experimental TMA descriptors {old_api}")
+            if stable and not allow_desc:
+                raise Unsupported(f"{kname}: TMA descriptor arguments {stable}")
+            tma_decl = {d.param: d for d in (_capture_tma.lookup(gname) or ())}
+            undeclared = [nm for nm in stable if nm not in tma_decl]
+            if undeclared:
+                raise Unsupported(f"{kname}: undeclared TMA descriptors {undeclared}")
+            tmeta = _tensordesc_meta(obj)
+            # Per descriptor: triton's metadata for it, or None when this
+            # kernel was lowered without a CUtensorMap at all (the pre-Hopper
+            # decomposition into a base pointer plus shape and strides). There
+            # is no 128-byte map to rebuild in that case, so it is refused
+            # below rather than patched as if there were.
+            desc_meta = {
+                nm: (tmeta[j] if bool(tmeta) and j < len(tmeta) else None)
+                for j, nm in enumerate(stable)
+            }
             # Two different orderings, and conflating them slides every argument
             # after the first specialized one onto the wrong expression.
             #
@@ -415,9 +478,22 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
             # Only integer scalars are patched. Pointers live at fixed addresses in
             # the graph's private pool; expanding their names would yield an
             # empty_strided_cuda(...) expression that merely looks shape-dependent.
+            # Cubin parameter index per signature entry: one each, except a
+            # descriptor, which expands.
+            cub_at: dict[str, int] = {}
+            n_cub = 0
+            for nm in args:
+                if nm in tma_decl:
+                    w = _desc_width(sig[nm], desc_meta[nm] is not None)
+                else:
+                    w = 1
+                cub_at[nm] = n_cub
+                n_cub += w
+            # A descriptor is patched as a descriptor, not as one of these.
+            plain = [k for k in args if k not in tma_decl]
             scalar = {
                 k: isinstance(sig.get(k), str) and not sig[k].startswith("*")
-                for k in args
+                for k in plain
             }
 
             blocks = settled_blocks(obj)
@@ -455,7 +531,7 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
             at = {nm: call_order.index(nm) for nm in args if nm in call_order}
             exprs = {
                 nm: _resolve(pos[at[nm]], source_code, symbols)
-                for nm in args
+                for nm in plain
                 if scalar.get(nm) and nm in at
             }
             # Pointer arguments are recorded too, by the buffer name they carry. They
@@ -464,7 +540,7 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
             # are only known at replay.
             ptrs = {
                 nm: pos[at[nm]].strip()
-                for nm in args
+                for nm in plain
                 if not scalar.get(nm) and nm in at
             }
             # A scalar Inductor specialized to a constant is gone from the parameter
@@ -478,11 +554,48 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
                 if nm not in args and i < len(pos)
             }
             offsets = {
-                nm: _param_info(func, args.index(nm)) for nm in list(exprs) + list(ptrs)
+                nm: _param_info(func, cub_at[nm]) for nm in list(exprs) + list(ptrs)
             }
             bad = [nm for nm, v in offsets.items() if v is None]
             if bad:
                 raise Unsupported(f"{kname}: no parameter offset for {bad}")
+            # Per descriptor: where its CUtensorMap sits, where the block shape
+            # and strides that follow it sit, and what it was built from.
+            descs = []
+            for nm in stable:
+                d = tma_decl[nm]
+                if desc_meta[nm] is None:
+                    raise Unsupported(
+                        f"{kname}: descriptor {nm} is lowered without a "
+                        "CUtensorMap, so there is no descriptor to patch"
+                    )
+                rank = _desc_rank(sig[nm])
+                first = cub_at[nm]
+                where = []
+                for j in range(1 + 2 * rank):
+                    info = _param_info(func, first + j)
+                    if info is None:
+                        raise Unsupported(f"{kname}: no parameter offset for {nm}")
+                    where.append(info)
+                for _off, size in where[1:]:
+                    if size not in (4, 8):
+                        # The shape beside the map is int32 and the strides
+                        # int64; anything else means the run was read wrong.
+                        raise Unsupported(
+                            f"{kname}: descriptor {nm} is followed by a "
+                            f"{size}-byte parameter"
+                        )
+                descs.append(
+                    dict(
+                        param=nm,
+                        source=d.source,
+                        block=tuple(int(b) for b in d.block_shape),
+                        meta=desc_meta[nm],
+                        rank=rank,
+                        map_off=where[0],
+                        tail_off=where[1:],
+                    )
+                )
 
             tail = [
                 _resolve(e, source_code, symbols)
@@ -518,6 +631,9 @@ def extract_kernel_table(source_code: str, call_globals: dict[str, Any]) -> Any:
                     # A user-written kernel names its parameters whatever it likes,
                     # so the `in_out_ptr` convention says nothing about it.
                     mutated=tuple(meta.get("mutated_arg_names") or ()),
+                    # Host-built TMA descriptors this kernel takes, as the producer
+                    # declared them; empty for every other kernel.
+                    descs=descs,
                     grid_type=meta.get("grid_type"),
                     # A combo (horizontally fused) kernel's grid is a formula over
                     # its sub-kernels' numels; this is the meta that formula reads.
@@ -1601,7 +1717,8 @@ extern "C" void dg_free(void* h) { delete (Exec*)h; }
 // end -- the whole step is this one call.
 extern "C" int dg_step(void* h, const int64_t* syms, int ptr_dirty, char* arena,
                        const char* const* ext, const CUgraph* child,
-                       const char* const* in, void* stream, int launch) {
+                       const char* const* in, const char* const* desc,
+                       void* stream, int launch) {
   Exec* e = (Exec*)h;
   CUresult rc;
   int64_t slot_off[NSLOT + 1];
@@ -1626,7 +1743,7 @@ extern "C" int dg_step(void* h, const int64_t* syms, int ptr_dirty, char* arena,
     ext_changed[s] = ext != nullptr && ext[s] != e->ext[s];
     if (ext_changed[s]) e->ext[s] = ext[s];
   }
-  (void)ext_changed; (void)arena; (void)slot_off; (void)syms;
+  (void)ext_changed; (void)arena; (void)slot_off; (void)syms; (void)desc;
   int64_t gx, gy, gz;
   bool touched, zero;
   Node* nd;
@@ -1695,6 +1812,7 @@ def generate_host_patcher(
     argv = argv or {}
     patch_inputs = OrderedSet(patch_inputs)
     blocks_of: list[str] = []
+    n_desc = 0
     for i, k in enumerate(kernels):
         lines = [
             f"  // ---- node {i}: {k['name']}",
@@ -1789,6 +1907,32 @@ def generate_host_patcher(
                 f"  {{ {ct} v = ({ct})({_expr_to_c(e, sym_index)}); {ct}* at = ({ct}*)(nd->buf.data() + {off});"
                 f" if (*at != v) {{ *at = v; touched = true; }} }}  // {nm} = {e}"
             )
+        for d in k.get("descs") or ():
+            # The descriptor is 128 opaque bytes rebuilt on the host for this
+            # shape (`_desc_blobs`), followed by the global shape as int32 and
+            # the strides as int64, which the same rebuild produced. Comparing
+            # the bytes keeps `touched` honest, so a shape that did not move
+            # the descriptor still costs no driver call.
+            map_off, map_sz = d["map_off"]
+            if map_sz != 128:
+                raise Unsupported(
+                    f"{k['name']} descriptor {d['param']} is {map_sz} bytes"
+                )
+            lines.append(
+                f"  {{ const char* dd = desc ? desc[{n_desc}] : nullptr;"
+                f" if (dd) {{"
+                f" if (memcmp(nd->buf.data() + {map_off}, dd, 128) != 0) {{"
+                f" memcpy(nd->buf.data() + {map_off}, dd, 128); touched = true; }}"
+            )
+            for j, (off, size) in enumerate(d["tail_off"]):
+                ct = "int32_t" if size == 4 else "int64_t"
+                lines.append(
+                    f"    {{ {ct} v = ({ct})(((const int64_t*)(dd + 128))[{j}]);"
+                    f" {ct}* at = ({ct}*)(nd->buf.data() + {off});"
+                    f" if (*at != v) {{ *at = v; touched = true; }} }}"
+                )
+            lines.append(f"  }} }}  // {d['param']} from {d['source']}")
+            n_desc += 1
         for nm, raw in (k.get("ptrs") or {}).items():
             buf, voff = _view_of(raw, alias, views or {})
             off, size = k["offsets"][nm]
@@ -1950,6 +2094,7 @@ def _compile_host(src: str) -> Any:
         ctypes.c_void_p,  # extern slot addresses
         ctypes.c_void_p,  # child graphs
         ctypes.c_void_p,  # input addresses
+        ctypes.c_void_p,  # TMA descriptor blobs
         ctypes.c_void_p,  # stream
         ctypes.c_int,  # launch
     ]
@@ -3097,6 +3242,41 @@ def _view_of(raw: str, alias: dict[str, str], views: dict[str, Any]) -> tuple[st
     return alias.get(raw, raw), (v[2] if v is not None else "0")
 
 
+def _desc_view_geometry(
+    raw: str, views: dict[str, tuple[list[str], list[str], str]]
+) -> tuple[list[str], list[str]] | None:
+    """`raw`'s own sizes and strides when it is a view, else None.
+
+    `_view_of` gives the storage and the offset into it; this is the other
+    half, the geometry the view is returned with. Written either as a name
+    assigned earlier or inline at the call site.
+    """
+    raw = raw.strip()
+    m = re.match(r"reinterpret_tensor\((.*)\)\s*$", raw, re.DOTALL)
+    if m:
+        args = [a.strip() for a in _split_args(m.group(1))]
+        if len(args) < 3 or not (args[1].startswith("(") and args[2].startswith("(")):
+            return None
+        return (
+            [a.strip() for a in _split_args(args[1][1:-1]) if a.strip()],
+            [a.strip() for a in _split_args(args[2][1:-1]) if a.strip()],
+        )
+    v = views.get(raw)
+    return (v[0], v[1]) if v is not None else None
+
+
+def _eval_ints(exprs: Sequence[str], env: dict[str, int]) -> list[int] | None:
+    """Every expression as an int, or None if any one of them is not
+    arithmetic over the symbols."""
+    out = []
+    for e in exprs:
+        v = _eval_int(e, env)
+        if v is None:
+            return None
+        out.append(v)
+    return out
+
+
 def _off_is_zero(off: str) -> bool:
     return _eval_int(off, {}) == 0
 
@@ -3807,9 +3987,14 @@ class DynaGraphRunner:
                 self.dev.problem = "cond-branch: a branch subgraph could not be read"
             else:
                 self.alloc_body = folded
+        from torch._inductor import config as _cfg
+
         try:
+            # A descriptor is rebuilt on the host, so a region that has to
+            # patch on the device keeps the opaque site instead.
+            allow_desc = _cfg.triton.dynagraph_tma_patch and self.dev is None
             kernels, symbols, opaque = extract_kernel_table(
-                self.alloc_body, getattr(model, "__globals__", {})
+                self.alloc_body, getattr(model, "__globals__", {}), allow_desc
             )
         except Unsupported as exc:
             kernels, symbols, opaque = None, None, None
@@ -3983,6 +4168,9 @@ class DynaGraphRunner:
         # Host path: per shape, the ctypes arrays `dg_step` takes; and the
         # per-call addresses of the inputs read in place (0 elsewhere).
         self.host_args: dict[Any, Any] = {}
+        # Per harvest key, the rebuilt TMA descriptors and what keeps them alive.
+        self.desc_blobs: dict[Any, Any] = {}
+        self.n_desc = sum(len(k.get("descs") or ()) for k in self.kernels)
         self.in_ptrs = (ctypes.c_void_p * max(len(self.argv), 1))()
         # Per shape: the output tensors that do not depend on the call.
         # key -> (the outputs fixed per shape, the input-view outputs' geometry)
@@ -4559,6 +4747,18 @@ class DynaGraphRunner:
                 self.update,
             )
             self.update = "device"
+        if self.n_desc and self.update != "host":
+            # A TMA descriptor is rebuilt by the producer's encoder, which runs
+            # on the host. The device planner reads the same kernel table and
+            # would leave the descriptor at the shape it was captured for, so
+            # the choice is the host path or nothing. `allow_desc` already kept
+            # descriptors out of the table when the device path was forced, so
+            # reaching here with one means the choice was free.
+            log.info(
+                "DynaGraph update %s -> host: the region has a TMA descriptor",
+                self.update,
+            )
+            self.update = "host"
         # Item sizes of everything a view can be taken of, for the pointer
         # patches of offset views.
         self.itemsize_of = {
@@ -5037,6 +5237,126 @@ class DynaGraphRunner:
             flat = self.arena[base : base + n * itemsize].view(dtype)
             views.append(flat.as_strided(rest[: len(sizes_e)], rest[len(sizes_e) :]))
         return views
+
+    def _desc_sources(self, env: dict[str, int], inputs: list[Any]) -> Any:
+        """The tensor behind every declared TMA descriptor, in patcher order.
+
+        The producer named a source per descriptor
+        (`torch.utils._capture_tma`); this resolves that name against what the
+        graph will actually read on this call. An arena buffer is its view at
+        this shape, whose address is frozen for the region. An argument is
+        taken at the address the nodes were patched with (`in_ptrs`): its own
+        when it is read in place, the copy held here when it was copied in --
+        and with this call's geometry, not the one the region was built at.
+
+        `None` refuses the region rather than describing a tensor that is not
+        where the descriptor would say it is.
+        """
+        import torch
+
+        views = self._arena_views(env)
+        if views is None:
+            log.debug("DynaGraph descriptor sources: no arena views at %s", env)
+            return None
+        by_name = dict(zip(self.alloc_order, views))
+        srcs = []
+        for k in self.kernels:
+            for d in k.get("descs") or ():
+                src = d["source"]
+                # As written at the call site, which is not always the name
+                # the arena knows: `bufB = bufA  # reuse` is a rename, and a
+                # `reinterpret_tensor` is a geometry of its own over someone
+                # else's storage.
+                owner, off = _view_of(src, self.alias, self.views)
+                t = by_name.get(owner)
+                if t is None:
+                    j = self.argv.get(owner)
+                    if j is None or j >= len(inputs):
+                        log.debug(
+                            "DynaGraph descriptor source %s (owner %s) is neither "
+                            "a buffer here (%s) nor an argument (%s)",
+                            src,
+                            owner,
+                            sorted(by_name),
+                            sorted(self.argv),
+                        )
+                        return None
+                    x = inputs[j]
+                    if not isinstance(x, torch.Tensor):
+                        return None
+                    store = self.input_store[j] if j < len(self.input_store) else None
+                    t = (
+                        x
+                        if store is None or j in self.inplace
+                        else _store_view(store, x)
+                    )
+                    if t.data_ptr() != (self.in_ptrs[j] or 0):
+                        # An unaligned in-place argument took the copy after
+                        # all, so the caller's tensor is not what runs.
+                        return None
+                if not isinstance(t, torch.Tensor):
+                    return None
+                view = _desc_view_geometry(src, self.views)
+                if view is not None or not _off_is_zero(off):
+                    if view is None:
+                        # An offset with no geometry to put on it.
+                        return None
+                    sizes = _eval_ints(view[0], env)
+                    strides = _eval_ints(view[1], env)
+                    base = _eval_int(off, env)
+                    if sizes is None or strides is None or base is None:
+                        return None
+                    t = t.as_strided(sizes, strides, t.storage_offset() + base)
+                srcs.append(t)
+        return srcs
+
+    def _desc_blobs(self, srcs: list[Any]) -> Any:
+        """Every declared TMA descriptor, encoded for the tensors it describes.
+
+        Triton owns the encoding, so nothing here knows a swizzle from an
+        element type: each source tensor is handed to triton's own
+        `make_tensordesc_arg`, and what comes back is the 128-byte map
+        followed by the global shape and strides the kernel is passed beside
+        it. Those go into one blob per descriptor, in the order the generated
+        patcher indexes them.
+
+        Cached by the caller on what the blobs are a function of -- each
+        source's address and geometry -- so this runs when one of those moves
+        and not once a replay. `None` means a descriptor could not be built,
+        which refuses the region rather than replaying a stale one.
+        """
+        import ctypes as ct
+
+        try:
+            from triton.backends.nvidia import driver as tdrv
+            from triton.tools.tensor_descriptor import TensorDescriptor
+        except Exception:
+            return None
+        out, keep = [], []
+        i = -1
+        for k in self.kernels:
+            for d in k.get("descs") or ():
+                i += 1
+                t = srcs[i]
+                try:
+                    desc = TensorDescriptor(
+                        t, list(t.shape), list(t.stride()), list(d["block"])
+                    )
+                    expanded = tdrv.make_tensordesc_arg(desc, d["meta"], None)
+                except Exception:
+                    return None
+                m = expanded[0]
+                at = id(m) + type(m).__basicsize__ - 128
+                raw = bytes((ct.c_char * 128).from_address(at))
+                tail = b"".join(
+                    int(v).to_bytes(8, "little", signed=True) for v in expanded[1:]
+                )
+                buf = ct.create_string_buffer(raw + tail, len(raw) + len(tail))
+                keep.append((buf, m, t))
+                out.append(ct.cast(buf, ct.c_void_p))
+        # `keep` rides along: the blobs and the PyCUtensorMap objects they
+        # were read out of have to outlive every replay that uses them.
+        return ((ct.c_void_p * max(len(out), 1))(*out), keep)
 
     def _run_intercepted(self, args: list[Any], views: Any, on_extern: Any) -> Any:
         """Run the wrapper once with its allocations and extern calls redirected.
@@ -5588,7 +5908,9 @@ class DynaGraphRunner:
             )
         return plan, offsets[-1], offsets
 
-    def _host_step(self, env: dict[str, int], hkey: Any, stream: int) -> bool:
+    def _host_step(
+        self, env: dict[str, int], hkey: Any, stream: int, inputs: list[Any]
+    ) -> bool:
         """Patch the exec on the host for this call and launch it: one C++ call.
 
         The call touches only what differs from what the exec holds (per
@@ -5618,6 +5940,34 @@ class DynaGraphRunner:
                 self.host_args.clear()
             self.host_args[hkey] = args
         syms, ext, child = args
+        desc = None
+        if self.n_desc:
+            # Not keyed by shape: a descriptor names a source, and an
+            # argument as a source moves and reshapes under a shape that
+            # recurs. So the key is what the bytes are a function of -- every
+            # source's address and geometry -- and a region whose sources all
+            # live in the arena still rebuilds once a shape, since those are
+            # frozen for its lifetime.
+            srcs = self._desc_sources(env, inputs)
+            if srcs is None:
+                return _fallback(
+                    "tma-source", f"a declared descriptor has no source at {env}"
+                )
+            dkey = tuple(
+                (t.data_ptr(), tuple(t.shape), tuple(t.stride())) for t in srcs
+            )
+            blobs = self.desc_blobs.get(dkey)
+            if blobs is None:
+                blobs = self._desc_blobs(srcs)
+                if blobs is None:
+                    return _fallback(
+                        "tma-rebuild",
+                        f"a declared descriptor could not be rebuilt at {env}",
+                    )
+                if len(self.desc_blobs) >= 4096:
+                    self.desc_blobs.clear()
+                self.desc_blobs[dkey] = blobs
+            desc = blobs[0]
         rc = ex.host_lib.dg_step(
             ex.host,
             syms,
@@ -5626,6 +5976,7 @@ class DynaGraphRunner:
             ext,
             child,
             self.in_ptrs,
+            desc,
             stream,
             1,
         )
@@ -6469,7 +6820,7 @@ class DynaGraphRunner:
 
         if host:
             # Patch what moved and launch, one call into the region's C++.
-            if not self._host_step(env, hkey, stream):
+            if not self._host_step(env, hkey, stream, inputs):
                 return None
         else:
             # Launched directly: torch's `replay()` also moves the CUDA

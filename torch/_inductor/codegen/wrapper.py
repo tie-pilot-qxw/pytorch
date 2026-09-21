@@ -2658,6 +2658,30 @@ class PythonWrapperCodegen(CodeGen):
         line = f"{desc.name} = {call}{self.ending}"
         self.writeline(line)
 
+    def codegen_tma_declaration(
+        self, kernel_name: str, descriptors: Sequence[tuple[str, Any]]
+    ) -> None:
+        """Declare the host-built TMA descriptors a kernel is launched with.
+
+        The wrapper is the only place that knows both which parameter a
+        descriptor occupies and which buffer it was built from. A consumer that
+        replays the launch at another shape has to rebuild the descriptor, and
+        the 128 bytes say nothing about how. See `torch.utils._capture_tma`.
+        """
+        if not descriptors:
+            return
+        self.add_import_once("from torch.utils import _capture_tma")
+        args = []
+        for param, desc in descriptors:
+            block = tuple(int(b) for b in desc.block_shape)
+            src = desc.tensor.codegen_reference()
+            args.append(f"_capture_tma.TmaArg({param!r}, {src!r}, {block!r})")
+        # Module scope, not the call body: a consumer reads the declaration when
+        # it first looks at the wrapper, which is before the wrapper has run.
+        self.header.writeline(
+            f"_capture_tma.register({kernel_name!r}, [{', '.join(args)}])"
+        )
+
     def generate_scatter_fallback(self, node: ir.ScatterFallback):
         self.writeline(ScatterFallbackLine(self, node))
 
