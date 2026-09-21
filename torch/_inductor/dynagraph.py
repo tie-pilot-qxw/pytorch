@@ -1173,6 +1173,7 @@ def generate_planner(
             alias or {},
             dev_grid,
             dev_param,
+            body0 + n_sites,
         )
     return out
 
@@ -1196,11 +1197,15 @@ def _planner_u_source(
     alias: dict[str, str],
     dev_grid: dict[int, list[str]],
     dev_param: dict[int, list[str]],
+    cond0: int = 0,
 ) -> str:
     """One kernel per `.item()` point: read the value where the kernel before
     it left it, derive the symbols that follow from it, and patch the nodes
-    after it that depend on them (see `generate_planner`)."""
+    after it that depend on them (see `generate_planner`). A point that is a
+    torch.cond's selector sets the conditional node's value from it
+    (`cond0` is where the handles sit in ctx)."""
     n_sym, n_k = len(symbols), len(kernels)
+    cond_site = {c.sel: c.site0 for c in getattr(dev, "conds", [])}
     out = ["\n#define S(i) (ctx[(i)])"]
     for j, (name, buf, form, _k) in enumerate(dev.items):
         root = buf
@@ -1234,6 +1239,11 @@ def _planner_u_source(
                 lines.append(f"    int64_t {nm} = {expr_c};")
 
         assign(name, read)
+        if name in cond_site:
+            lines.append(
+                f"    if (c) cudaGraphSetConditional((cudaGraphConditionalHandle)ctx[{cond0 + cond_site[name]}],"
+                f" (unsigned)ctx[{sym_index[name]}]);  // {name}"
+            )
         for nm, expr, point in dev.derived:
             if point == j:
                 assign(nm, _expr_to_c(expr, sym_index, local_names))
@@ -3033,6 +3043,7 @@ class _Exec:
 
 
 _ITEM_LINE = re.compile(r"^\s*(u\d+(?:_undivided)?)\s*=\s*(\w+)\.item\(\)\s*$")
+_SEL_LINE = re.compile(r"^\s*(\w+_selector)\s*=\s*int\((\w+)\.item\(\)\)\s*$")
 _ITEM_BOOL_LINE = re.compile(r"^\s*(u\d+)\s*=\s*1 if (\w+)\.item\(\) else 0\s*$")
 _DEV_ASSIGN = re.compile(r"^\s*(u\d+(?:_\w+)?)\s*=\s*(.+?)\s*$")
 _RANGE_LINE = re.compile(r"^\s*# unbacked (u\d+) in \[(\S+), (\S+)\]\s*$")
@@ -3046,6 +3057,26 @@ _INT_DTYPES = (
     "torch.uint8",
     "torch.bool",
 )
+
+
+class _Cond:
+    """One torch.cond kept in the region: its selector, its branch subgraph
+    functions with the argument lists they are called with, the buffers the
+    wrapper picks out of the result, and where the block sits in the body."""
+
+    def __init__(self, name: str, sel: str, sel_buf: str, sel_line: int) -> None:
+        self.name = name
+        self.sel = sel
+        self.sel_buf = sel_buf
+        self.sel_line = sel_line
+        self.block_end = sel_line
+        self.branches: list[tuple[str, str]] = []
+        self.outs: dict[int, str] = {}
+        # Per branch, the allocations its subgraph makes, in order, under
+        # the names the folded body gives them (the capture, which does not
+        # run the branches, makes them itself so the allocation count agrees).
+        self.branch_allocs: list[list[str]] = []
+        self.site0 = -1
 
 
 class _DevScalars:
@@ -3082,10 +3113,168 @@ class _DevScalars:
         # allocation lines).
         self.item_index: dict[str, int] = {}
         self.item_dtype: dict[str, str] = {}
+        # torch.cond blocks kept in the region, in body order.
+        self.conds: list[_Cond] = []
 
     @property
     def names(self) -> OrderedSet[str]:
         return OrderedSet(self.syms)
+
+
+def _is_item_line(line: str) -> bool:
+    return bool(
+        _ITEM_LINE.match(line) or _ITEM_BOOL_LINE.match(line) or _SEL_LINE.match(line)
+    )
+
+
+def _cond_blocks(body: str) -> list[_Cond]:
+    """The torch.cond blocks of a body (`codegen_switch`): the selector line,
+    `name = [None] * n`, an if/elif/else over the selector calling one
+    subgraph function per branch, then `out = name[i]` for each output."""
+    lines = body.splitlines()
+    conds: list[_Cond] = []
+    i = 0
+    while i < len(lines):
+        m = _SEL_LINE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        cond = _Cond(m.group(1)[: -len("_selector")], m.group(1), m.group(2), i)
+        j = i + 1
+        indent = len(lines[i]) - len(lines[i].lstrip())
+        while j < len(lines):
+            t = lines[j].strip()
+            ind = len(lines[j]) - len(lines[j].lstrip())
+            if not t or t.startswith("#"):
+                j += 1
+                continue
+            if ind < indent:
+                break
+            if ind == indent and re.match(r"(if|elif|else)\b", t):
+                fn, args = None, None
+                k = j + 1
+                while k < len(lines) and (
+                    not lines[k].strip()
+                    or lines[k].strip().startswith("#")
+                    or len(lines[k]) - len(lines[k].lstrip()) > indent
+                ):
+                    mm = re.match(r"^\s*(\w+)_args\s*=\s*(\[.*\])\s*$", lines[k])
+                    if mm:
+                        args = mm.group(2)
+                    mc = re.match(r"^\s*\w+\s*=\s*(\w+)\((\w+)_args\)\s*$", lines[k])
+                    if mc:
+                        fn = mc.group(1)
+                    k += 1
+                if fn is None or args is None:
+                    cond.branches = []
+                    break
+                cond.branches.append((fn, args))
+                cond.block_end = k - 1
+                j = k
+                continue
+            if ind == indent and re.match(rf"^{cond.name}\s*=\s*\[None\]", t):
+                j += 1
+                continue
+            mo = re.match(rf"^(\w+)\s*=\s*{cond.name}\[(\d+)\]\s*$", t)
+            if mo and cond.branches:
+                cond.outs[int(mo.group(2))] = mo.group(1)
+                j += 1
+                continue
+            if cond.branches and re.match(r"^(assert_\w+\(|del )", t):
+                j += 1
+                continue
+            break
+        if cond.branches:
+            conds.append(cond)
+        i = j if j > i else i + 1
+    return conds
+
+
+def _fold_branches(body: str, src: str, conds: list[_Cond]) -> str | None:
+    """`body` with each cond block replaced by its branches' subgraph bodies
+    in turn, under the caller's names: the subgraph's parameters become the
+    arguments the branch is called with, and the buffers it returns become
+    the buffers the wrapper picks out of the result. What the allocation and
+    lifetime parsers then see is a straight-line wrapper in which the
+    branches' outputs are one allocation each, made once per branch."""
+    lines = body.splitlines()
+    for cond in reversed(conds):
+        indent = lines[cond.sel_line][
+            : len(lines[cond.sel_line]) - len(lines[cond.sel_line].lstrip())
+        ]
+        folded: list[str] = []
+        cond.branch_allocs = []
+        for fn, args_text in cond.branches:
+            m = re.search(
+                rf"^def {fn}\(args\):\n(.*?)(?=^\S)", src, re.MULTILINE | re.DOTALL
+            )
+            if not m:
+                return None
+            fbody = m.group(1)
+            outer = [a.strip() for a in args_text.strip()[1:-1].split(",") if a.strip()]
+            unpack = re.search(
+                r"^\s*((?:\w+\s*,\s*)*\w+)\s*,?\s*=\s*args\s*$", fbody, re.MULTILINE
+            )
+            params = [n.strip() for n in unpack.group(1).split(",")] if unpack else []
+            if len(params) != len(outer):
+                return None
+            ret = re.search(r"^\s*return\s*\((.*?),?\s*\)\s*$", fbody, re.MULTILINE)
+            rets = (
+                [r.strip() for r in ret.group(1).split(",") if r.strip()] if ret else []
+            )
+            names = dict(zip(params, outer))
+            for idx, nm in enumerate(rets):
+                if idx in cond.outs:
+                    names[nm] = cond.outs[idx]
+            allocs: list[str] = []
+            for fl in fbody.splitlines():
+                t = fl.strip()
+                if (
+                    not t
+                    or t.startswith("#")
+                    or t == "args.clear()"
+                    or re.match(
+                        r"^(return\b|del |assert_size_stride|with torch\.cuda\._DeviceGuard|torch\.cuda\.set_device|raw_stream\d* = get_raw_stream)",
+                        t,
+                    )
+                    or re.match(r"^(?:\w+\s*,\s*)*\w+\s*,?\s*=\s*args$", t)
+                    or re.match(r"^[su]\d+\s*=\s*\w+$", t)
+                ):
+                    continue
+                for old, new in names.items():
+                    t = re.sub(rf"\b{re.escape(old)}\b", new, t)
+                ma = re.match(r"^(\w+)\s*=\s*empty_strided_cuda\(", t)
+                if ma:
+                    allocs.append(ma.group(1))
+                folded.append(indent + t)
+            cond.branch_allocs.append(allocs)
+        lines[cond.sel_line : cond.block_end + 1] = folded
+    return "\n".join(lines)
+
+
+def _sites_in_order(body: str, conds: list[_Cond]) -> list[tuple[str, str | None]]:
+    """(site name, buffer it assigns or None) per site in the body, in
+    order: the extern calls as `_site_calls` names them, and per cond one
+    site per branch (`cond:<name>:<b>`) at the selector line."""
+    by_line = {c.sel_line: c for c in conds}
+    out: list[tuple[str, str | None]] = []
+    for ln, line in enumerate(body.splitlines()):
+        c = by_line.get(ln)
+        if c is not None:
+            c.site0 = len(out)
+            for b in range(len(c.branches)):
+                out.append((f"cond:{c.name}:{b}", None))
+            continue
+        code = line.split("#", 1)[0]
+        for m in _SITE_CALL.finditer(code):
+            if m.group("ek"):
+                name = m.group("ek")
+            elif m.group("ops"):
+                name = "ops:" + re.sub(r"\s+", "", m.group("ops"))
+            else:
+                name = "ops:aten." + re.sub(r"\s+", "", m.group("aten"))
+            out.append((name, m.group("out")))
+    return out
 
 
 def _device_scalars(body: str) -> _DevScalars | None:
@@ -3093,15 +3282,21 @@ def _device_scalars(body: str) -> _DevScalars | None:
     if not re.search(r"\.item\(\)", body):
         return None
     d = _DevScalars()
+    d.conds = _cond_blocks(body)
+    in_cond = OrderedSet()
+    for c in d.conds:
+        in_cond.update(range(c.sel_line + 1, c.block_end + 1))
     n_run = 0
     point = -1
-    for line in body.splitlines():
+    for ln, line in enumerate(body.splitlines()):
+        if ln in in_cond:
+            continue
         m = _RANGE_LINE.match(line)
         if m:
             d.ranges[m.group(1)] = (m.group(2), m.group(3))
             continue
         code = "" if line.lstrip().startswith("#") else line.split("#", 1)[0]
-        m = _ITEM_LINE.match(code)
+        m = _ITEM_LINE.match(code) or _SEL_LINE.match(code)
         form = "int"
         if m is None:
             m = _ITEM_BOOL_LINE.match(code)
@@ -3112,7 +3307,7 @@ def _device_scalars(body: str) -> _DevScalars | None:
             d.items.append((name, buf, form, n_run))
             d.point_of[name] = point
             d.item_index[name] = point
-            if re.fullmatch(r"u\d+", name):
+            if re.fullmatch(r"u\d+", name) or name.endswith("_selector"):
                 d.syms.append(name)
             continue
         m = _DEV_ASSIGN.match(code)
@@ -3225,6 +3420,16 @@ class DynaGraphRunner:
         # "forward", "backward" or "inference": what the region is to autograd,
         # which is what tells a step boundary from a call within one.
         self.mode = mode
+        self.dev: _DevScalars | None = None
+        self.dev_model: Any = None
+        self.dev_out_syms: list[str] = []
+        self.dev_out_idx: list[int] = []
+        self._bounds_now: dict[str, int] = {}
+        self._capturing = False
+        self.bound_env: dict[Any, Any] = {}
+        self.alloc_body: str = ""
+        self.dev_source: str = ""
+        self.cond_of: dict[int, tuple[int, int, int]] = {}
         # The arenas: one per call of a step (`_Steps`), `self.arena` being
         # the one the current call uses.
         self.lanes: list[Any] = []
@@ -3292,23 +3497,39 @@ class DynaGraphRunner:
         self.kernels: list[dict[str, Any]] = kernels or []
         self.symbols: list[str] = symbols or []
         self.exact = not any(k.get("atomic") for k in self.kernels)
-        self.sizes = buffer_size_exprs(body)
-        self.layouts = buffer_layouts(body)
-        self.alias = _buffer_aliases(body)
+        # Unbacked symbols resolved on the device (`dynagraph_unbacked="device"`).
+        self.dev = _device_scalars(body)
+        # What the allocation, layout and lifetime parsers read: the body,
+        # with each torch.cond's branches folded in (`_fold_branches`).
+        self.alloc_body = body
+        if self.dev is not None and self.dev.conds:
+            folded = _fold_branches(body, src, self.dev.conds)
+            if folded is None:
+                self.dev.problem = "cond-branch: a branch subgraph could not be read"
+            else:
+                self.alloc_body = folded
+            for c in self.dev.conds:
+                if c.sel not in self.symbols:
+                    self.symbols.append(c.sel)
+        self.sizes = buffer_size_exprs(self.alloc_body)
+        self.layouts = buffer_layouts(self.alloc_body)
+        self.alias = _buffer_aliases(self.alloc_body)
         # Every view assigned in the wrapper, with its composed element
         # offset: a call-site argument may be one (`_view_of`).
-        self.views = _buffer_views(body)
-        # Unbacked symbols resolved on the device (`dynagraph_unbacked="device"`).
-        self.dev: _DevScalars | None = _device_scalars(body)
-        self.dev_model: Any = None
-        self.dev_out_syms: list[str] = []
-        self.dev_out_idx: list[int] = []
-        self._bounds_now: dict[str, int] = {}
+        self.views = _buffer_views(self.alloc_body)
+        self.dev_model = None
+        self.dev_out_syms = []
+        self.dev_out_idx = []
+        self._bounds_now = {}
         self._capturing = False
-        self.bound_env: dict[Any, Any] = {}
+        self.bound_env = {}
         self.f_planner_u: list[int] = []
         self._u_pin: Any = None
         self._u_view: Any = None
+        self._on_extern_cb: Any = None
+        self._alloc_cb: Any = None
+        self._real_alloc: Any = None
+        self._cond_bodies: dict[int, Any] = {}
         # A returned buffer is often a rename of one that owns the allocation.
         # What comes back is a mix: arena buffers, and inputs handed straight
         # through. `out_order` keeps the caller's order across both, since the
@@ -3319,10 +3540,19 @@ class DynaGraphRunner:
         # Per arena output: its own geometry when it is a `reinterpret_tensor`
         # of the owning buffer, else None for the allocation's.
         self.output_views: list[Any] = []
-        views = _buffer_views(body)
+        views = _buffer_views(self.alloc_body)
         self.out_order: list[tuple[bool, Any]] = []
-        # Buffers that are an extern call's own output, by site.
-        site_out = extern_site_outputs(src, self.entry)
+        # Buffers that are an extern call's own output, by site. The sites:
+        # the extern calls, and one per torch.cond branch (`_sites_in_order`).
+        sites = _sites_in_order(body, self.dev.conds if self.dev is not None else [])
+        site_out = [o for _n, o in sites]
+        # Site index -> (cond index, branch, number of branches) for the
+        # branch sites; the first branch site owns the conditional node.
+        self.cond_of: dict[int, tuple[int, int, int]] = {}
+        if self.dev is not None:
+            for ci, c in enumerate(self.dev.conds):
+                for b in range(len(c.branches)):
+                    self.cond_of[c.site0 + b] = (ci, b, len(c.branches))
         self.extern_outs_of = {out: i for i, out in enumerate(site_out) if out}
         # One address slot per site, then one per element of a tuple-valued
         # site output the wrapper picks out (`buf14 = buf13[0]`: efficient
@@ -3364,7 +3594,7 @@ class DynaGraphRunner:
         self.sym_from_input = _input_symbol_map(body)
         # extern_kernels.* call sites, in order. Each becomes a child-graph
         # node; see `_harvest` and `_capture`.
-        self.extern_sites = extern_sites(src, self.entry)
+        self.extern_sites = [n for n, _o in sites]
         # Device path: where in the `setctx` values the "inputs moved" flag
         # sits (the input addresses follow it, one per argument position).
         self._ctx_in0 = (
@@ -3375,7 +3605,7 @@ class DynaGraphRunner:
         ]
         # Allocation order, so a harvest can hand each empty_strided_cuda call
         # its arena view by position.
-        self.alloc_order = [n for n, _, _, _ in _find_allocations(body)]
+        self.alloc_order = [n for n, _, _, _ in _find_allocations(self.alloc_body)]
         # Harvest key (`_hkey`: shape, lane, extern-read addresses) -> raw
         # child graph per site, plus the CUDAGraph objects that own them; the
         # raw handles are only valid while those live.
@@ -3503,15 +3733,47 @@ class DynaGraphRunner:
         ):
             dev.problem = "unbacked-extern-output: an extern output sized by an unbacked symbol is returned"
             return
+        for c in dev.conds:
+            for b, (fn, args) in enumerate(c.branches):
+                m = re.search(
+                    rf"^def {fn}\(args\):\n(.*?)(?=^\S)", src, re.MULTILINE | re.DOTALL
+                )
+                if m and any(
+                    _SITE_CALL.search(l.split("#", 1)[0])
+                    for l in m.group(1).splitlines()
+                ):
+                    dev.problem = f"cond-branch: {fn} calls an extern kernel"
+                    return
+                # The planner patches the graph's own kernels only; a
+                # branch body is a child graph it does not reach.
+                if _UNBACKED.search(args) or any(
+                    u_sized(nm) for nm in c.branch_allocs[b]
+                ):
+                    dev.problem = f"cond-unbacked: {fn} is sized by an unbacked symbol"
+                    return
+        cond_at = {c.sel_line: c for c in dev.conds}
+        skip: OrderedSet[int] = OrderedSet()
+        for c in dev.conds:
+            skip.update(range(c.sel_line + 1, c.block_end + 1))
         lines = []
-        for line in body.splitlines():
+        for ln, line in enumerate(body.splitlines()):
+            if ln in skip:
+                continue
             code = "" if line.lstrip().startswith("#") else line.split("#", 1)[0]
             indent = line[: len(line) - len(line.lstrip())]
-            m = _ITEM_LINE.match(code) or _ITEM_BOOL_LINE.match(code)
+            m = (
+                _ITEM_LINE.match(code)
+                or _ITEM_BOOL_LINE.match(code)
+                or _SEL_LINE.match(code)
+            )
             if m:
                 lines.append(
                     f"{indent}{m.group(1)} = __dg_item({m.group(1)!r}, {m.group(2)})"
                 )
+                c = cond_at.get(ln)
+                if c is not None:
+                    fns = ", ".join(f"lambda: {fn}({args})" for fn, args in c.branches)
+                    lines.append(f"{indent}{c.name} = __dg_cond({c.site0}, ({fns},))")
                 continue
             m = _DEV_ASSIGN.match(code)
             if (
@@ -3524,6 +3786,7 @@ class DynaGraphRunner:
             lines.append(line)
         fname = f"__dg_dev_{id(self)}"
         text = f"def {fname}(args):\n" + "\n".join(lines) + "\n"
+        self.dev_source = text
         g = self.model.__globals__
         try:
             exec(compile(text, f"<dynagraph {fname}>", "exec"), g)
@@ -3547,6 +3810,43 @@ class DynaGraphRunner:
             if v is None:
                 return None
             out[u] = max(int(v), 0)
+        return out
+
+    def _dev_cond(self, site0: int, fns: Any) -> Any:
+        """The rewritten wrapper's torch.cond: every branch is a site. At
+        harvest each branch runs and is captured on its own; at capture each
+        becomes a body of one conditional node, and the branch allocations
+        the run would have made are made here so the count agrees."""
+        wrap = self._on_extern_cb
+        out = None
+        g = self.model.__globals__
+        for b, fn in enumerate(fns):
+            if not self._capturing and self._real_alloc is not None:
+                # Warm-up with the module's own allocator: the branch's
+                # kernels get compiled and tuned before the capture, and
+                # the arena views by position stay for the captured run.
+                patched = g.get("empty_strided_cuda")
+                g["empty_strided_cuda"] = self._real_alloc
+                try:
+                    fn()
+                finally:
+                    g["empty_strided_cuda"] = patched
+            if self._capturing and self._alloc_cb is not None:
+                _ci, _b, _n = self.cond_of[site0 + b]
+                cond = self.dev.conds[_ci] if self.dev is not None else None
+                for nm in cond.branch_allocs[b] if cond is not None else []:
+                    sizes_e, strides_e, dtype_name = self.layouts[nm]
+                    env = self._bounds_now
+                    sizes = [int(_eval_int(e, env) or 0) for e in sizes_e]
+                    strides = [int(_eval_int(e, env) or 0) for e in strides_e]
+                    self._alloc_cb(
+                        tuple(sizes),
+                        tuple(strides),
+                        getattr(__import__("torch"), dtype_name.split(".")[-1]),
+                    )
+            # Through the site-counting wrapper, so the branch lands on
+            # site `site0 + b` like an extern call at the selector line.
+            out = wrap(fn)()
         return out
 
     def _dev_item(self, name: str, buf: Any) -> int:
@@ -3612,7 +3912,7 @@ class DynaGraphRunner:
             body = "\n".join(
                 line
                 for line in body.splitlines()
-                if not (_ITEM_LINE.match(line) or _ITEM_BOOL_LINE.match(line))
+                if not _is_item_line(line) and not line.lstrip().startswith("assert_")
             )
         if unreachable_launch(body, config.triton.dynagraph_extern_child):
             return "extern-launch"
@@ -3830,18 +4130,18 @@ class DynaGraphRunner:
             )
         # Of those, the ones read where they are, no copy (`__call__`).
         self.inplace: OrderedSet[int] = OrderedSet()
-        # How many arena pointer arguments the planner tracks (LASTP slots).
-        self.n_ptr = generate_pointer_patches(
-            self.kernels,
-            self.slot_of,
-            self.alias,
-            self.input_bufs,
-            self.extern_outs_of,
-            self.views,
-        )[1]
         host_src: str | None = None
         planner_src: str | None = None
         try:
+            # How many arena pointer arguments the planner tracks (LASTP slots).
+            self.n_ptr = generate_pointer_patches(
+                self.kernels,
+                self.slot_of,
+                self.alias,
+                self.input_bufs,
+                self.extern_outs_of,
+                self.views,
+            )[1]
             if self.update == "host":
                 self.inplace = self._inputs_by_address(inputs, static)
                 host_src = generate_host_patcher(
@@ -3956,6 +4256,14 @@ class DynaGraphRunner:
                 code = line.split("#", 1)[0]
                 if _SITE_CALL.search(code):
                     for nm in re.findall(r"\b[A-Za-z_]\w*\b", code):
+                        if nm in self.argv:
+                            out.add(self.argv[nm])
+        if self.dev is not None:
+            # A branch's captured graph holds the addresses of what it is
+            # called with, as an extern's does.
+            for c in self.dev.conds:
+                for _fn, args in c.branches:
+                    for nm in re.findall(r"\b[A-Za-z_]\w*\b", args):
                         if nm in self.argv:
                             out.add(self.argv[nm])
         return out
@@ -4248,11 +4556,20 @@ class DynaGraphRunner:
         old_torch = g.get("torch")
         old_aten = g.get("aten")
         old_item = g.get("__dg_item")
+        old_cond = g.get("__dg_cond")
         if self.dev_model is not None:
             g["__dg_item"] = self._dev_item
+            g["__dg_cond"] = self._dev_cond
+            self._on_extern_cb = wrap
+            self._alloc_cb = alloc
+            self._real_alloc = old_alloc
         ops_calls = {}
         try:
             for name in OrderedSet(self.extern_sites):
+                if name.startswith("cond:"):
+                    # A torch.cond branch: the rewritten wrapper reaches it
+                    # through `__dg_cond`, not a kernel namespace.
+                    continue
                 if name.startswith("ops:"):
                     ops_calls[name[4:]] = wrap(_resolve_op(name[4:]))
                     continue
@@ -4273,6 +4590,13 @@ class DynaGraphRunner:
                     g.pop("__dg_item", None)
                 else:
                     g["__dg_item"] = old_item
+                if old_cond is None:
+                    g.pop("__dg_cond", None)
+                else:
+                    g["__dg_cond"] = old_cond
+                self._on_extern_cb = None
+                self._alloc_cb = None
+                self._real_alloc = None
             if ops_calls:
                 g["torch"] = old_torch
                 if old_aten is not None:
@@ -4340,8 +4664,13 @@ class DynaGraphRunner:
             s.wait_stream(torch.cuda.current_stream())
             gen = torch.cuda.default_generators[self.device_index]
             offset = gen.get_offset()
-            with torch.cuda.stream(s):
-                r = fn(*a, **kw)
+            r = None
+            if not self.extern_sites[i].startswith("cond:"):
+                # Warmed up here; a cond branch was warmed up by `_dev_cond`
+                # with real allocations, since a run of it here would take
+                # the arena views meant for the captured run.
+                with torch.cuda.stream(s):
+                    r = fn(*a, **kw)
             torch.cuda.current_stream().wait_stream(s)
             # The generator offset moves when the op is enqueued, not when it
             # runs, so no synchronize is needed to read it.
@@ -4408,6 +4737,12 @@ class DynaGraphRunner:
         for i, n in enumerate(counts):
             raw = raws[i]
             topos = self.site_topos[i]
+            if n not in topos and topos and i in self.cond_of:
+                # A branch's node is inside the conditional's body; a second
+                # topology there would need a conditional of its own.
+                self.skip_keys.add(key)
+                _fallback("cond-topology", f"branch site {i}: {n} nodes at {env}")
+                return False
             if n not in topos:
                 if len(topos) >= _max_graphs():
                     self.skip_keys.add(key)
@@ -5046,6 +5381,52 @@ class DynaGraphRunner:
 
             from torch.cuda._utils import _check_cuda_bindings as ck
 
+            cinfo = self.cond_of.get(i)
+            if cinfo is not None:
+                ci, b, n_b = cinfo
+                g_raw = self.child_graphs[build_key][i]
+                st = torch.cuda.current_stream().cuda_stream
+                if b == 0:
+                    info = ck(cr.cudaStreamGetCaptureInfo(st))
+                    cap_graph, deps = info[2], list(info[3] or [])
+                    handle = ck(cr.cudaGraphConditionalHandleCreate(cap_graph, 0, 0))
+                    params = cr.cudaGraphNodeParams()
+                    params.type = cr.cudaGraphNodeType.cudaGraphNodeTypeConditional
+                    params.conditional.handle = handle
+                    params.conditional.type = (
+                        cr.cudaGraphConditionalNodeType.cudaGraphCondTypeSwitch
+                    )
+                    params.conditional.size = n_b
+                    node = ck(
+                        cr.cudaGraphAddNode(cap_graph, deps, None, len(deps), params)
+                    )
+                    self._cond_bodies[ci] = (params, params.conditional.phGraph_out)
+                    child = ck(
+                        cr.cudaGraphAddChildGraphNode(
+                            self._cond_bodies[ci][1][0], None, 0, g_raw
+                        )
+                    )
+                    self.ex.site_cond.append(int(handle))
+                    ck(
+                        cr.cudaStreamUpdateCaptureDependencies(
+                            st,
+                            [node],
+                            None,
+                            1,
+                            cr.cudaStreamUpdateCaptureDependenciesFlags.cudaStreamSetCaptureDependencies,
+                        )
+                    )
+                else:
+                    child = ck(
+                        cr.cudaGraphAddChildGraphNode(
+                            self._cond_bodies[ci][1][b], None, 0, g_raw
+                        )
+                    )
+                    self.ex.site_cond.append(0)
+                self.ex.site_held.append([g_raw])
+                self.ex.site_body_nodes.append([child])
+                self.ex.child_nodes.append(child)
+                return self._harvest_result(build_key, i, a, kw)
             graphs_i = self.site_graphs[i]
             if self.child_graphs[build_key][i] is None:
                 # Nothing to launch (a stream-ordering op): the wrapper just
