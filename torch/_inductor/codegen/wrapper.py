@@ -4018,6 +4018,12 @@ class PythonWrapperCodegen(CodeGen):
             compile_wrapper.writeline(f"async_compile.triton({original_name!r}, '''")
 
         inductor_meta["kernel_name"] = name
+        if config.triton.dynagraph:
+            # DynaGraph patches kernel nodes on the device through a handle
+            # only the static launcher asks for at launch. In the meta, so a
+            # kernel compiled with the flag off is not reused from a
+            # source-keyed cache.
+            inductor_meta["static_launch"] = True
         triton_info_kernel_cls = self._get_triton_info_kernel_cls()
         inductor_meta.update(triton_info_kernel_cls.inductor_meta_common())
 

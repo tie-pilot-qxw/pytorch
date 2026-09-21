@@ -3060,6 +3060,7 @@ class StaticTritonCompileResult(CompileResult[_T]):
                 heuristic_type == HeuristicType.USER_AUTOTUNE
                 and not torch._inductor.config.static_launch_user_defined_triton_kernels
                 and triton_meta.get("device") is not None
+                and not inductor_meta.get("static_launch")
             ):
                 # Don't support user defined triton kernels yet -- unless the device index
                 # was dropped (compile-on-one-rank), where one artifact serves every
