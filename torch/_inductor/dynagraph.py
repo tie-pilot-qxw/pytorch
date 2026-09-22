@@ -55,6 +55,7 @@ import subprocess
 import tempfile
 from typing import Any, TYPE_CHECKING
 
+from torch.utils import _capture_scratch
 from torch.utils._ordered_set import OrderedSet
 
 
@@ -337,6 +338,15 @@ def precomputed_grid(k: dict[str, Any], obj: Any) -> list[str] | None:
         for e in (g.x_grid, g.y_grid, g.z_grid)
     ]
 
+
+# Bigger than any address, so a range tuple can be bisected by its low end.
+_ABOVE_ANY = float("inf")
+# Diagnostic counters for the capture check: nodes it could read, and nodes it
+# could not (a launch whose arguments are not in `kernelParams` form).
+_seen = [0]
+_blind = [0]
+# A launch with more parameters than this is not one the table can read anyway.
+_MAX_PARAMS = 256
 
 _DESC_RANK = re.compile(r"tensordesc<([^\[>]*)\[([^\]]*)\]")
 
@@ -861,7 +871,9 @@ extern "C" __global__ void dynagraph_planner(
   // at the start of an execution, and resets it to the handle's default when
   // the handle carries cudaGraphCondAssignDefault. A planner that skipped
   // this because the shape had not changed would run the default body rather
-  // than the selected one, and nothing would say so.
+  // than the selected one, and nothing would say so
+  // (microbench/cond_persist.cu: set body 2, replay without setting it, get
+  // body 0 back).
   if (i == 0) {
     for (int s = 0; s < /*@NSITE@*/; ++s) {
       long long h = ctx[/*@COND0@*/ + s];
@@ -2963,6 +2975,37 @@ def _is_eager_site(name: str) -> bool:
 # one is dropped (`config.triton.dynagraph_max_graphs`).
 
 
+# Graph node types, as far as this module names them.
+_NODE_TYPE = {0: "kernel", 1: "memcpy", 2: "memset", 3: "host", 4: "child-graph"}
+
+# Which of them a selector can turn off, by the call it has. Host-side
+# `cudaGraphNodeSetEnabled` takes kernel, memcpy and memset nodes and refuses a
+# child-graph node with "invalid argument". The device-side call is
+# `cudaGraphKernelNodeSetEnabled`, and a `cudaGraphDeviceNode_t` exists only
+# for a kernel node, so nothing else can even be named there
+# (microbench/enable_node_types.cu).
+_HOST_DISABLABLE = frozenset(OrderedSet([0, 1, 2]))
+_DEVICE_DISABLABLE = frozenset(OrderedSet([0]))
+
+
+def _enable_selectable(sig: tuple[Any, ...], host: bool) -> tuple[bool, str]:
+    """Whether enable/disable can select this body as a unit, and what stops it.
+
+    Choosing one variant by turning the others off only works when every node
+    of the ones turned off can be turned off. Disabling a branch's kernels
+    while its memset still runs does not unselect it: the memset executes and
+    can erase the result of the variant that was selected (measured on a graph
+    of kernel, memset, kernel -- disabling the last kernel left the output 0
+    instead of the first kernel's 777). A body holding anything unturnoffable
+    has to be selected some other way, which today means a SWITCH body.
+    """
+    allowed = _HOST_DISABLABLE if host else _DEVICE_DISABLABLE
+    bad = sorted(OrderedSet([n[0] for n in sig if n and n[0] not in allowed]))
+    if not bad:
+        return True, ""
+    return False, ", ".join(_NODE_TYPE.get(t, f"type {t}") for t in bad)
+
+
 def _max_graphs() -> int:
     from torch._inductor import config
 
@@ -3035,7 +3078,7 @@ def _declared_dep(site: str, argtext: str) -> tuple[str, Any] | None:
     decl = _capture_deps.lookup(qualname)
     if decl is None:
         return None
-    arg_names, _resolve = decl
+    arg_names = decl.arg_names
     try:
         op = _resolve_op(site[4:])
         schema_args = [a.name for a in op._schema.arguments]
@@ -3271,6 +3314,57 @@ def _desc_view_geometry(
         )
     v = views.get(raw)
     return (v[0], v[1]) if v is not None else None
+
+
+def _tensor_range(t: Any, what: str) -> list[tuple[int, int, str]]:
+    """`t`'s storage as one labelled range, or nothing when it is not a tensor."""
+    import torch
+
+    if not isinstance(t, torch.Tensor) or not t.numel():
+        return []
+    st = t.untyped_storage()
+    return [(st.data_ptr(), st.data_ptr() + st.nbytes(), what)]
+
+
+def _named_ranges(a: Any, kw: Any) -> list[tuple[int, int, str]]:
+    """Every tensor an extern call was handed, under the name it was passed by.
+
+    A pointer that lands in one of these is one the host already knows how to
+    rewrite, because the caller chooses that argument every call.
+    """
+    out: list[tuple[int, int, str]] = []
+    for j, v in enumerate(a or ()):
+        out += _tensor_range(v, f"arg{j}")
+        if isinstance(v, (list, tuple)):
+            for k, x in enumerate(v):
+                out += _tensor_range(x, f"arg{j}[{k}]")
+    for nm, v in (kw or {}).items():
+        out += _tensor_range(v, f"kw:{nm}")
+    return out
+
+
+def _extra_blob(extra: int) -> int:
+    """The packed argument buffer behind a launch in `extra` form, or 0.
+
+    `extra` is a null-terminated array of (key, value) pairs; one key gives the
+    buffer's address and another the address of its size. The driver's own
+    constants: END is 0, BUFFER_POINTER 1, BUFFER_SIZE 2.
+    """
+    import ctypes as ct
+
+    if not extra:
+        return 0
+    src = 0
+    j = 0
+    while j < 2 * _MAX_PARAMS:
+        key = ct.c_void_p.from_address(extra + 8 * j).value or 0
+        if not key:
+            break
+        val = ct.c_void_p.from_address(extra + 8 * (j + 1)).value or 0
+        if key == 1:
+            src = val
+        j += 2
+    return src
 
 
 def _eval_ints(exprs: Sequence[str], env: dict[str, int]) -> list[int] | None:
@@ -4151,6 +4245,12 @@ class DynaGraphRunner:
         # which body each site's graph belongs to. Filled by `_harvest`,
         # turned into nodes by `_capture`.
         self.site_topos: list[list[Any]] = [[] for _ in self.extern_sites]
+        # Operator -> the values it returned that its declared branches do not
+        # contain, so the warning is one per value rather than one per call.
+        self._undeclared: dict[str, OrderedSet[Any]] = {}
+        # Set by `_deps_key` when an operator answered Unavailable/Unsupported:
+        # (qualname, kind, reason, permanent).
+        self._deps_refusal: tuple[str, str, str, bool] | None = None
         self.site_graphs: list[list[int | None]] = [[] for _ in self.extern_sites]
         self.site_holds: list[list[Any]] = [[] for _ in self.extern_sites]
         self.key_bodies: dict[Any, list[int]] = {}
@@ -4920,7 +5020,10 @@ class DynaGraphRunner:
             key = tuple(
                 sorted((s, v) for s, v in env.items() if s in self.sym_from_input)
             )
-            if not self._harvest(env, key, self._hkey(key), inputs):
+            hkey = self._hkey(key)
+            if hkey is None:
+                return self._refuse_deps(key, env)
+            if not self._harvest(env, key, hkey, inputs):
                 return False
 
         return (
@@ -4971,12 +5074,50 @@ class DynaGraphRunner:
         reads (the copy held here, or the tensor itself when static). A call
         that sees the same finds its harvest under this; one that does not
         harvests again, and the old entry stays for the call that recurs."""
+        deps = self._deps_key()
+        if deps is None:
+            return None  # a site would not say what its capture depends on
         return (
             key,
             self.lane,
             tuple(self.in_ptrs[j] or 0 for j in self.extern_read),
-            self._deps_key(),
+            deps,
         )
+
+    def _refuse_deps(self, key: Any, env: Any) -> bool:
+        """Hand this call back because an operator would not name its identity.
+
+        `Unavailable` is this call only: the context it reads may well be there
+        on the next one, so nothing is remembered. `Unsupported` is the
+        operator saying it never will, so the shape joins the ones this region
+        does not serve and stops being asked.
+        """
+        r = self._deps_refusal
+        if r is None:
+            return False
+        qualname, kind, reason, forever = r
+        if forever:
+            self.skip_keys.add(key)
+        _fallback(f"deps-{kind.lower()}", f"{qualname}: {reason} at {env}")
+        return False
+
+    def _site_budget(self, i: int) -> tuple[int, bool]:
+        """How many bodies site `i` may grow, and whether its operator said so.
+
+        An operator that declared its branches knows how many kernels it can
+        choose between; a consumer guessing a constant either refuses a
+        library with more of them than it expected or prepares room for ones
+        that do not exist. The constant stays for the sites that declared
+        nothing, where guessing is all there is.
+        """
+        d = self.site_deps[i]
+        if d is not None:
+            from torch.utils import _capture_deps
+
+            decl = _capture_deps.lookup(d[0])
+            if decl is not None and decl.branches is not None:
+                return max(1, len(decl.branches)), True
+        return _max_graphs(), False
 
     def _deps_key(self) -> Any:
         """What this region's sites depend on right now, beyond the shapes and
@@ -4995,11 +5136,41 @@ class DynaGraphRunner:
         from torch.utils import _capture_deps
 
         out = []
+        self._deps_refusal = None
         for qualname, named in [d for d in self.site_deps if d is not None]:
             decl = _capture_deps.lookup(qualname)
             if decl is None:
                 continue
-            out.append((qualname, named, decl[1](*named)))
+            got = _capture_deps._as_result(decl.resolve(*named))
+            if not isinstance(got, _capture_deps.Known):
+                # "I cannot say" is not an identity. Capturing under it would
+                # tie this graph to whatever the operator happened to be doing
+                # in a warm-up or a profiling run, and replaying it for a real
+                # call that also cannot say would look like a cache hit.
+                self._deps_refusal = (
+                    qualname,
+                    type(got).__name__,
+                    got.reason,
+                    isinstance(got, _capture_deps.Unsupported),
+                )
+                return None
+            v = got.value
+            if decl.branches is not None and v not in decl.branches:
+                # Naming a set is a promise about the whole set. A value
+                # outside it means the bodies prepared for this site are not
+                # the ones it can need, so say it here rather than let it
+                # surface as a budget the site cannot explain. Once per
+                # value: this runs every call.
+                seen = self._undeclared.setdefault(qualname, OrderedSet())
+                if v not in seen:
+                    seen.add(v)
+                    log.warning(
+                        "DynaGraph %s declared branches %s but returned %r",
+                        qualname,
+                        decl.branches,
+                        v,
+                    )
+            out.append((qualname, named, v))
         return tuple(out)
 
     def _invalidate_harvests(self, lane: int | None = None) -> None:
@@ -5480,6 +5651,150 @@ class DynaGraphRunner:
             st = self._side_stream = torch.cuda.Stream()
         return st
 
+    def _capture_ranges(self) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+        """(every live allocation, the ones whose lifetime this region controls).
+
+        A value sitting in a kernel parameter is only a pointer if it lands
+        inside a live allocation, which is what the first list is for. The
+        second is what this region can promise is still there at replay: the
+        arena lanes, the copies it holds of the inputs, the static inputs it
+        keeps a reference to, and anything a graph pool retains -- an
+        allocation made while a graph was capturing stays in that graph's
+        private pool for the graph's lifetime, which is exactly the guarantee
+        the default pool does not give.
+        """
+        import torch
+
+        live: list[tuple[int, int]] = []
+        safe: list[tuple[int, int]] = []
+        # Same ranges, carrying what they are: which class a pointer falls in
+        # is the question "can this call be patched instead of captured?"
+        label: list[tuple[int, int, str]] = []
+        for seg in torch.cuda.memory_snapshot():
+            lo = int(seg["address"])
+            span = (lo, lo + int(seg["total_size"]))
+            live.append(span)
+            if tuple(seg.get("segment_pool_id") or (0, 0)) != (0, 0):
+                safe.append(span)
+                label.append((*span, "graph-pool"))
+            else:
+                # Block level, so an unowned pointer can be told apart by the
+                # size of what it points into: an engine's KV cache is
+                # enormous and never moves, a per-call metadata buffer is tiny.
+                at = lo
+                for blk in seg.get("blocks") or ():
+                    nb = int(blk.get("size") or 0)
+                    if blk.get("state") == "active_allocated":
+                        label.append((at, at + nb, f"outside/{nb}B"))
+                    at += nb
+
+        def own(t: Any, what: str) -> None:
+            if isinstance(t, torch.Tensor) and t.numel():
+                st = t.untyped_storage()
+                span = (st.data_ptr(), st.data_ptr() + st.nbytes())
+                safe.append(span)
+                label.append((*span, what))
+
+        for t in self.lanes:
+            own(t, "arena")
+        for t in self.input_store:
+            own(t, "input-copy")
+        for t in self.static_inputs:
+            own(t, "input")
+        live.sort()
+        safe.sort()
+        # Narrowest first, so a lookup picking the last start below the value
+        # lands on the most specific range covering it.
+        label.sort(key=lambda r: (r[0], -(r[1] - r[0])))
+        self._labels = label
+        return live, safe
+
+    def _foreign_pointers(
+        self,
+        raw: Any,
+        live: list[tuple[int, int]],
+        safe: list[tuple[int, int]],
+        every: bool = False,
+    ) -> list[int]:
+        """Device pointers this captured graph holds that nothing here keeps alive.
+
+        The harvest key covers what the wrapper *names*: an argument at the
+        call site (`_extern_read_positions`), or a name standing for something
+        a producer declared (`_capture_deps`). Neither can cover what an
+        operator reaches through a side channel, because there is no name to
+        follow. vLLM's attention is the case that taught this: its
+        FlashAttention scheduler metadata is allocated per step outside the
+        region, never appears as an argument, and FA3 aliases its tile-count
+        semaphore onto it. Capturing the call bakes that pointer into the node
+        while nothing retains the storage, so every replay works through a
+        block the allocator has since handed to someone else. The answers
+        stayed correct and the kernel got steadily slower.
+
+        So this asks the other end of the question: not what the text names,
+        but what the graph actually holds.
+        """
+        import bisect
+        import ctypes as ct
+
+        from cuda.bindings import driver as cu, runtime as cr
+
+        from torch.cuda._utils import _check_cuda_bindings as ck
+
+        def inside(v: int, rs: list[tuple[int, int]]) -> bool:
+            i = bisect.bisect_right(rs, (v, _ABOVE_ANY)) - 1
+            return i >= 0 and rs[i][0] <= v < rs[i][1]
+
+        n = int(ck(cr.cudaGraphGetNodes(raw))[1])
+        nodes = ck(cr.cudaGraphGetNodes(raw, n))[0]
+        kernel = cr.cudaGraphNodeType.cudaGraphNodeTypeKernel
+        out: list[int] = []
+        for nd in nodes:
+            if ck(cr.cudaGraphNodeGetType(nd)) != kernel:
+                continue
+            try:
+                p = ck(cu.cuGraphKernelNodeGetParams(cu.CUgraphNode(int(nd))))
+            except Exception:
+                _blind[0] += 1
+                continue
+            info = []
+            for j in range(_MAX_PARAMS):
+                try:
+                    off, size = ck(cu.cuFuncGetParamInfo(p.func, j))
+                except Exception:
+                    break
+                info.append((int(off), int(size)))
+            # Two launch forms, the same question. `kernelParams` is an array of
+            # pointers, one per argument; `extra` is the already-packed buffer a
+            # launcher handed the driver, indexed by the same offsets. A cutlass
+            # kernel with cluster attributes arrives in the second form, which is
+            # most of the nodes in an attention call -- reading only the first
+            # would leave the check blind to exactly the operator that needs it.
+            kp = int(p.kernelParams or 0)
+            blob = 0 if kp else _extra_blob(int(p.extra or 0))
+            if not kp and not blob:
+                _blind[0] += 1
+                continue
+            _seen[0] += 1
+            for j, (off, size) in enumerate(info):
+                # Every aligned word of every parameter, not just the ones
+                # declared eight bytes wide. A cutlass kernel takes one large
+                # params struct by value and keeps all of its pointers inside
+                # it, so looking only at pointer-sized parameters sees nothing
+                # at exactly the call that needs checking. What makes a word a
+                # pointer here is that it lands inside a live allocation, which
+                # a size or a stride does not.
+                if kp:
+                    at = ct.c_void_p.from_address(kp + 8 * j).value
+                    if not at:
+                        continue
+                else:
+                    at = blob + off
+                for w in range(0, size - 7, 8):
+                    v = ct.c_uint64.from_address(at + w).value
+                    if v and inside(v, live) and (every or not inside(v, safe)):
+                        out.append(v)
+        return out
+
     def _harvest(
         self, env: dict[str, int], key: Any, hkey: Any, inputs: list[Any]
     ) -> bool:
@@ -5500,6 +5815,17 @@ class DynaGraphRunner:
         graphs: list[Any] = []
         results: list[Any] = []
         eager: dict[int, Any] = {}
+        # What a captured child graph is allowed to point at. Computed once
+        # here, not per site: a snapshot walks every segment the allocator
+        # holds, and a transformer has a couple of hundred sites.
+        from torch._inductor import config as _cfg
+
+        mode = _cfg.triton.dynagraph_check_capture
+        ranges = self._capture_ranges() if mode != "off" else None
+        foreign: dict[int, int] = {}
+        held: dict[
+            int, tuple[list[int], list[tuple[int, int, str]], tuple[Any, ...]]
+        ] = {}
 
         def on_extern(i: int, fn: Any, a: Any, kw: Any) -> Any:
             if self.extern_sites[i] in _NOOP_OPS:
@@ -5558,12 +5884,37 @@ class DynaGraphRunner:
             # site here (a Llama backward has 62 sites per shape) and made
             # every later allocation a cudaMalloc. The warm-up above ran on
             # this stream, so the capture is ordered after it as it is.
-            with torch.cuda.stream(s):
+            # Around the capture and nothing else, so what the operator
+            # declares while it runs belongs to this call: the warm-up above
+            # ran it once already, and its buffers are not the ones this graph
+            # holds (`torch.utils._capture_scratch`).
+            with (
+                _capture_scratch.scope(self.extern_sites[i]) as scratch,
+                torch.cuda.stream(s),
+            ):
                 g.capture_begin(pool=self.harvest_pool, capture_error_mode="global")
                 try:
                     r = fn(*a, **_on_current_stream(kw))
                 finally:
                     g.capture_end()
+            if ranges is not None:
+                every = mode == "classify"
+                got = self._foreign_pointers(g.raw_cuda_graph(), *ranges, every)
+                if every:
+                    # Named sources for this call: the arguments the operator
+                    # was handed, and whatever it declared it would reach for
+                    # (`torch.utils._capture_scratch`). A pointer that matches
+                    # one of these is a pointer the host can rewrite per call,
+                    # which is the whole question.
+                    named = _named_ranges(a, kw)
+                    # Recorded, not asked for: the operator declared these
+                    # while it ran, just now, inside its own context. Asking
+                    # afterwards is what used to come up empty.
+                    for nm, t in scratch.buffers.items():
+                        named += _tensor_range(t, f"declared:{nm}")
+                    held[i] = (got, named, self._node_sig(g.raw_cuda_graph()))
+                elif got:
+                    foreign[i] = len(got)
             graphs.append(g)
             results.append(r)
             return r
@@ -5574,6 +5925,72 @@ class DynaGraphRunner:
                 self._run_intercepted(shaped, views, on_extern)
         except Unsupported as exc:
             return _fallback("extern-harvest", str(exc))
+        if ranges is not None:
+            log.info(
+                "DynaGraph capture check read %d kernel nodes, could not read %d",
+                _seen[0],
+                _blind[0],
+            )
+        if mode == "classify" and held:
+            import bisect
+            import collections
+
+            lab = getattr(self, "_labels", [])
+            starts = [r[0] for r in lab]
+
+            def name(v: int) -> str:
+                i = bisect.bisect_right(starts, v) - 1
+                while i >= 0:
+                    lo, hi, what = lab[i]
+                    if lo <= v < hi:
+                        return what
+                    i -= 1
+                return "unknown"
+
+            for i, (vals, named, sig) in held.items():
+                near = sorted(named, key=lambda r: (r[0], -(r[1] - r[0])))
+                nstart = [r[0] for r in near]
+
+                def pick(v: int, _n: Any = near, _s: Any = nstart) -> str:
+                    j = bisect.bisect_right(_s, v) - 1
+                    while j >= 0:
+                        lo, hi, what = _n[j]
+                        if lo <= v < hi:
+                            return what
+                        j -= 1
+                    return name(v)
+
+                tally = collections.Counter(pick(v) for v in vals)
+                unknown = sum(
+                    n for k, n in tally.items() if k.startswith(("outside/", "unknown"))
+                )
+                ok_h, why_h = _enable_selectable(sig, True)
+                ok_d, _ = _enable_selectable(sig, False)
+                sel = (
+                    "enable:both"
+                    if ok_d
+                    else ("enable:host-only" if ok_h else f"enable:no({why_h})")
+                )
+                log.info(
+                    "DynaGraph site %s holds %d pointers, %d unaccounted, %s: %s",
+                    self.extern_sites[i],
+                    len(vals),
+                    unknown,
+                    sel,
+                    ", ".join(f"{k} x{n}" for k, n in tally.most_common()),
+                )
+        if foreign:
+            named = ", ".join(
+                f"{self.extern_sites[i]}({n})" for i, n in list(foreign.items())[:4]
+            )
+            why = (
+                f"{len(foreign)} site(s) captured a device pointer nothing here "
+                f"keeps alive, so a replay reads storage the allocator has since "
+                f"reused: {named}"
+            )
+            if mode == "refuse":
+                return _fallback("foreign-pointer", why)
+            log.warning("DynaGraph %s", why)
         raws = [g.raw_cuda_graph() if g is not None else None for g in graphs]
         # Which body of each site this shape's graphs belong to. A node count
         # not seen at a site before is a new topology -- the library chose a
@@ -5603,11 +6020,16 @@ class DynaGraphRunner:
                 _fallback("cond-topology", f"branch site {i}: {n} nodes at {env}")
                 return False
             if n not in topos:
-                if len(topos) >= _max_graphs():
+                budget, declared = self._site_budget(i)
+                if len(topos) >= budget:
                     self.skip_keys.add(key)
+                    # An operator that named its branches sized this budget
+                    # itself, so overrunning it is a broken declaration and
+                    # not a tuning problem; the two deserve different names.
                     _fallback(
-                        "extern-topology",
-                        f"site {i} already has {len(topos)} bodies, {n} nodes at {env}",
+                        "branch-undeclared" if declared else "extern-topology",
+                        f"site {i} ({self.extern_sites[i]}) already has "
+                        f"{len(topos)} bodies, {n} nodes at {env}",
                     )
                     return False
                 topos.append(n)
@@ -6782,6 +7204,9 @@ class DynaGraphRunner:
 
         ex = self.ex
         hkey = self._hkey(key)
+        if hkey is None:
+            self._refuse_deps(key, env)
+            return SKIP_SHAPE
         if self.extern_sites and self.child_sites:
             if key in self.skip_keys:
                 return SKIP_SHAPE

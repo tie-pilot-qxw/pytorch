@@ -2218,6 +2218,24 @@ class triton:
         "TORCHINDUCTOR_DYNAGRAPH_TOPOLOGY", "host"
     )
 
+    # What to do when a harvested child graph turns out to hold a device
+    # pointer whose storage nothing in the region keeps alive: an operator that
+    # reaches per-call scratch through a side channel rather than through its
+    # arguments (vLLM's attention does this with FlashAttention's scheduler
+    # metadata). Capturing such a call bakes in a pointer to a block the
+    # allocator later hands to someone else, and it does not fail -- the answers
+    # stay right and the kernel gets slower, or the next operator of that shape
+    # quietly computes the wrong thing. "warn" says so, "refuse" turns the
+    # region away, "off" skips the check (one allocator snapshot per harvest).
+    # Off by default: it says a capture is unsafe without making the region
+    # servable, and the route that removes the unsafe capture altogether is to
+    # patch the extern call in place rather than capture it opaquely. Kept
+    # because the walk it does over a captured graph's nodes and parameters is
+    # what that route needs anyway.
+    dynagraph_check_capture: str = os.environ.get(
+        "TORCHINDUCTOR_DYNAGRAPH_CHECK_CAPTURE", "off"
+    )
+
     # Whether a kernel taking a host-built TMA descriptor is patched like any
     # other kernel (the descriptor is rebuilt per shape from the producer's
     # declaration, `torch.utils._capture_tma`) instead of becoming an opaque

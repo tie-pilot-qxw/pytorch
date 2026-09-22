@@ -22,17 +22,77 @@ guarantee of safety.
 """
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 
-__all__ = ["register", "lookup"]
+__all__ = [
+    "Declaration",
+    "Known",
+    "Unavailable",
+    "Unsupported",
+    "register",
+    "lookup",
+]
 
-# op qualname ("_c10d_functional::all_reduce") -> (argument names, resolver)
-_DEPS: dict[str, tuple[tuple[str, ...], Callable[..., Any]]] = {}
+
+class Known(NamedTuple):
+    """The identity this call's capture would be tied to."""
+
+    value: Any
+
+
+class Unavailable(NamedTuple):
+    """The operator cannot say right now, and might be able to later.
+
+    The context it reads has not been installed yet, or this is a warm-up or a
+    profiling run that is not a real invocation. A consumer must not capture
+    under an unknown identity, and must not cache this answer: the next call
+    may well be answerable.
+    """
+
+    reason: str
+
+
+class Unsupported(NamedTuple):
+    """This operator will not be able to say, on this path, ever.
+
+    A backend that cannot name what it bakes in. A consumer should stop asking
+    and take whatever route it has for an operator that declares nothing.
+    """
+
+    reason: str
+
+
+# A resolver may return one of the three above, or a bare value, which means
+# `Known(value)`. Returning None as a bare value is how the first version
+# reported "I could not tell", which made four different states -- a real
+# no-op, a context not yet installed, an unsupported backend, and a bug in the
+# resolver -- indistinguishable, and cacheable: a capture taken during a
+# profiling run became the answer for a real invocation whose lookup also
+# failed. Saying which one it is costs the producer one word.
+def _as_result(v: Any) -> Known | Unavailable | Unsupported:
+    if isinstance(v, (Known, Unavailable, Unsupported)):
+        return v
+    return Known(v)
+
+
+class Declaration(NamedTuple):
+    """What one operator declared. `branches` is None when it named no space."""
+
+    arg_names: tuple[str, ...]
+    resolve: Callable[..., Any]
+    branches: tuple[Any, ...] | None
+
+
+# op qualname ("_c10d_functional::all_reduce") -> what it declared
+_DEPS: dict[str, Declaration] = {}
 
 
 def register(
-    qualname: str, arg_names: tuple[str, ...], resolve: Callable[..., Any]
+    qualname: str,
+    arg_names: tuple[str, ...],
+    resolve: Callable[..., Any],
+    branches: tuple[Any, ...] | None = None,
 ) -> None:
     """Declare that this operator's capture is only valid while `resolve` of
     those arguments stays the same.
@@ -40,10 +100,28 @@ def register(
     `resolve` is called with the arguments' values, in the order named. It is
     evaluated once per call of the region holding the operator, so it must be
     cheap, and it must never raise.
+
+    `resolve` returns `Known(value)`, `Unavailable(reason)` or
+    `Unsupported(reason)`; a bare value means `Known(value)`.
+
+    `branches` is every value `resolve` can return, in a fixed order, for an
+    operator whose identity moves between a known set rather than an open one
+    -- a library that picks among kernels it could name. Equality alone tells
+    a consumer that the capture went stale; the set tells it what the capture
+    could have been instead, which is what lets it prepare all of them once
+    rather than discover them one re-capture at a time, size a per-operator
+    budget from the operator rather than from a constant, and refuse a space
+    too large to prepare while it is still building rather than mid-run.
+
+    Declaring a set is a promise about the whole set, not about the values
+    seen so far: a consumer that meets a value outside it has been told
+    something false, and should say so rather than pick a neighbour.
     """
-    _DEPS[qualname] = (tuple(arg_names), resolve)
+    _DEPS[qualname] = Declaration(
+        tuple(arg_names), resolve, None if branches is None else tuple(branches)
+    )
 
 
-def lookup(qualname: str) -> tuple[tuple[str, ...], Callable[..., Any]] | None:
+def lookup(qualname: str) -> Declaration | None:
     """What this operator declared, or None."""
     return _DEPS.get(qualname)

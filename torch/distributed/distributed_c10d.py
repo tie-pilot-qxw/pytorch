@@ -8207,6 +8207,8 @@ def _capture_identity_of_group(group_name: object) -> object:
     move when an elastic run rebuilds the group at another size, which is why
     this has to be evaluated rather than read.
     """
+    from torch.utils import _capture_deps
+
     try:
         pg = (
             _resolve_process_group(cast("GroupName", group_name))
@@ -8217,9 +8219,12 @@ def _capture_identity_of_group(group_name: object) -> object:
         if serial is None:
             serial = next(_capture_group_count)
             _capture_group_serials[pg] = serial
-        return (pg.size(), serial)
-    except Exception:
-        return None
+        return _capture_deps.Known((pg.size(), serial))
+    except Exception as e:
+        # Not None: "no group by that name right now" is a different state from
+        # "this group is the same one as last time", and only one of them is an
+        # identity a capture may be tied to.
+        return _capture_deps.Unavailable(f"{type(e).__name__}: {e}")
 
 
 def _declare_capture_deps() -> None:
