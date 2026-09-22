@@ -5709,6 +5709,142 @@ class DynaGraphRunner:
         self._labels = label
         return live, safe
 
+    @staticmethod
+    def _pointer_words(raw: Any) -> list[tuple[int, int, int]]:
+        """Every eight-byte-aligned word of every kernel parameter in a graph,
+        as (node index, byte offset, value).
+
+        The offset is the one `cuFuncGetParamInfo` gives for the parameter plus
+        the word's position inside it, which is the same coordinate both
+        patchers already write at: the host one edits its shadow of the packed
+        argument buffer at that offset, and the device one passes it to
+        `cudaGraphKernelNodeSetParam`. So a source bound to an offset here can
+        be written back without translating anything.
+
+        Every word, not only the parameters declared eight bytes wide: a
+        cutlass kernel takes one large params struct by value and keeps all of
+        its pointers inside it, so looking only at pointer-sized parameters
+        sees nothing at exactly the call that needs checking. Whether a word is
+        a pointer is decided by the caller, from where it lands.
+        """
+        import ctypes as ct
+
+        from cuda.bindings import driver as cu, runtime as cr
+
+        from torch.cuda._utils import _check_cuda_bindings as ck
+
+        n = int(ck(cr.cudaGraphGetNodes(raw))[1])
+        nodes = ck(cr.cudaGraphGetNodes(raw, n))[0]
+        kernel = cr.cudaGraphNodeType.cudaGraphNodeTypeKernel
+        out: list[tuple[int, int, int]] = []
+        for i, nd in enumerate(nodes):
+            if ck(cr.cudaGraphNodeGetType(nd)) != kernel:
+                continue
+            try:
+                p = ck(cu.cuGraphKernelNodeGetParams(cu.CUgraphNode(int(nd))))
+            except Exception:
+                _blind[0] += 1
+                continue
+            info = []
+            for j in range(_MAX_PARAMS):
+                try:
+                    off, size = ck(cu.cuFuncGetParamInfo(p.func, j))
+                except Exception:
+                    break
+                info.append((int(off), int(size)))
+            # Two launch forms, the same question. `kernelParams` is an array of
+            # pointers, one per argument; `extra` is the already-packed buffer a
+            # launcher handed the driver, indexed by the same offsets. A cutlass
+            # kernel with cluster attributes arrives in the second form, which is
+            # most of the nodes in an attention call -- reading only the first
+            # would leave this blind to exactly the operator that needs it.
+            kp = int(p.kernelParams or 0)
+            blob = 0 if kp else _extra_blob(int(p.extra or 0))
+            if not kp and not blob:
+                _blind[0] += 1
+                continue
+            _seen[0] += 1
+            for j, (off, size) in enumerate(info):
+                if kp:
+                    at = ct.c_void_p.from_address(kp + 8 * j).value
+                    if not at:
+                        continue
+                else:
+                    at = blob + off
+                for w in range(0, size - 7, 8):
+                    v = ct.c_uint64.from_address(at + w).value
+                    if v:
+                        out.append((i, off + w, v))
+        return out
+
+    def _bind_sources(
+        self,
+        raw: Any,
+        named: list[tuple[int, int, str]],
+        fallback: list[tuple[int, int, str]],
+        live: list[tuple[int, int]],
+    ) -> tuple[list[tuple[int, int, str, int]], int]:
+        """Where each captured pointer sits, and which named source it came from.
+
+        This is what an update program is written from. Knowing that a capture
+        holds no pointer it cannot account for says the call *could* be
+        rewritten per shape; this says where to write and what to write there:
+        per binding the node, the byte offset, the source's name, and the
+        distance from the start of that source, so a later call writes
+        `current base of that source + delta` and nothing has to be recaptured.
+
+        The delta matters as much as the base. A pointer rarely sits at the
+        start of what it came from: FlashAttention's semaphore is aliased onto
+        an offset within the scheduler metadata, and an argument is often a
+        view into the middle of a tensor. Returns the bindings and how many
+        pointer-looking words fell in no named source, which is the count that
+        has to be zero before the call can be served without capturing it.
+        """
+        import bisect
+
+        def index(rs: list[tuple[int, int, str]]) -> Any:
+            # Widest first at a shared start, so stepping back from the last
+            # start at or below the value meets the most specific range first.
+            near = sorted(rs, key=lambda r: (r[0], -(r[1] - r[0])))
+            return near, [r[0] for r in near]
+
+        # Two layers, tried in order rather than merged: a name the call itself
+        # supplies -- an argument, or a buffer the operator declared -- says
+        # where a later call will find that pointer again, and a region label
+        # only says which pool it currently lies in. Merging them and letting
+        # the narrowest win lets a pool label beat a declaration whenever the
+        # pointer sits outside the exact extent that was declared, which turns
+        # a source an update can follow into one it cannot.
+        layers = [index(named), index(fallback)]
+        lv = sorted(live)
+
+        def is_pointer(v: int) -> bool:
+            # Most words are not pointers at all -- a size, a stride, a scalar.
+            # What makes one a pointer here is that it lands inside an
+            # allocation that is live, which a size does not.
+            i = bisect.bisect_right(lv, (v, _ABOVE_ANY)) - 1
+            return i >= 0 and lv[i][0] <= v < lv[i][1]
+
+        out: list[tuple[int, int, str, int]] = []
+        loose = 0
+        for node, off, v in self._pointer_words(raw):
+            if not is_pointer(v):
+                continue
+            for near, starts in layers:
+                j = bisect.bisect_right(starts, v) - 1
+                while j >= 0:
+                    lo, hi, what = near[j]
+                    if lo <= v < hi:
+                        out.append((node, off, what, v - lo))
+                        break
+                    j -= 1
+                else:
+                    continue
+                break
+            else:
+                loose += 1
+        return out, loose
+
     def _foreign_pointers(
         self,
         raw: Any,
@@ -5734,66 +5870,16 @@ class DynaGraphRunner:
         but what the graph actually holds.
         """
         import bisect
-        import ctypes as ct
-
-        from cuda.bindings import driver as cu, runtime as cr
-
-        from torch.cuda._utils import _check_cuda_bindings as ck
 
         def inside(v: int, rs: list[tuple[int, int]]) -> bool:
             i = bisect.bisect_right(rs, (v, _ABOVE_ANY)) - 1
             return i >= 0 and rs[i][0] <= v < rs[i][1]
 
-        n = int(ck(cr.cudaGraphGetNodes(raw))[1])
-        nodes = ck(cr.cudaGraphGetNodes(raw, n))[0]
-        kernel = cr.cudaGraphNodeType.cudaGraphNodeTypeKernel
-        out: list[int] = []
-        for nd in nodes:
-            if ck(cr.cudaGraphNodeGetType(nd)) != kernel:
-                continue
-            try:
-                p = ck(cu.cuGraphKernelNodeGetParams(cu.CUgraphNode(int(nd))))
-            except Exception:
-                _blind[0] += 1
-                continue
-            info = []
-            for j in range(_MAX_PARAMS):
-                try:
-                    off, size = ck(cu.cuFuncGetParamInfo(p.func, j))
-                except Exception:
-                    break
-                info.append((int(off), int(size)))
-            # Two launch forms, the same question. `kernelParams` is an array of
-            # pointers, one per argument; `extra` is the already-packed buffer a
-            # launcher handed the driver, indexed by the same offsets. A cutlass
-            # kernel with cluster attributes arrives in the second form, which is
-            # most of the nodes in an attention call -- reading only the first
-            # would leave the check blind to exactly the operator that needs it.
-            kp = int(p.kernelParams or 0)
-            blob = 0 if kp else _extra_blob(int(p.extra or 0))
-            if not kp and not blob:
-                _blind[0] += 1
-                continue
-            _seen[0] += 1
-            for j, (off, size) in enumerate(info):
-                # Every aligned word of every parameter, not just the ones
-                # declared eight bytes wide. A cutlass kernel takes one large
-                # params struct by value and keeps all of its pointers inside
-                # it, so looking only at pointer-sized parameters sees nothing
-                # at exactly the call that needs checking. What makes a word a
-                # pointer here is that it lands inside a live allocation, which
-                # a size or a stride does not.
-                if kp:
-                    at = ct.c_void_p.from_address(kp + 8 * j).value
-                    if not at:
-                        continue
-                else:
-                    at = blob + off
-                for w in range(0, size - 7, 8):
-                    v = ct.c_uint64.from_address(at + w).value
-                    if v and inside(v, live) and (every or not inside(v, safe)):
-                        out.append(v)
-        return out
+        return [
+            v
+            for _node, _off, v in self._pointer_words(raw)
+            if inside(v, live) and (every or not inside(v, safe))
+        ]
 
     def _harvest(
         self, env: dict[str, int], key: Any, hkey: Any, inputs: list[Any]
@@ -5823,9 +5909,7 @@ class DynaGraphRunner:
         mode = _cfg.triton.dynagraph_check_capture
         ranges = self._capture_ranges() if mode != "off" else None
         foreign: dict[int, int] = {}
-        held: dict[
-            int, tuple[list[int], list[tuple[int, int, str]], tuple[Any, ...]]
-        ] = {}
+        held: dict[int, tuple[Any, ...]] = {}
 
         def on_extern(i: int, fn: Any, a: Any, kw: Any) -> Any:
             if self.extern_sites[i] in _NOOP_OPS:
@@ -5912,7 +5996,22 @@ class DynaGraphRunner:
                     # afterwards is what used to come up empty.
                     for nm, t in scratch.buffers.items():
                         named += _tensor_range(t, f"declared:{nm}")
-                    held[i] = (got, named, self._node_sig(g.raw_cuda_graph()))
+                    raw = g.raw_cuda_graph()
+                    held[i] = (
+                        got,
+                        named,
+                        self._node_sig(raw),
+                        # The labelled regions as well as the call's own
+                        # names: a pointer into the arena or into the graph's
+                        # pool has a source too, just one the region already
+                        # rewrites by other means. Leaving them out would
+                        # report them as gaps. Narrower ranges win, so a
+                        # declared tensor lying inside the arena still binds
+                        # to its own name.
+                        self._bind_sources(
+                            raw, named, getattr(self, "_labels", []), ranges[0]
+                        ),
+                    )
                 elif got:
                     foreign[i] = len(got)
             graphs.append(g)
@@ -5947,7 +6046,7 @@ class DynaGraphRunner:
                     i -= 1
                 return "unknown"
 
-            for i, (vals, named, sig) in held.items():
+            for i, (vals, named, sig, bound) in held.items():
                 near = sorted(named, key=lambda r: (r[0], -(r[1] - r[0])))
                 nstart = [r[0] for r in near]
 
@@ -5978,6 +6077,21 @@ class DynaGraphRunner:
                     unknown,
                     sel,
                     ", ".join(f"{k} x{n}" for k, n in tally.most_common()),
+                )
+                # Where each of them sits, which is what an update program is
+                # written from. Reported next to the tally so the two can be
+                # compared: a source that accounts for a pointer but cannot be
+                # located is not one a later call can rewrite.
+                binds, loose = bound
+                by_src = collections.Counter(b[2] for b in binds)
+                log.info(
+                    "DynaGraph site %s binds %d locations over %d nodes, "
+                    "%d unbound: %s",
+                    self.extern_sites[i],
+                    len(binds),
+                    len(OrderedSet([b[0] for b in binds])),
+                    loose,
+                    ", ".join(f"{k} x{n}" for k, n in by_src.most_common(6)),
                 )
         if foreign:
             named = ", ".join(
