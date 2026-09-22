@@ -850,16 +850,19 @@ extern "C" __global__ void dynagraph_planner(
   // the host's rather than the device's because threads in different blocks
   // are not ordered against each other: one block could read the "already
   // applied" flag after another had written it and skip patches it still owed.
-  if (ctx[/*@NSYM@*/] == 0 && ctx[/*@INDIRTY@*/] == 0) return;
-
   int i = blockIdx.x * blockDim.x + threadIdx.x;
 
   // Sites whose extern topology varies are SWITCH nodes: thread 0 selects the
   // body for this shape from the index the host wrote past the extern
-  // outputs. A site with a single topology has a zero handle here. Set only
-  // when the shape changed (above), so a skipped planner leaves the last
-  // selection standing.
-  if (i == 0 && ctx[/*@NSYM@*/] != 0) {
+  // outputs. A site with a single topology has a zero handle here.
+  //
+  // Written on every replay, ahead of the early exit below, because a
+  // conditional's value does not survive a launch: CUDA leaves it undefined
+  // at the start of an execution, and resets it to the handle's default when
+  // the handle carries cudaGraphCondAssignDefault. A planner that skipped
+  // this because the shape had not changed would run the default body rather
+  // than the selected one, and nothing would say so.
+  if (i == 0) {
     for (int s = 0; s < /*@NSITE@*/; ++s) {
       long long h = ctx[/*@COND0@*/ + s];
       if (h != 0)
@@ -867,6 +870,8 @@ extern "C" __global__ void dynagraph_planner(
                                 (unsigned)ctx[/*@BODY0@*/ + s]);
     }
   }
+
+  if (ctx[/*@NSYM@*/] == 0 && ctx[/*@INDIRTY@*/] == 0) return;
   if (i >= /*@N@*/) return;
 
   // Inputs read where they are: when one moved, the host wrote the new
@@ -1519,8 +1524,11 @@ def _planner_u_source(
                 f" if (pin) {{ ctx[{sym_index[name]}] = pin - 1; c = 1; }} }}"
                 f"  // forced branch of {name}"
             )
+            # Unconditionally, not under `c`: the value does not survive a
+            # launch (see the SWITCH comment in the main planner), so
+            # "the selector did not change" is not a reason to skip writing it.
             lines.append(
-                f"    if (c) cudaGraphSetConditional((cudaGraphConditionalHandle)ctx[{cond0 + site0}],"
+                f"    cudaGraphSetConditional((cudaGraphConditionalHandle)ctx[{cond0 + site0}],"
                 f" (unsigned)ctx[{sym_index[name]}]);  // {name}"
             )
         for nm, expr, point in dev.derived:
