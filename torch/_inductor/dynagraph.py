@@ -55,7 +55,6 @@ import subprocess
 import tempfile
 from typing import Any, TYPE_CHECKING
 
-from torch.utils import _capture_scratch
 from torch.utils._ordered_set import OrderedSet
 
 
@@ -5968,14 +5967,7 @@ class DynaGraphRunner:
             # site here (a Llama backward has 62 sites per shape) and made
             # every later allocation a cudaMalloc. The warm-up above ran on
             # this stream, so the capture is ordered after it as it is.
-            # Around the capture and nothing else, so what the operator
-            # declares while it runs belongs to this call: the warm-up above
-            # ran it once already, and its buffers are not the ones this graph
-            # holds (`torch.utils._capture_scratch`).
-            with (
-                _capture_scratch.scope(self.extern_sites[i]) as scratch,
-                torch.cuda.stream(s),
-            ):
+            with torch.cuda.stream(s):
                 g.capture_begin(pool=self.harvest_pool, capture_error_mode="global")
                 try:
                     r = fn(*a, **_on_current_stream(kw))
@@ -5986,16 +5978,12 @@ class DynaGraphRunner:
                 got = self._foreign_pointers(g.raw_cuda_graph(), *ranges, every)
                 if every:
                     # Named sources for this call: the arguments the operator
-                    # was handed, and whatever it declared it would reach for
-                    # (`torch.utils._capture_scratch`). A pointer that matches
-                    # one of these is a pointer the host can rewrite per call,
-                    # which is the whole question.
+                    # was handed. A pointer that matches one of these is a
+                    # pointer the host can rewrite per call, which is the whole
+                    # question. A pointer that does not is one the caller has
+                    # to have kept still, which is its contract with any graph
+                    # capture and not something a compiler can arrange.
                     named = _named_ranges(a, kw)
-                    # Recorded, not asked for: the operator declared these
-                    # while it ran, just now, inside its own context. Asking
-                    # afterwards is what used to come up empty.
-                    for nm, t in scratch.buffers.items():
-                        named += _tensor_range(t, f"declared:{nm}")
                     raw = g.raw_cuda_graph()
                     held[i] = (
                         got,
