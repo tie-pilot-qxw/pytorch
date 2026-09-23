@@ -3378,6 +3378,166 @@ def _extra_blob(extra: int) -> int:
     return src
 
 
+def _byte_span(t: Any) -> tuple[int, int]:
+    """The bytes a strided tensor can touch, as [first, past last)."""
+    lo = t.data_ptr()
+    return lo, lo + _extent(t) * t.element_size()
+
+
+def _call_signature(a: Any, kw: Any) -> tuple[tuple[Any, ...], list[Any]] | None:
+    """What a library call's capture depends on apart from where its operands
+    live, and the tensors themselves in argument order.
+
+    Two calls with the same signature record the same launches: the same
+    kernels, grids and scalars, differing only in the operand addresses the
+    parameters hold. That is what lets one captured call stand for every
+    layer of a model -- 28 layers make 28 calls per projection, one
+    signature. Per tensor: shape, stride, dtype, and the address's alignment
+    up to 256 bytes (a library picks vectorised kernels by it). Across
+    tensors: which of them overlap and by how much, since a library that
+    notices aliasing takes a different path. Anything but tensors and plain
+    scalars is None: there is no way to tell what the capture read from it.
+    """
+    import torch
+
+    items: list[tuple[Any, Any]] = [(j, v) for j, v in enumerate(a or ())]
+    items += sorted((kw or {}).items())
+    sig: list[Any] = []
+    ts: list[Any] = []
+    for k, v in items:
+        if isinstance(v, torch.Tensor):
+            if not v.is_cuda or not v.numel():
+                return None
+            p = v.data_ptr()
+            sig.append((k, tuple(v.shape), v.stride(), v.dtype, min(p & -p, 256)))
+            ts.append(v)
+        elif v is None or isinstance(v, (bool, int, float, str, torch.dtype)):
+            sig.append((k, v))
+        else:
+            return None
+    ext = [_byte_span(t) for t in ts]
+    for u in range(len(ts)):
+        for w in range(u + 1, len(ts)):
+            if ext[u][0] < ext[w][1] and ext[w][0] < ext[u][1]:
+                sig.append((u, w, ts[w].data_ptr() - ts[u].data_ptr()))
+    return tuple(sig), ts
+
+
+class _ClonedChild:
+    """A child graph made by cloning another site's capture and rewriting the
+    operand addresses in its kernel parameters.
+
+    Stands where a `CUDAGraph` would in a harvest's graph list, which only
+    ever asks it for the raw handle. Holds the graph it was cloned from: the
+    workspace and pool memory the clone still points at belong to that
+    capture.
+    """
+
+    def __init__(self, raw: Any, source: Any) -> None:
+        self._raw = raw
+        self._source = source
+
+    def raw_cuda_graph(self) -> int:
+        return int(self._raw)
+
+    def __del__(self) -> None:
+        try:
+            from cuda.bindings import runtime as cr
+
+            cr.cudaGraphDestroy(self._raw)
+        except Exception:
+            pass
+
+
+def _clone_plan(raw: Any, ts: list[Any]) -> tuple[list[Any], list[Any]] | None:
+    """Where a captured call holds each of its operands' addresses.
+
+    Returns the graph's nodes and, per kernel node that needs rewriting, its
+    index and a list of (byte offset, operand index, distance into the
+    operand). None when the capture is not one this can re-point: a node
+    that is not a kernel (a memset or copy holds addresses where this does
+    not look), or a word that lands just past an operand, which is an end
+    pointer that would not move with it.
+    """
+    from cuda.bindings import runtime as cr
+
+    from torch.cuda._utils import _check_cuda_bindings as ck
+
+    n = int(ck(cr.cudaGraphGetNodes(raw))[1])
+    nodes = ck(cr.cudaGraphGetNodes(raw, n))[0]
+    kernel = cr.cudaGraphNodeType.cudaGraphNodeTypeKernel
+    if any(ck(cr.cudaGraphNodeGetType(nd)) != kernel for nd in nodes):
+        return None
+    ext = [_byte_span(t) for t in ts]
+    at: dict[int, list[tuple[int, int, int]]] = {}
+    for node, off, v in DynaGraphRunner._pointer_words(raw):
+        # Narrowest operand first: two views into one buffer both contain an
+        # address inside the smaller one, and the signature fixed how they
+        # overlap, so either would re-point it the same way.
+        hits = sorted((hi - lo, k) for k, (lo, hi) in enumerate(ext) if lo <= v < hi)
+        if hits:
+            k = hits[0][1]
+            at.setdefault(node, []).append((off, k, v - ts[k].data_ptr()))
+        elif any(hi <= v < hi + 4096 for _lo, hi in ext):
+            return None
+    return nodes, sorted(at.items())
+
+
+def _clone_child(source: Any, plan: Any, ts: list[Any]) -> _ClonedChild | None:
+    """`source`'s graph with its operand addresses moved to `ts`'s."""
+    import ctypes as ct
+
+    from cuda.bindings import driver as cu, runtime as cr
+
+    from torch.cuda._utils import _check_cuda_bindings as ck
+
+    nodes, at = plan
+    clone = ck(cr.cudaGraphClone(source.raw_cuda_graph()))
+    out = _ClonedChild(clone, source)
+    keep: list[Any] = []
+    for i, words in at:
+        nd = ck(cr.cudaGraphNodeFindInClone(nodes[i], clone))
+        cnd = cu.CUgraphNode(int(nd))
+        p = ck(cu.cuGraphKernelNodeGetParams(cnd))
+        info = []
+        for j in range(_MAX_PARAMS):
+            try:
+                off, size = ck(cu.cuFuncGetParamInfo(p.func, j))
+            except Exception:
+                break
+            info.append((int(off), int(size)))
+        kp = int(p.kernelParams or 0)
+        blob = 0 if kp else _extra_blob(int(p.extra or 0))
+        if not kp and not blob:
+            return None
+        total = max((o + s for o, s in info), default=0)
+        buf = (ct.c_ubyte * max(total, 1))()
+        for j, (o, s) in enumerate(info):
+            src = (ct.c_void_p.from_address(kp + 8 * j).value or 0) if kp else blob + o
+            if not src:
+                return None
+            ct.memmove(ct.addressof(buf) + o, src, s)
+        for off, k, delta in words:
+            ct.c_uint64.from_address(ct.addressof(buf) + off).value = (
+                ts[k].data_ptr() + delta
+            )
+        if kp:
+            arr = (ct.c_void_p * max(len(info), 1))(
+                *[ct.addressof(buf) + o for o, _s in info]
+            )
+            keep.append((buf, arr))
+            p.kernelParams = ct.addressof(arr)
+        else:
+            size = ct.c_size_t(total)
+            ex = (ct.c_void_p * 5)(1, ct.addressof(buf), 2, ct.addressof(size), 0)
+            keep.append((buf, size, ex))
+            p.extra = ct.addressof(ex)
+        # The driver copies the arguments into the node here, so `keep` only
+        # has to outlive this call.
+        ck(cu.cuGraphKernelNodeSetParams(cnd, p))
+    return out
+
+
 def _eval_ints(exprs: Sequence[str], env: dict[str, int]) -> list[int] | None:
     """Every expression as an int, or None if any one of them is not
     arithmetic over the symbols."""
@@ -4278,6 +4438,12 @@ class DynaGraphRunner:
         # outputs a call allocates for itself are held (`extern_outs`) so
         # they are never handed out twice.
         self.harvest_pool: Any = None
+        # (site name, `_call_signature`) -> the capture that stands for every
+        # call with that signature, and where it holds its operands
+        # (`_clone_plan`, None when it cannot be re-pointed). Kept across
+        # harvests and arena moves: the plan records distances into operands,
+        # not addresses.
+        self._reps: dict[Any, tuple[Any, Any]] = {}
         self.harvests = 0
         # Call counter, stamped on the graph that served each call (LRU).
         self.tick = 0
@@ -6019,6 +6185,8 @@ class DynaGraphRunner:
         ranges = self._capture_ranges() if mode != "off" else None
         foreign: dict[int, int] = {}
         held: dict[int, tuple[Any, ...]] = {}
+        cloning = _cfg.triton.dynagraph_clone_sites
+        made = [0, 0]
 
         def on_extern(i: int, fn: Any, a: Any, kw: Any) -> Any:
             if self.extern_sites[i] in _NOOP_OPS:
@@ -6035,6 +6203,35 @@ class DynaGraphRunner:
                 graphs.append(None)
                 results.append(kw.get("out", r))
                 return results[-1]
+            first = None
+            if (
+                cloning
+                and not self.extern_sites[i].startswith(("ops:", "tk:"))
+                and "out" in kw
+                and i not in self.cond_of
+            ):
+                # A library call (cuBLAS, cuDNN) whose capture depends only on
+                # its operands: every call with the same signature records the
+                # same launches, so one capture per signature is enough and
+                # the others are that capture with their own addresses in it.
+                # Only with `out=`, so every tensor the call writes is an
+                # operand and moves with the rest. Ahead of the warm-up: the
+                # call that was captured for this signature was warmed up, and
+                # a harvest's values are never read (the wrapper's own answer
+                # comes from `_reference`), so a clone's call is not run.
+                got = _call_signature(a, kw)
+                if got is not None:
+                    gkey = (self.extern_sites[i], got[0])
+                    rep = self._reps.get(gkey)
+                    if rep is None:
+                        first = (gkey, got[1])
+                    elif rep[1] is not None:
+                        h = _clone_child(rep[0], rep[1], got[1])
+                        if h is not None:
+                            made[1] += 1
+                            graphs.append(h)
+                            results.append(kw["out"])
+                            return kw["out"]
             s = self._harvest_stream()
             s.wait_stream(torch.cuda.current_stream())
             gen = torch.cuda.default_generators[self.device_index]
@@ -6083,6 +6280,9 @@ class DynaGraphRunner:
                     r = fn(*a, **_on_current_stream(kw))
                 finally:
                     g.capture_end()
+            made[0] += 1
+            if first is not None:
+                self._reps[first[0]] = (g, _clone_plan(g.raw_cuda_graph(), first[1]))
             if ranges is not None:
                 every = mode == "classify"
                 got = self._foreign_pointers(g.raw_cuda_graph(), *ranges, every)
@@ -6122,6 +6322,13 @@ class DynaGraphRunner:
                 self._run_intercepted(shaped, views, on_extern)
         except Unsupported as exc:
             return _fallback("extern-harvest", str(exc))
+        if cloning:
+            log.info(
+                "DynaGraph harvest at %s captured %d sites, cloned %d",
+                env,
+                made[0],
+                made[1],
+            )
         if ranges is not None:
             log.info(
                 "DynaGraph capture check read %d kernel nodes, could not read %d",

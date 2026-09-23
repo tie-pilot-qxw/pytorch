@@ -2236,6 +2236,15 @@ class triton:
         "TORCHINDUCTOR_DYNAGRAPH_CHECK_CAPTURE", "off"
     )
 
+    # Whether a harvest captures a library extern call (cuBLAS, cuDNN) once
+    # per argument signature instead of once per call site: the other sites
+    # with that signature -- the same projection in every layer -- get a clone
+    # of that capture with their operand addresses written into its kernel
+    # parameters. The calls still run once each; only the capture is shared.
+    dynagraph_clone_sites: bool = (
+        os.environ.get("TORCHINDUCTOR_DYNAGRAPH_CLONE_SITES", "0") == "1"
+    )
+
     # Whether a kernel taking a host-built TMA descriptor is patched like any
     # other kernel (the descriptor is rebuilt per shape from the producer's
     # declaration, `torch.utils._capture_tma`) instead of becoming an opaque
