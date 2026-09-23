@@ -137,7 +137,13 @@ def bucket_of(int_key: tuple[int, ...] | int | None, ratio: float) -> Any:
 
 
 # --------------------------------------------------------------- extraction
-def _split_args(argstr: str) -> list[str]:
+def _split_args(argstr: str, keep_kw: bool = False) -> list[str]:
+    """Top-level comma-separated pieces of an argument list.
+
+    Keyword arguments are dropped unless `keep_kw`: the launch lines this was
+    written for carry keywords (`stream=`) that are not kernel arguments. An
+    extern call's `out=` is an operand, so building a call keeps them.
+    """
     out: list[str] = []
     depth = 0
     cur: list[str] = []
@@ -153,6 +159,8 @@ def _split_args(argstr: str) -> list[str]:
             cur.append(ch)
     if cur:
         out.append("".join(cur).strip())
+    if keep_kw:
+        return [a for a in out if a]
     return [a for a in out if a and "=" not in a.split("(")[0]]
 
 
@@ -2974,6 +2982,10 @@ def _is_eager_site(name: str) -> bool:
 # one is dropped (`config.triton.dynagraph_max_graphs`).
 
 
+# `_site_operands`: an argument it could not build, as distinct from one whose
+# value is legitimately None.
+_UNBUILT = object()
+
 # Graph node types, as far as this module names them.
 _NODE_TYPE = {0: "kernel", 1: "memcpy", 2: "memset", 3: "host", 4: "child-graph"}
 
@@ -4209,6 +4221,9 @@ class DynaGraphRunner:
         # extern_kernels.* call sites, in order. Each becomes a child-graph
         # node; see `_harvest` and `_capture`.
         self.extern_sites = [n for n, _o, _a in sites]
+        # The argument text of each site as written, so its operands can be
+        # built from the text and the arena layout (`_site_operands`).
+        self.site_args = [a for _n, _o, a in sites]
         # What each site's capture depends on beyond shapes and addresses,
         # as the operator declared it (`torch.utils._capture_deps`): named in
         # the wrapper, evaluated per call.
@@ -5082,6 +5097,101 @@ class DynaGraphRunner:
             tuple(self.in_ptrs[j] or 0 for j in self.extern_read),
             deps,
         )
+
+    def _site_operands(
+        self, i: int, env: dict[str, int], views: list[Any], args: list[Any]
+    ) -> tuple[list[Any], dict[str, Any]] | None:
+        """The arguments site `i` is called with at this shape, built from the
+        call's text instead of by running the wrapper up to it.
+
+        What a capture of an extern call depends on is the geometry, dtype and
+        address of what it is handed, never the values: a kernel launched
+        inside a stream capture is recorded, not run. Every one of those is a
+        function of the shape alone -- an arena buffer's view at this layout,
+        an input as the region holds it, a `reinterpret_tensor` of either -- so
+        they can be had without executing the kernels upstream of the site.
+
+        `views` is `_arena_views(env)` and `args` the inputs as the region
+        holds them, the same two things a harvest runs the wrapper with.
+        None when an argument is something this does not build (an extern
+        call's own return value, an expression it does not recognise).
+        """
+        import ast
+
+        text = self.site_args[i]
+        depth, j = 1, 0
+        while j < len(text) and depth:
+            if text[j] == "(":
+                depth += 1
+            elif text[j] == ")":
+                depth -= 1
+            j += 1
+        if depth:
+            return None
+        by_name = dict(zip(self.alloc_order, views))
+        reinterpret = self.model.__globals__["reinterpret_tensor"]
+
+        def tensor_of(name: str) -> Any:
+            if name in by_name:
+                return by_name[name]
+            if name in self.argv and self.argv[name] < len(args):
+                return args[self.argv[name]]
+            return None
+
+        def build(v: str) -> Any:
+            v = v.strip()
+            m = re.match(r"reinterpret_tensor\((.*)\)\s*$", v, re.DOTALL)
+            if m:
+                parts = [x.strip() for x in _split_args(m.group(1))]
+                if len(parts) != 4:
+                    return _UNBUILT
+                base = build(parts[0])
+                sizes = _eval_ints(_split_args(parts[1].strip()[1:-1]), env)
+                strides = _eval_ints(_split_args(parts[2].strip()[1:-1]), env)
+                off = _eval_int(parts[3], env)
+                if base is _UNBUILT or sizes is None or strides is None or off is None:
+                    return _UNBUILT
+                return reinterpret(base, sizes, strides, off)
+            if re.fullmatch(r"\w+", v):
+                owner = self.alias.get(v, v)
+                t = tensor_of(owner)
+                if t is None:
+                    t = tensor_of(v)
+                if t is None:
+                    try:
+                        return ast.literal_eval(v)
+                    except (ValueError, SyntaxError):
+                        return _UNBUILT
+                geo = self.views.get(v)
+                if geo is None:
+                    return t
+                sizes = _eval_ints(geo[0], env)
+                strides = _eval_ints(geo[1], env)
+                off = _eval_int(geo[2], env)
+                if sizes is None or strides is None or off is None:
+                    return _UNBUILT
+                return reinterpret(t, sizes, strides, off)
+            try:
+                return ast.literal_eval(v)
+            except (ValueError, SyntaxError):
+                return _UNBUILT
+
+        pos: list[Any] = []
+        kw: dict[str, Any] = {}
+        for a in _split_args(text[: j - 1], keep_kw=True):
+            a = a.strip()
+            if not a:
+                continue
+            m = re.match(r"^(\w+)\s*=(?!=)\s*(.*)$", a, re.DOTALL)
+            key, v = (m.group(1), m.group(2)) if m else (None, a)
+            val = build(v)
+            if val is _UNBUILT:
+                return None
+            if key is None:
+                pos.append(val)
+            else:
+                kw[key] = val
+        return pos, kw
 
     def _refuse_deps(self, key: Any, env: Any) -> bool:
         """Hand this call back because an operator would not name its identity.
