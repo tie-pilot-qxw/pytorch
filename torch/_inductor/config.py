@@ -2245,6 +2245,13 @@ class triton:
         os.environ.get("TORCHINDUCTOR_DYNAGRAPH_CLONE_SITES", "0") == "1"
     )
 
+    # Whether an extern call whose operator declared its kernel launches
+    # (`torch.utils._capture_launch`) is captured inline and rewritten per
+    # call from the declaration, instead of harvested into a child graph.
+    dynagraph_declared_launches: bool = (
+        os.environ.get("TORCHINDUCTOR_DYNAGRAPH_DECLARED_LAUNCHES", "1") == "1"
+    )
+
     # Whether a kernel taking a host-built TMA descriptor is patched like any
     # other kernel (the descriptor is rebuilt per shape from the producer's
     # declaration, `torch.utils._capture_tma`) instead of becoming an opaque

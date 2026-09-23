@@ -2200,9 +2200,54 @@ _PY_COMPARE: dict[Any, Any] = {
 }
 
 
+_ARITH_NODES = (
+    ast.Expression,
+    ast.Constant,
+    ast.Name,
+    ast.Load,
+    ast.BinOp,
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.FloorDiv,
+    ast.Mod,
+    ast.UnaryOp,
+    ast.USub,
+    ast.IfExp,
+)
+
+
+@functools.cache
+def _compiled_expr(expr: str) -> Any:
+    """`expr` compiled, when it is plain arithmetic `eval` gives the same
+    answer for as `_eval_int`'s walk; None otherwise. The walk is what every
+    layout and operand evaluation paid per expression per shape."""
+    node = _parse_expr(expr)
+    if node is None:
+        return None
+    for n in ast.walk(node):
+        if not isinstance(n, _ARITH_NODES):
+            return None
+        if isinstance(n, ast.Constant) and (
+            isinstance(n.value, bool) or not isinstance(n.value, (int, float))
+        ):
+            return None
+    return compile(node, "<dynagraph-expr>", "eval")
+
+
 def _eval_int(expr: str, env: dict[str, int]) -> int | None:
     """Evaluate an arithmetic expression over symbol values, or None if it is
     not a plain arithmetic expression."""
+    code = _compiled_expr(expr)
+    if code is not None:
+        try:
+            v = eval(code, {"__builtins__": {}}, env)
+        except (NameError, ZeroDivisionError, TypeError):
+            return None
+        if isinstance(v, float):
+            return int(v) if v == int(v) else None
+        return v
     node = _parse_expr(expr)
     if node is None:
         return None
@@ -3147,6 +3192,42 @@ def extern_site_outputs(
     return [out for _, out in _site_calls(src, entry, opaque)]
 
 
+# Operator site name -> the variants set up in this process (`_ensure_prepared`).
+# Process-wide, like the compile caches it stands for.
+_PREPARED: dict[str, OrderedSet[Any]] = {}
+
+
+_OPS_CALL = re.compile(r"torch\.ops\.(\w+)\.(\w+)\.\w+\s*\(")
+
+
+def _declared_call(line: str) -> bool:
+    """Whether a wrapper line calls an operator that declared its launches."""
+    from torch.utils import _capture_launch
+
+    m = _OPS_CALL.search(line.split("#", 1)[0])
+    return (
+        m is not None
+        and _capture_launch.lookup(f"{m.group(1)}::{m.group(2)}") is not None
+    )
+
+
+def _inline_declarations(sites: list[str]) -> dict[int, Any]:
+    """Site -> launch declaration, for the `ops:` sites whose operator made one."""
+    from torch._inductor import config
+    from torch.utils import _capture_launch
+
+    if not config.triton.dynagraph_declared_launches:
+        return {}
+    out = {}
+    for i, name in enumerate(sites):
+        parts = name[4:].split(".") if name.startswith("ops:") else []
+        if len(parts) == 3:
+            d = _capture_launch.lookup(f"{parts[0]}::{parts[1]}")
+            if d is not None:
+                out[i] = d
+    return out
+
+
 def _resolve_op(path: str) -> Any:
     """`torch.ops.<ns>.<op>.<overload>` for a dotted `ns.op.overload`."""
     import torch
@@ -3752,6 +3833,13 @@ class _Exec:
         self.site_cond: list[int] = []
         self.site_held: list[list[int | None]] = []
         self.site_applied_raw: list[list[int | None]] = []
+        # Per inline site: its nodes in this graph, the cluster shape each was
+        # captured with (a launch attribute no parameter update can change),
+        # what they were last rewritten for, and whether they are disabled.
+        self.inline_nodes: dict[int, list[Any]] = {}
+        self.inline_cluster: dict[int, list[Any]] = {}
+        self.inline_applied: dict[int, Any] = {}
+        self.inline_off: OrderedSet[int] = OrderedSet()
         # Shapes whose replay has already been checked against eager.
         self.verified: OrderedSet[Any] = OrderedSet()
         # Host-side path: the patcher's per-exec state (`dg_init`), and the
@@ -4232,6 +4320,7 @@ class DynaGraphRunner:
             self.argv, self.input_bufs = {}, OrderedSet()
             self.in_ptrs = (ctypes.c_void_p * 1)()
             self.extern_sites, self.alloc_order = [], []
+            self.inline_sites = {}
             self.eager_sites = []
             self.ext_slots = []
             self.exact = True
@@ -4384,6 +4473,11 @@ class DynaGraphRunner:
         # The argument text of each site as written, so its operands can be
         # built from the text and the arena layout (`_site_operands`).
         self.site_args = [a for _n, _o, a in sites]
+        # The buffer each site's result is assigned to, if any, and for an
+        # inline site the result its capture returned: a later site handed
+        # that name gets that tensor (`_site_operands`).
+        self.site_out = [o for _n, o, _a in sites]
+        self._inline_rets: dict[str, Any] = {}
         # What each site's capture depends on beyond shapes and addresses,
         # as the operator declared it (`torch.utils._capture_deps`): named in
         # the wrapper, evaluated per call.
@@ -4391,7 +4485,23 @@ class DynaGraphRunner:
         # The sites that own a child graph. A torch.cond branch is captured
         # into the conditional's body instead, so its nodes are patched per
         # shape like any other and a new shape needs no harvest of it.
-        self.child_sites = [n for n in self.extern_sites if not n.startswith("cond:")]
+        # Sites whose operator declared its launches
+        # (`torch.utils._capture_launch`): captured inline, their kernels are
+        # ordinary nodes of the main graph, rewritten per call from the
+        # declaration. No child graph, and nothing to harvest at a new shape.
+        self.inline_sites = _inline_declarations(self.extern_sites)
+        self.child_sites = [
+            n
+            for i, n in enumerate(self.extern_sites)
+            if not n.startswith("cond:") and i not in self.inline_sites
+        ]
+        # Per harvest key, the operands of every inline site; per (site,
+        # harvest key, declared key), the node parameters prepared from its
+        # declaration; per declared kernel name, the function it resolved to.
+        self._inline_ops: dict[Any, dict[int, tuple[list[Any], dict[str, Any]]]] = {}
+        self._inline_prepared: dict[Any, tuple[Any, Any]] = {}
+        self._site_code: dict[int, tuple[Any, OrderedSet[str]]] = {}
+        self._kernel_funcs: dict[Any, int] = {}
         # Device path: where in the `setctx` values the "inputs moved" flag
         # sits (the input addresses follow it, one per argument position).
         self._ctx_in0 = (
@@ -4825,6 +4935,12 @@ class DynaGraphRunner:
                 for line in body.splitlines()
                 if not _is_item_line(line) and not line.lstrip().startswith("assert_")
             )
+        if config.triton.dynagraph_declared_launches:
+            # A call to an operator that declared its launches is inline: its
+            # nodes are rewritten per call like the region's own kernels.
+            body = "\n".join(
+                line for line in body.splitlines() if not _declared_call(line)
+            )
         if unreachable_launch(body, config.triton.dynagraph_extern_child):
             return "extern-launch"
         return None
@@ -5196,7 +5312,7 @@ class DynaGraphRunner:
             max(offsets[-1], 1024), dtype=torch.uint8, device=self.device
         )
         self.lanes, self.lane = [self.arena], 0
-        if self.extern_sites:
+        if len(self.inline_sites) < len(self.extern_sites):
             key = tuple(
                 sorted((s, v) for s, v in env.items() if s in self.sym_from_input)
             )
@@ -5206,6 +5322,8 @@ class DynaGraphRunner:
             if not self._harvest(env, key, hkey, inputs):
                 return False
 
+        if self.inline_sites and not self._prepare_for_capture(env, inputs):
+            return False
         return (
             self._capture() and self._replays_match(env) and self._branches_match(env)
         )
@@ -5265,7 +5383,7 @@ class DynaGraphRunner:
         )
 
     def _site_operands(
-        self, i: int, env: dict[str, int], views: list[Any], args: list[Any]
+        self, i: int, env: dict[str, int], view_of: Any, args: list[Any]
     ) -> tuple[list[Any], dict[str, Any]] | None:
         """The arguments site `i` is called with at this shape, built from the
         call's text instead of by running the wrapper up to it.
@@ -5277,87 +5395,83 @@ class DynaGraphRunner:
         an input as the region holds it, a `reinterpret_tensor` of either -- so
         they can be had without executing the kernels upstream of the site.
 
-        `views` is `_arena_views(env)` and `args` the inputs as the region
-        holds them, the same two things a harvest runs the wrapper with.
-        None when an argument is something this does not build (an extern
-        call's own return value, an expression it does not recognise).
+        `view_of(name)` is an arena buffer's view at this shape's layout (None
+        for a name that is not one) and `args` the inputs as the region holds
+        them. The call's text is compiled once; per shape only the names it
+        mentions are resolved. None when a name is something this does not
+        build (another extern call's result, unless inline).
         """
-        import ast
-
-        text = self.site_args[i]
-        depth, j = 1, 0
-        while j < len(text) and depth:
-            if text[j] == "(":
-                depth += 1
-            elif text[j] == ")":
-                depth -= 1
-            j += 1
-        if depth:
-            return None
-        by_name = dict(zip(self.alloc_order, views))
+        compiled = self._site_code.get(i)
+        if compiled is None:
+            text = self.site_args[i]
+            depth, j = 1, 0
+            while j < len(text) and depth:
+                if text[j] == "(":
+                    depth += 1
+                elif text[j] == ")":
+                    depth -= 1
+                j += 1
+            if depth:
+                return None
+            try:
+                tree = ast.parse(f"__call({text[: j - 1]})", mode="eval")
+            except SyntaxError:
+                return None
+            names = OrderedSet(
+                n.id
+                for n in ast.walk(tree)
+                if isinstance(n, ast.Name)
+                and n.id not in ("__call", "reinterpret_tensor")
+            )
+            compiled = self._site_code[i] = (
+                compile(tree, "<dynagraph-site>", "eval"),
+                names,
+            )
+        code, names = compiled
         reinterpret = self.model.__globals__["reinterpret_tensor"]
 
         def tensor_of(name: str) -> Any:
-            if name in by_name:
-                return by_name[name]
+            t = view_of(name)
+            if t is not None:
+                return t
+            if name in self._inline_rets:
+                return self._inline_rets[name]
             if name in self.argv and self.argv[name] < len(args):
                 return args[self.argv[name]]
             return None
 
-        def build(v: str) -> Any:
-            v = v.strip()
-            m = re.match(r"reinterpret_tensor\((.*)\)\s*$", v, re.DOTALL)
-            if m:
-                parts = [x.strip() for x in _split_args(m.group(1))]
-                if len(parts) != 4:
-                    return _UNBUILT
-                base = build(parts[0])
-                sizes = _eval_ints(_split_args(parts[1].strip()[1:-1]), env)
-                strides = _eval_ints(_split_args(parts[2].strip()[1:-1]), env)
-                off = _eval_int(parts[3], env)
-                if base is _UNBUILT or sizes is None or strides is None or off is None:
-                    return _UNBUILT
-                return reinterpret(base, sizes, strides, off)
-            if re.fullmatch(r"\w+", v):
-                owner = self.alias.get(v, v)
-                t = tensor_of(owner)
-                if t is None:
-                    t = tensor_of(v)
-                if t is None:
-                    try:
-                        return ast.literal_eval(v)
-                    except (ValueError, SyntaxError):
-                        return _UNBUILT
-                geo = self.views.get(v)
-                if geo is None:
-                    return t
+        ns: dict[str, Any] = {
+            "__builtins__": {},
+            "__call": lambda *a, **k: (list(a), k),
+            "reinterpret_tensor": reinterpret,
+        }
+        for v in names:
+            if v in env:
+                ns[v] = env[v]
+                continue
+            if v == "torch":
+                import torch
+
+                ns[v] = torch
+                continue
+            t = tensor_of(self.alias.get(v, v))
+            if t is None:
+                t = tensor_of(v)
+            if t is None:
+                return None
+            geo = self.views.get(v)
+            if geo is not None:
                 sizes = _eval_ints(geo[0], env)
                 strides = _eval_ints(geo[1], env)
                 off = _eval_int(geo[2], env)
                 if sizes is None or strides is None or off is None:
-                    return _UNBUILT
-                return reinterpret(t, sizes, strides, off)
-            try:
-                return ast.literal_eval(v)
-            except (ValueError, SyntaxError):
-                return _UNBUILT
-
-        pos: list[Any] = []
-        kw: dict[str, Any] = {}
-        for a in _split_args(text[: j - 1], keep_kw=True):
-            a = a.strip()
-            if not a:
-                continue
-            m = re.match(r"^(\w+)\s*=(?!=)\s*(.*)$", a, re.DOTALL)
-            key, v = (m.group(1), m.group(2)) if m else (None, a)
-            val = build(v)
-            if val is _UNBUILT:
-                return None
-            if key is None:
-                pos.append(val)
-            else:
-                kw[key] = val
-        return pos, kw
+                    return None
+                t = reinterpret(t, sizes, strides, off)
+            ns[v] = t
+        try:
+            return eval(code, ns)
+        except Exception:
+            return None
 
     def _refuse_deps(self, key: Any, env: Any) -> bool:
         """Hand this call back because an operator would not name its identity.
@@ -5672,25 +5786,26 @@ class DynaGraphRunner:
 
     def _arena_views(self, env: dict[str, int]) -> list[Any] | None:
         """One tensor per allocation, in source order, at this shape's layout."""
-        import torch
-
         offsets = self.slot_offsets(env)
         if offsets is None or offsets[self.n_slots] > self.arena.numel():
             return None
-        views = []
-        for name in self.alloc_order:
-            span, itemsize = self.sizes[name]
-            sizes_e, strides_e, dtype_name = self.layouts[name]
-            vals = [_eval_int(e, env) for e in (span, *sizes_e, *strides_e)]
-            if any(v is None for v in vals):
-                return None
-            ints = [v for v in vals if v is not None]
-            n, rest = ints[0], ints[1:]
-            base = offsets[self.slot_of[name]]
-            dtype = getattr(torch, dtype_name.split(".")[-1])
-            flat = self.arena[base : base + n * itemsize].view(dtype)
-            views.append(flat.as_strided(rest[: len(sizes_e)], rest[len(sizes_e) :]))
-        return views
+        views = [self._arena_view(name, env, offsets) for name in self.alloc_order]
+        return None if any(v is None for v in views) else views
+
+    def _arena_view(self, name: str, env: dict[str, int], offsets: list[int]) -> Any:
+        """Allocation `name` as a tensor over the arena at this shape's layout."""
+        import torch
+
+        span, itemsize = self.sizes[name]
+        sizes_e, strides_e, dtype_name = self.layouts[name]
+        vals = _eval_ints([span, *sizes_e, *strides_e], env)
+        if vals is None:
+            return None
+        n, rest = vals[0], vals[1:]
+        base = offsets[self.slot_of[name]]
+        dtype = getattr(torch, dtype_name.split(".")[-1])
+        flat = self.arena[base : base + n * itemsize].view(dtype)
+        return flat.as_strided(rest[: len(sizes_e)], rest[len(sizes_e) :])
 
     def _desc_sources(self, env: dict[str, int], inputs: list[Any]) -> Any:
         """The tensor behind every declared TMA descriptor, in patcher order.
@@ -6189,6 +6304,13 @@ class DynaGraphRunner:
         made = [0, 0]
 
         def on_extern(i: int, fn: Any, a: Any, kw: Any) -> Any:
+            if i in self.inline_sites:
+                # Nothing of its own to harvest; run so that what follows it
+                # in the wrapper gets its result.
+                r = fn(*a, **_on_current_stream(kw))
+                graphs.append(None)
+                results.append(r)
+                return r
             if self.extern_sites[i] in _NOOP_OPS:
                 r = a[0] if a else None
                 graphs.append(None)
@@ -6513,7 +6635,12 @@ class DynaGraphRunner:
         """What extern slot `slot` holds at `hkey`: a site's result, or one
         element of a tuple-valued one."""
         site, elem = self.ext_slots[slot]
-        t = self.extern_outs[hkey][site]
+        if site in self.inline_sites:
+            # Captured inline: its result is the one its capture returned,
+            # held by the graph's pool, whatever the shape.
+            t = self._inline_rets.get(self.site_out[site])
+        else:
+            t = self.extern_outs[hkey][site]
         if elem is not None and isinstance(t, (tuple, list)):
             return t[elem] if elem < len(t) else None
         return t
@@ -6779,8 +6906,9 @@ class DynaGraphRunner:
                 ext = (ctypes.c_void_p * max(len(self.ext_slots), 1))(
                     *self._ext_ptrs(hkey)
                 )
+                # No harvest when every site is inline: no child to swap.
                 child = (ctypes.c_void_p * n_s)(
-                    *[(g or 0) for g in self.child_graphs[hkey]]
+                    *[(g or 0) for g in self.child_graphs.get(hkey, [None] * n_s)]
                 )
             else:
                 ext = child = None
@@ -7152,8 +7280,10 @@ class DynaGraphRunner:
         # cudaGraphExecChildGraphNodeSetParams finds the node in the exec by
         # the handle taken at capture, which dangles once the graph is freed
         # (it fails with invalid argument, whatever the topology).
-        with_children = bool(self.extern_sites)
-        graph = torch.cuda.CUDAGraph(keep_graph=with_children)
+        with_children = len(self.inline_sites) < len(self.extern_sites)
+        graph = torch.cuda.CUDAGraph(
+            keep_graph=with_children or bool(self.inline_sites)
+        )
         if with_children:
             build_key = key if key is not None else next(iter(self.child_graphs))
         else:
@@ -7168,6 +7298,8 @@ class DynaGraphRunner:
 
             from torch.cuda._utils import _check_cuda_bindings as ck
 
+            if i in self.inline_sites:
+                return self._capture_inline(i, fn, a, kw)
             cinfo = self.cond_of.get(i)
             if cinfo is not None:
                 ci, b, n_b = cinfo
@@ -7328,7 +7460,7 @@ class DynaGraphRunner:
                         self.ex.ctx.data_ptr(),
                         raw,
                     )
-                if with_children or self.dev is not None:
+                if self.extern_sites or self.dev is not None:
                     # Allocations still come from the graph pool here; only
                     # the extern calls are redirected. Their harvested graphs
                     # already carry arena addresses, and the Triton nodes are
@@ -7338,7 +7470,7 @@ class DynaGraphRunner:
                     self._run_intercepted(list(args), self._pool_allocs(), on_extern)
                 else:
                     self.model(list(args))
-            if with_children or host:
+            if with_children or host or self.inline_sites:
                 graph.instantiate()
             handles = [] if host else launcher._end_device_node_collection()
         except Exception as exc:
@@ -7430,6 +7562,255 @@ class DynaGraphRunner:
         except Exception as exc:
             return _fallback("upload-failed", f"{type(exc).__name__}: {exc}")
         return True
+
+    def _prepare_for_capture(self, env: dict[str, int], inputs: list[Any]) -> bool:
+        """Every inline site's variant at the build shape, set up before the
+        capture that runs them inline."""
+        offsets = self.slot_offsets(env)
+        if offsets is None:
+            return _fallback("unevaluable-size", f"inline prepare at {env}")
+        memo: dict[str, Any] = {}
+
+        def view_of(name: str) -> Any:
+            if name not in memo:
+                memo[name] = (
+                    self._arena_view(name, env, offsets)
+                    if name in self.slot_of
+                    else None
+                )
+            return memo[name]
+
+        shaped = self._shape_inputs(inputs)
+        for i, decl in self.inline_sites.items():
+            got = self._site_operands(i, env, view_of, shaped)
+            if got is None:
+                # A result of an earlier inline site, known only once it has
+                # been captured; `_prepare_inline` sets it up at first use.
+                continue
+            self._ensure_prepared(i, decl, *got)
+        return True
+
+    def _capture_inline(self, i: int, fn: Any, a: Any, kw: Any) -> Any:
+        """Run a declared operator inside the main capture and note its nodes.
+
+        Its kernels become ordinary nodes of the graph. The call is also the
+        first check of the declaration: what it declares for these very
+        arguments must be what it just launched, byte for byte, or the region
+        is refused rather than served from a declaration that is wrong.
+        """
+        from cuda.bindings import runtime as cr
+
+        import torch
+        from torch.cuda._utils import _check_cuda_bindings as ck
+        from torch.utils import _capture_launch as cl
+
+        st = torch.cuda.current_stream().cuda_stream
+        before = OrderedSet(
+            int(d) for d in ck(cr.cudaStreamGetCaptureInfo(st))[3] or ()
+        )
+        out = fn(*a, **kw)
+        # The nodes the call added: everything reachable backwards from the
+        # capture's new frontier without crossing the old one.
+        seen: dict[int, Any] = {}
+        todo = [
+            n
+            for n in ck(cr.cudaStreamGetCaptureInfo(st))[3] or ()
+            if int(n) not in before
+        ]
+        while todo:
+            n = todo.pop()
+            if int(n) in seen or int(n) in before:
+                continue
+            seen[int(n)] = n
+            cnt = int(ck(cr.cudaGraphNodeGetDependencies(n))[2])
+            todo += list(ck(cr.cudaGraphNodeGetDependencies(n, cnt))[0]) if cnt else []
+        try:
+            nodes = cl._chain_order(list(seen.values()))
+            recorded = [cl.read_node(n) for n in nodes]
+            if any(r is None for r in recorded):
+                raise cl.Mismatch("the call added a node that is not a kernel")
+            decl = self.inline_sites[i]
+            # A recorded declaration would only record this same call again.
+            if not getattr(decl.launches, "records", False):
+                launches = decl.launches(*a, **kw)
+                funcs = cl.check(launches, recorded, decl.exact)  # type: ignore[arg-type]
+                for launch, f in zip(launches, funcs):
+                    if not isinstance(launch.kernel, int):
+                        self._kernel_funcs[launch.kernel] = f
+        except cl.Mismatch as exc:
+            raise Unsupported(f"{self.extern_sites[i]}: {exc}") from exc
+        name = self.site_out[i]
+        if name is not None:
+            self._inline_rets[name] = out
+        self.ex.inline_nodes[i] = nodes
+        self.ex.inline_cluster[i] = [r.cluster for r in recorded]  # type: ignore[union-attr]
+        self.ex.child_nodes.append(None)
+        self.ex.site_body_nodes.append([None])
+        self.ex.site_cond.append(0)
+        self.ex.site_held.append([None])
+        return out
+
+    def _apply_inline(
+        self,
+        ex: Any,
+        env: dict[str, int],
+        hkey: Any,
+        inputs: list[Any],
+        offsets: list[int],
+    ) -> bool:
+        """Rewrite every inline site's nodes for this call, where it moved.
+
+        A site is rewritten when its harvest key or what its operator's `key`
+        returns has changed since the last call this graph served; otherwise
+        nothing is done. The operands are built once per harvest key from the
+        call's text and the arena layout, not by running the wrapper.
+        """
+        from cuda.bindings import driver as cu
+
+        from torch.cuda._utils import _check_cuda_bindings as ck
+        from torch.utils import _capture_launch as cl
+
+        ops = self._inline_ops.get(hkey)
+        if ops is None:
+            memo: dict[str, Any] = {}
+
+            def view_of(name: str) -> Any:
+                if name not in memo:
+                    memo[name] = (
+                        self._arena_view(name, env, offsets)
+                        if name in self.slot_of
+                        else None
+                    )
+                return memo[name]
+
+            shaped = self._shape_inputs(inputs)
+            ops = {}
+            for i in self.inline_sites:
+                got = self._site_operands(i, env, view_of, shaped)
+                if got is None:
+                    return _fallback("inline-operands", self.extern_sites[i])
+                ops[i] = got
+            if len(self._inline_ops) >= 1024:
+                self._inline_ops.clear()
+            self._inline_ops[hkey] = ops
+        for i, decl in self.inline_sites.items():
+            a, kw = ops[i]
+            want = (hkey, decl.key(*a, **kw) if decl.key is not None else None)
+            if ex.inline_applied.get(i) == want:
+                continue
+            prepared = self._inline_prepared.get((i, want))
+            if prepared is None:
+                try:
+                    prepared = self._prepare_inline(i, ex, decl, a, kw)
+                except cl.Mismatch as exc:
+                    return _fallback(
+                        "launch-declaration", f"{self.extern_sites[i]}: {exc}"
+                    )
+                if len(self._inline_prepared) >= 4096:
+                    self._inline_prepared.clear()
+                self._inline_prepared[(i, want)] = prepared
+            params, _keep = prepared
+            nodes = ex.inline_nodes[i]
+            if params is None:
+                # Declared to launch nothing this time.
+                if i not in ex.inline_off:
+                    for n in nodes:
+                        ck(cu.cuGraphNodeSetEnabled(ex.exec_h, int(n), 0))
+                    ex.inline_off.add(i)
+            else:
+                for n, p in zip(nodes, params):
+                    ck(cu.cuGraphExecKernelNodeSetParams(ex.exec_h, int(n), p))
+                if i in ex.inline_off:
+                    for n in nodes:
+                        ck(cu.cuGraphNodeSetEnabled(ex.exec_h, int(n), 1))
+                    ex.inline_off.discard(i)
+            ex.inline_applied[i] = want
+        return True
+
+    def _ensure_prepared(self, i: int, decl: Any, a: Any, kw: Any) -> None:
+        """Run the operator's one-time set-up for this call's variant, once.
+
+        JIT compilation, autotuning, library initialisation: work a capture
+        cannot contain and a replay must not repeat. Once per (operator,
+        variant) for the process, never inside a capture -- the warm-up an
+        engine does before capturing a backend, done per variant instead of
+        per captured size. An operator that declared no `prepare` is run once
+        instead.
+        """
+        name = self.extern_sites[i]
+        v = decl.variant(*a, **kw) if decl.variant is not None else None
+        done = _PREPARED.setdefault(name, OrderedSet())
+        if v in done:
+            return
+        if self._capturing:
+            raise Unsupported(f"{name}: variant {v!r} first met inside a capture")
+        if decl.prepare is not None:
+            decl.prepare(*a, **kw)
+        else:
+            _resolve_op(name[4:])(*a, **kw)
+        done.add(v)
+        log.info("DynaGraph prepared %s variant %r", name, v)
+
+    def _prepare_inline(
+        self, i: int, ex: Any, decl: Any, a: Any, kw: Any
+    ) -> tuple[Any, Any]:
+        """Node parameters for site `i` from its declaration.
+
+        The variant is set up first (`_ensure_prepared`); a kernel the
+        declaration names that this process has not resolved is then learned
+        from a recording of this very call. So the cost of a new kernel is
+        paid once per kernel, not per shape.
+        """
+        import ctypes as ct
+
+        from cuda.bindings import driver as cu
+
+        from torch.utils import _capture_launch as cl
+
+        self._ensure_prepared(i, decl, a, kw)
+        launches = decl.launches(*a, **kw)
+        if not launches:
+            return None, None
+        nodes = ex.inline_nodes[i]
+        if len(launches) != len(nodes):
+            raise cl.Mismatch(
+                f"{len(launches)} launches where the graph holds {len(nodes)} nodes"
+            )
+        unknown = [
+            L
+            for L in launches
+            if not isinstance(L.kernel, int) and L.kernel not in self._kernel_funcs
+        ]
+        if unknown:
+            # Resolution, not set-up: a kernel named by the declaration is
+            # found by recording this very call (host code only), which also
+            # checks the declaration once more.
+            fn = _resolve_op(self.extern_sites[i][4:])
+            for L, f in zip(
+                launches, cl.check(launches, cl.record(fn, *a, **kw), decl.exact)
+            ):
+                if not isinstance(L.kernel, int):
+                    self._kernel_funcs[L.kernel] = f
+        params, keep = [], []
+        for n, L in enumerate(launches):
+            if L.cluster != ex.inline_cluster[i][n]:
+                raise cl.Mismatch(
+                    f"launch {n} wants cluster {L.cluster}, captured with "
+                    f"{ex.inline_cluster[i][n]}; a graph update cannot change it"
+                )
+            f = L.kernel if isinstance(L.kernel, int) else self._kernel_funcs[L.kernel]
+            bufs = [ct.create_string_buffer(b, len(b)) for b in cl.pack(L, f)]
+            arr = (ct.c_void_p * max(len(bufs), 1))(*[ct.addressof(b) for b in bufs])
+            p = cu.CUDA_KERNEL_NODE_PARAMS()
+            p.func = f
+            p.gridDimX, p.gridDimY, p.gridDimZ = L.grid
+            p.blockDimX, p.blockDimY, p.blockDimZ = L.block
+            p.sharedMemBytes = L.smem
+            p.kernelParams = ct.addressof(arr)
+            p.extra = 0
+            params.append(p)
+            keep.append((bufs, arr, L.owner))
+        return params, keep
 
     def _hot_tables(self) -> tuple[Any, ...]:
         """The per-call tables, derived once from what the build settled."""
@@ -7642,6 +8023,8 @@ class DynaGraphRunner:
                     self._ex_of.clear()
                 self._ex_of[hkey] = ex
             self.ex = ex
+        if self.inline_sites and not self._apply_inline(ex, env, hkey, inputs, offsets):
+            return SKIP_SHAPE
         self.tick += 1
         ex.used = self.tick
 
