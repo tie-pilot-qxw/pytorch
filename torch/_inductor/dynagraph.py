@@ -7740,7 +7740,9 @@ class DynaGraphRunner:
             # handle for a planner to reach.
             return "host"
         gpu_us = self._gpu_time_us()
-        host_us = 0.5 * len(self.kernels) + 60.0
+        # The margin is the per-call Python around the patching; the C++
+        # runtime (`_rt_ext`) leaves a few microseconds of it.
+        host_us = 0.5 * len(self.kernels) + (5.0 if _rt_ext() is not None else 60.0)
         pick = "host" if gpu_us is not None and gpu_us >= host_us else "device"
         log.info(
             "DynaGraph update auto: %s (gpu %s us at the recorded shape, host patching ~%.0f us)",
@@ -9012,9 +9014,9 @@ class DynaGraphRunner:
         library's C describe. Only a region whose every extern call is inline
         and declares one; False (and not tried again) otherwise."""
         r = self._rt_region()
-        if r is None or not self.inline_sites or self.child_sites:
+        if r is None or self.child_sites:
             return False
-        if len(self.inline_sites) != len(self.extern_sites):
+        if len(self.inline_sites or {}) != len(self.extern_sites):
             return False
         try:
             self._rt_program_build(r)
@@ -9075,7 +9077,7 @@ class DynaGraphRunner:
         statics: list[bytes] = []
         n_ops: list[int] = []
         ops = {k: [] for k in ("kind", "slot", "pos", "item", "dt", "nd", "gat")}
-        for i, decl in self.inline_sites.items():
+        for i, decl in (self.inline_sites or {}).items():
             if (
                 decl.c_describe is None
                 or decl.c_statics is None
@@ -9223,7 +9225,7 @@ class DynaGraphRunner:
         r.clear_execs()
         ext = self._rt_ext_arr
         for ex in ready:
-            sites = list(self.inline_sites)
+            sites = list(self.inline_sites or {})
             r.add_exec(
                 ex,
                 int(ex.exec_h),

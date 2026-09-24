@@ -670,7 +670,7 @@ class Region {
     e.host = X->host;
     e.ext = X->ext;
     e.child = X->child;
-    e.has_inline = true;
+    e.has_inline = !P.sites.empty();
     e.own_batch = true;
     e.exec = X->exec;
     InlineBatch& b = e.batch;
