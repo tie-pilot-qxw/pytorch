@@ -127,6 +127,30 @@ class Declaration(NamedTuple):
     template: Callable[..., Hashable] | None = None
     sources: Callable[..., Any] | None = None
     share: bool = False
+    # The same declaration for a caller in C: the address of a function with
+    # the launch-describe ABI below, and `c_statics(*args, **kwargs)` (tensor
+    # arguments passed as None) giving the bytes it takes for the call's
+    # non-tensor arguments. A consumer that has the operands as raw pointers
+    # and geometry (DynaGraph's C++ runtime) then never goes through Python.
+    c_describe: int | None = None
+    c_statics: Callable[..., bytes] | None = None
+
+
+# The launch-describe ABI, v1 (C):
+#
+#   struct dg_operand { uint64_t ptr; int32_t dtype; int32_t ndim;
+#                       int64_t sizes[8]; int64_t strides[8]; };
+#   struct dg_launch  { uint64_t func; uint32_t grid[3], block[3];
+#                       uint32_t smem, cluster, pdl, nargs; };
+#   int describe(const dg_operand* ops, int nops, const char* statics,
+#                dg_launch* out, int max_launches, char* args, int64_t args_cap,
+#                uint32_t* arg_sizes, int sizes_cap, char* err, int err_cap);
+#
+# `ops` are the call's tensor arguments in order (dtype a c10::ScalarType,
+# strides in elements); nothing is launched. It returns the number of
+# launches, their parameter values back to back in `args` with one size per
+# parameter in `arg_sizes`; -1 when the operator raised (message in `err`),
+# -2 when a buffer is too small.
 
 
 _registry: dict[str, Declaration] = {}
@@ -143,6 +167,8 @@ def register(
     template: Callable[..., Hashable] | None = None,
     sources: Callable[..., Any] | None = None,
     share: bool = False,
+    c_describe: int | None = None,
+    c_statics: Callable[..., bytes] | None = None,
 ) -> None:
     """Declare the launches of operator `qualname` ("namespace::name")."""
     _registry[qualname] = Declaration(
@@ -154,6 +180,8 @@ def register(
         template,
         sources,
         share or template is not None,
+        c_describe,
+        c_statics,
     )
 
 

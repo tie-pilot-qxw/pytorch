@@ -1808,6 +1808,37 @@ extern "C" int dg_last_error(void) { return g_dg_err; }
 """
 
 
+def _layout_c(
+    sizes: dict[str, tuple[str, int]] | None,
+    slot_of: dict[str, int] | None,
+    sym_index: dict[str, int],
+    fixed_off: Sequence[int] | None,
+) -> list[str]:
+    """C statements setting `slot_off` (NSLOT + 1 entries, the total last)
+    from `syms`, with `acc` and `m` declared: the layout `slot_offsets`
+    computes, or the constants a fixed one chose."""
+    if not slot_of:
+        return []
+    n_slots = max(slot_of.values()) + 1
+    if fixed_off is not None:
+        return [f"  slot_off[{slot}] = {int(v)};" for slot, v in enumerate(fixed_off)]
+    per_slot: dict[int, list[str]] = {}
+    for name, (span, item) in (sizes or {}).items():
+        if name in slot_of:
+            per_slot.setdefault(slot_of[name], []).append(
+                f"({_expr_to_c(span, sym_index)}) * {int(item)}"
+            )
+    lines = []
+    for slot in range(n_slots):
+        terms = per_slot.get(slot, ["0"])
+        lines.append(f"  m = {terms[0]};")
+        for t in terms[1:]:
+            lines.append(f"  {{ int64_t v = {t}; if (v > m) m = v; }}")
+        lines.append(f"  slot_off[{slot}] = acc; acc += (m + 255) & ~(int64_t)255;")
+    lines.append(f"  slot_off[{n_slots}] = acc;")
+    return lines
+
+
 def generate_host_patcher(
     kernels: list[dict[str, Any]],
     symbols: list[str],
@@ -1833,28 +1864,7 @@ def generate_host_patcher(
     `fixed_off` bakes one chosen at build."""
     sym_index = {s: i for i, s in enumerate(symbols)}
     n_slots = (max(slot_of.values()) + 1) if slot_of else 0
-    layout_lines = []
-    if slot_of:
-        if fixed_off is not None:
-            layout_lines = [
-                f"  slot_off[{slot}] = {int(v)};" for slot, v in enumerate(fixed_off)
-            ]
-        else:
-            per_slot: dict[int, list[str]] = {}
-            for name, (span, item) in (sizes or {}).items():
-                if name in slot_of:
-                    per_slot.setdefault(slot_of[name], []).append(
-                        f"({_expr_to_c(span, sym_index)}) * {int(item)}"
-                    )
-            for slot in range(n_slots):
-                terms = per_slot.get(slot, ["0"])
-                layout_lines.append(f"  m = {terms[0]};")
-                for t in terms[1:]:
-                    layout_lines.append(f"  {{ int64_t v = {t}; if (v > m) m = v; }}")
-                layout_lines.append(
-                    f"  slot_off[{slot}] = acc; acc += (m + 255) & ~(int64_t)255;"
-                )
-            layout_lines.append(f"  slot_off[{n_slots}] = acc;")
+    layout_lines = _layout_c(sizes, slot_of, sym_index, fixed_off)
     alias = alias or {}
     extern_out_of = extern_out_of or {}
     argv = argv or {}
@@ -2130,6 +2140,31 @@ extern "C" int dg_inline_set(CUgraphExec ex, int n, const CUgraphNode* nodes,
 }
 
 extern "C" int dg_inline_error(void) { return g_inline_err; }
+"""
+
+
+_RT_GEOM_TEMPLATE = r"""
+#include <math.h>
+#include <stdint.h>
+
+static inline int64_t dg_floordiv(int64_t a, int64_t b) {
+  int64_t q = a / b; if ((a % b != 0) && ((a < 0) != (b < 0))) --q; return q;
+}
+static inline int64_t dg_mod(int64_t a, int64_t b) {
+  int64_t r = a % b; if (r != 0 && ((r < 0) != (b < 0))) r += b; return r;
+}
+static inline int64_t dg_min(int64_t a, int64_t b) { return a < b ? a : b; }
+static inline int64_t dg_max(int64_t a, int64_t b) { return a > b ? a : b; }
+#define S(i) (syms[(i)])
+
+// A region's arena layout and the geometry of its outputs and of every
+// inline site's operands, at the shape `syms` gives (`_rt_program`).
+extern "C" void dg_rt_geom(const int64_t* syms, int64_t* slot_off, int64_t* g) {
+  int64_t acc = 0, m;
+  (void)acc; (void)m; (void)syms; (void)slot_off; (void)g;
+/*@LAYOUT@*/
+/*@GEOM@*/
+}
 """
 
 
@@ -3983,6 +4018,33 @@ def _outs_ext() -> Any:
     return _outs_ext_state[0]
 
 
+_rt_ext_state: list[Any] = []
+
+
+def _rt_ext() -> Any:
+    """The C++ runtime that serves a call at a shape already prepared
+    (`dynagraph_rt.cpp`), or None when it cannot be built. One build per
+    machine: the source is fixed, everything per region is data."""
+    if not _rt_ext_state:
+        try:
+            from torch.utils.cpp_extension import load_inline
+
+            src = os.path.join(os.path.dirname(__file__), "dynagraph_rt.cpp")
+            with open(src) as fh:
+                code = fh.read()
+            ext = load_inline(
+                "dynagraph_rt",
+                cpp_sources=code,
+                with_cuda=True,
+                extra_cflags=["-O2"],
+            )
+        except Exception as exc:
+            log.warning("DynaGraph C++ runtime unavailable: %s", exc)
+            ext = None
+        _rt_ext_state.append(ext)
+    return _rt_ext_state[0]
+
+
 @functools.cache
 def _torch_dtype(name: str) -> Any:
     import torch
@@ -4851,6 +4913,16 @@ class DynaGraphRunner:
         # Per shape: the output tensors that do not depend on the call.
         # key -> (the outputs fixed per shape, the input-view outputs' geometry)
         self.out_cache: dict[Any, Any] = {}
+        # The C++ runtime's copy of this region (`_rt_region`): None until
+        # made, False where the region is not one it serves.
+        self._rt: Any = None
+        self._rt_protos: dict[Any, int] = {}
+        # Whether the runtime serves new shapes itself (`_rt_program`): None
+        # until tried; and how many graphs it was handed for them.
+        self._rt_prog: bool | None = None
+        self._rt_nexec = -1
+        self._rt_geom_lib: Any = None
+        self._rt_ext_arr: Any = None
         if self.dev is not None:
             self._dev_check(body, src)
         self.sym_index = {s: i for i, s in enumerate(self.symbols or [])}
@@ -6043,6 +6115,7 @@ class DynaGraphRunner:
         addresses they hold are stale (the arena moved). Shapes are
         harvested again as they recur; the graphs keep their nodes and get
         the new children swapped in."""
+        self._rt_clear()
         for d in (
             self.child_graphs,
             self.child_holds,
@@ -6120,6 +6193,9 @@ class DynaGraphRunner:
         self.input_store[j] = store
         self.static_inputs[j] = _store_view(store, x)
         self.in_ptrs[j] = store.data_ptr()
+        if self._rt:
+            self._rt.set_store(j, store)
+            self._rt.clear()
         # A harvest that captured the old copy is keyed by its address
         # (`_hkey`); the shape is harvested again at the new one.
 
@@ -6185,6 +6261,7 @@ class DynaGraphRunner:
             self.static_ptrs[i] = ptr
             self.static_inputs[i] = inputs[i]
             self.in_ptrs[i] = ptr
+        self._rt_sync_static()
         # Under the dynamic layout this is every shape change for a backward:
         # its static inputs are the forward's outputs, laid out per shape. A
         # harvest that captured another address for one an extern reads is
@@ -7106,6 +7183,7 @@ class DynaGraphRunner:
                 # is ever handed back to per-shape recording for this.
                 combo = min(self.execs, key=lambda c: self.execs[c].used)
                 gone = self.execs.pop(combo)
+                self._rt_clear()
                 for k2 in [k2 for k2, e2 in self._ex_of.items() if e2 is gone]:
                     del self._ex_of[k2]
                 self.host_args.clear()
@@ -8241,6 +8319,7 @@ class DynaGraphRunner:
             self._debug_node_map(graph.raw_cuda_graph())
         structure = tuple(tuple(ex.inline_cluster[i]) for i in self.inline_sites)
         self.execs[self._combo(build_key, structure)] = ex
+        self._rt_clear()
         self._ex_of.clear()
         self._structure_ex.clear()
         log.info(
@@ -8637,6 +8716,7 @@ class DynaGraphRunner:
             if len(self.execs) >= _max_graphs():
                 combo = min(self.execs, key=lambda c: self.execs[c].used)
                 self.execs.pop(combo)
+                self._rt_clear()
                 self._ex_of.clear()
                 self.host_args.clear()
             if not self._recapture(hkey, inputs):
@@ -8867,6 +8947,387 @@ class DynaGraphRunner:
             strides,
         )
 
+    def _rt_region(self) -> Any:
+        """This region in the C++ runtime, made on first use; None where it
+        is not one the runtime serves (device-resolved sizes, descriptors,
+        declared dependencies)."""
+        if self._rt is None:
+            ext = _rt_ext()
+            if (
+                ext is None
+                or self.update != "host"
+                or self.dev is not None
+                or self.dev_out_idx
+                or self.n_desc
+                or any(self.site_deps)
+            ):
+                self._rt = False
+                return None
+            sym_order, _held, _out_pass, mut_copy, mut_patch, _v = self._hot
+            lib = _inline_lib() if self.inline_sites else None
+            r = ext.Region(
+                [i for _s, i in sym_order],
+                list(self.extern_read),
+                list(self.inplace),
+                ctypes.addressof(self.in_ptrs),
+                list(mut_copy),
+                list(mut_patch),
+                ctypes.cast(lib.dg_inline_set, ctypes.c_void_p).value if lib else 0,
+                self.device_index,
+            )
+            for j, st in enumerate(self.input_store):
+                if st is not None:
+                    r.set_store(j, st)
+            self._rt = r
+            self._rt_sync_static()
+        return self._rt or None
+
+    def _rt_sync_static(self) -> None:
+        if self._rt:
+            idxs = list(self.static_idxs)
+            self._rt.set_static(idxs, [self.static_ptrs[i] or 0 for i in idxs])
+
+    def _rt_clear(self) -> None:
+        """Forget every shape handed to the C++ runtime: something they point
+        at (the arena, a store, a harvest, a graph) is gone."""
+        if self._rt:
+            self._rt.clear()
+            self._rt.clear_execs()
+            self._rt_nexec = -1
+
+    def _rt_proto(self, r: Any, dtype: Any) -> int:
+        """The runtime's index for `dtype` (a tensor of it it makes others like)."""
+        dt = self._rt_protos.get(dtype)
+        if dt is None:
+            import torch
+
+            dt = self._rt_protos[dtype] = r.add_proto(
+                torch.empty(0, dtype=dtype, device=self.arena.device)
+            )
+        return dt
+
+    def _rt_program(self) -> bool:
+        """Let the C++ runtime serve new shapes itself: the region's layout
+        and geometry as generated C, each inline site's operands and its
+        library's C describe. Only a region whose every extern call is inline
+        and declares one; False (and not tried again) otherwise."""
+        r = self._rt_region()
+        if r is None or not self.inline_sites or self.child_sites:
+            return False
+        if len(self.inline_sites) != len(self.extern_sites):
+            return False
+        try:
+            self._rt_program_build(r)
+        except (Unsupported, KeyError, NotImplementedError, SyntaxError) as exc:
+            log.info("DynaGraph: new shapes stay on the Python path: %s", exc)
+            return False
+        return True
+
+    def _rt_program_build(self, r: Any) -> None:
+        sym_index = {s_: i for i, s_ in enumerate(self.symbols)}
+        sym_pos = [self.sym_from_input[s_] for s_ in self.symbols]
+        geom: list[str] = []
+
+        def put(exprs: Sequence[str]) -> int:
+            geom.extend(str(e) for e in exprs)
+            return len(geom) - len(exprs)
+
+        # outputs, as `__call__` builds them
+        o = {k: [] for k in ("kind", "slot", "item", "dt", "nd", "gat", "fixed")}
+
+        def out(
+            kind: int,
+            slot: int = 0,
+            item: int = 0,
+            dt: int = 0,
+            nd: int = 0,
+            gat: int = -1,
+            fixed: Any = None,
+        ) -> None:
+            for k, v in zip(o, (kind, slot, item, dt, nd, gat, fixed)):
+                o[k].append(v)
+
+        for is_arena, v in self.out_order:
+            if is_arena == "extern":
+                t = self._ext_value(None, v)
+                if t is None:
+                    out(0)
+                else:
+                    out(4, fixed=t)
+            elif is_arena == "inview":
+                idx, (sz, st, off) = v
+                out(3, slot=idx, nd=len(sz), gat=put([*sz, *st, off]))
+            elif not is_arena:
+                out(2, slot=v)
+            else:
+                name = self.outputs[v]
+                view = self.output_views[v]
+                _span, item = self.sizes[name]
+                sz, st, dtn = self.layouts[name]
+                off = "0"
+                if view is not None:
+                    sz, st, off = view
+                dt = self._rt_proto(r, _torch_dtype(dtn))
+                out(1, self.slot_of[name], item, dt, len(sz), put([off, *sz, *st]))
+
+        # inline sites: every tensor argument, where it lives and its geometry
+        describe: list[int] = []
+        statics: list[bytes] = []
+        n_ops: list[int] = []
+        ops = {k: [] for k in ("kind", "slot", "pos", "item", "dt", "nd", "gat")}
+        for i, decl in self.inline_sites.items():
+            if (
+                decl.c_describe is None
+                or decl.c_statics is None
+                or decl.key is not None
+            ):
+                raise Unsupported(f"{self.extern_sites[i]} declares no C describe")
+            text = self.site_args[i]
+            depth, j = 1, 0
+            while j < len(text) and depth:
+                depth += {"(": 1, ")": -1}.get(text[j], 0)
+                j += 1
+            call = ast.parse(f"__call({text[: j - 1]})", mode="eval").body
+            if not isinstance(call, ast.Call) or call.keywords:
+                raise Unsupported(f"{self.extern_sites[i]}: keyword arguments")
+            values: list[Any] = []
+            count = 0
+            for arg in call.args:
+                if isinstance(arg, ast.Constant):
+                    values.append(arg.value)
+                    continue
+                geo = None
+                if (
+                    isinstance(arg, ast.Call)
+                    and isinstance(arg.func, ast.Name)
+                    and arg.func.id == "reinterpret_tensor"
+                    and len(arg.args) in (3, 4)
+                ):
+                    t_sz, t_st = arg.args[1], arg.args[2]
+                    if not isinstance(t_sz, ast.Tuple) or not isinstance(
+                        t_st, ast.Tuple
+                    ):
+                        raise Unsupported(f"{self.extern_sites[i]}: {ast.unparse(arg)}")
+                    off = ast.unparse(arg.args[3]) if len(arg.args) == 4 else "0"
+                    geo = (
+                        [ast.unparse(x) for x in t_sz.elts],
+                        [ast.unparse(x) for x in t_st.elts],
+                        off,
+                    )
+                    arg = arg.args[0]
+                if not isinstance(arg, ast.Name) or arg.id in sym_index:
+                    raise Unsupported(
+                        f"{self.extern_sites[i]}: argument {ast.unparse(arg)}"
+                    )
+                v = arg.id
+                n = self.alias.get(v, v)
+                vgeo = self.views.get(v)
+                if geo is not None and vgeo is not None:
+                    # reinterpret_tensor's offset adds to its base's
+                    geo = (geo[0], geo[1], f"({vgeo[2]}) + ({geo[2]})")
+                elif geo is None and vgeo is not None:
+                    geo = (list(vgeo[0]), list(vgeo[1]), vgeo[2])
+                if n in self.slot_of:
+                    _span, item = self.sizes[n]
+                    lsz, lst, dtn = self.layouts[n]
+                    if geo is None:
+                        geo = (list(lsz), list(lst), "0")
+                    rec = (
+                        0,
+                        self.slot_of[n],
+                        0,
+                        item,
+                        self._rt_proto(r, _torch_dtype(dtn)),
+                        len(geo[0]),
+                        put([*geo[0], *geo[1], geo[2]]),
+                    )
+                elif n in self.argv:
+                    if geo is None:
+                        rec = (1, 0, self.argv[n], 0, -1, 0, -1)
+                    else:
+                        rec = (
+                            1,
+                            0,
+                            self.argv[n],
+                            0,
+                            -1,
+                            len(geo[0]),
+                            put([*geo[0], *geo[1], geo[2]]),
+                        )
+                else:
+                    raise Unsupported(
+                        f"{self.extern_sites[i]}: {v} is no buffer or input"
+                    )
+                for k, x in zip(ops, rec):
+                    ops[k].append(x)
+                values.append(None)
+                count += 1
+            describe.append(int(decl.c_describe))
+            statics.append(bytes(decl.c_statics(*values)))
+            n_ops.append(count)
+
+        body = [
+            f"  g[{k}] = (int64_t)({_expr_to_c(e, sym_index)});"
+            for k, e in enumerate(geom)
+        ]
+        src = _RT_GEOM_TEMPLATE.replace(
+            "/*@LAYOUT@*/",
+            "\n".join(_layout_c(self.sizes, self.slot_of, sym_index, self.fixed_off)),
+        ).replace("/*@GEOM@*/", "\n".join(body))
+        lib = _compile_host(src)
+        if lib is None:
+            raise Unsupported("geometry helper did not build")
+        cuda = ctypes.CDLL("libcuda.so.1")
+        r.set_program(
+            ctypes.cast(lib.dg_rt_geom, ctypes.c_void_p).value,
+            len(geom),
+            self.n_slots,
+            sym_pos,
+            o["kind"],
+            o["slot"],
+            o["item"],
+            o["dt"],
+            o["nd"],
+            o["gat"],
+            o["fixed"],
+            describe,
+            statics,
+            n_ops,
+            ops["kind"],
+            ops["slot"],
+            ops["pos"],
+            ops["item"],
+            ops["dt"],
+            ops["nd"],
+            ops["gat"],
+            ctypes.cast(cuda.cuFuncGetParamInfo, ctypes.c_void_p).value,
+        )
+        self._rt_geom_lib = lib
+        n_ext = len(self.ext_slots)
+        self._rt_ext_arr = (
+            (ctypes.c_void_p * max(n_ext, 1))(*self._ext_ptrs(None)) if n_ext else None
+        )
+
+    def _rt_sync_execs(self, verify_shapes: int) -> None:
+        """Hand the runtime every graph that has been checked against eager
+        on as many shapes as a graph ever is: the ones a new shape may be
+        served by without checking it."""
+        ready = [
+            ex
+            for ex in self.execs.values()
+            if ex.host and len(ex.verified) >= verify_shapes
+        ]
+        if len(ready) == self._rt_nexec:
+            return
+        r = self._rt
+        r.clear_execs()
+        ext = self._rt_ext_arr
+        for ex in ready:
+            sites = list(self.inline_sites)
+            r.add_exec(
+                ex,
+                int(ex.exec_h),
+                int(ex.host),
+                ctypes.cast(ex.host_lib.dg_step, ctypes.c_void_p).value,
+                ctypes.addressof(ext) if ext is not None else 0,
+                0,
+                [[int(n) for n in ex.inline_nodes[i]] for i in sites],
+                [[(c[0] if c else 1) for c in ex.inline_cluster[i]] for i in sites],
+                (ex, ext),
+            )
+        self._rt_nexec = len(ready)
+
+    def _rt_put(
+        self,
+        key: Any,
+        hkey: Any,
+        ex: Any,
+        lane: int,
+        total: int,
+        geom: list[Any],
+        inview: list[Any],
+        out_pass: list[Any],
+        verify_shapes: int,
+    ) -> None:
+        """Hand the shape this call was just served at to the C++ runtime,
+        when everything it takes is fixed per shape and the shape has been
+        checked against eager."""
+        if key not in ex.verified and len(ex.verified) < verify_shapes:
+            return
+        if self.extern_sites and self.eager_calls.get(hkey):
+            return
+        inline = None
+        applied = None
+        keep: list[Any] = []
+        if self.inline_sites:
+            batch = ex.inline_batches.get(hkey)
+            if batch is None or ex.inline_state != hkey:
+                return
+            args, applied = batch
+            inline = (
+                int(ex.exec_h),
+                args[0],
+                *[ctypes.addressof(a) for a in args[1:]],
+            )
+            keep.append(batch)
+        r = self._rt_region()
+        if r is None:
+            return
+        args = self.host_args.get(hkey)
+        if args is None:
+            return
+        syms, ext, child = args
+        keep.append(args)
+        n = len(geom)
+        kinds, offs, dts, idxs, nds = [0] * n, [0] * n, [0] * n, [0] * n, [0] * n
+        sizes: list[list[int]] = [[] for _ in range(n)]
+        strides: list[list[int]] = [[] for _ in range(n)]
+        fixed: list[Any] = [None] * n
+        for pos, g in enumerate(geom):
+            if g is None:
+                continue
+            if g[0] == "arena":
+                kinds[pos], offs[pos], dts[pos] = 1, g[1], self._rt_proto(r, g[2])
+                sizes[pos], strides[pos] = list(g[3]), list(g[4])
+            else:
+                t = self._ext_value(hkey, g[1])
+                if t is not None:
+                    kinds[pos], fixed[pos] = 4, t
+        for pos, v in out_pass:
+            kinds[pos], idxs[pos] = 2, v
+        for pos, idx, sz, st, off in inview:
+            kinds[pos], idxs[pos], offs[pos] = 3, idx, off
+            sizes[pos], strides[pos] = list(sz), list(st)
+        for pos in range(n):
+            nds[pos] = len(sizes[pos])
+        rkey = [lane, *(v for _s, v in key), *hkey[2]]
+        r.put(
+            rkey,
+            ex,
+            hkey,
+            applied,
+            ctypes.cast(ex.host_lib.dg_step, ctypes.c_void_p).value,
+            int(ex.host),
+            ctypes.addressof(syms),
+            ctypes.addressof(ext) if ext is not None else 0,
+            ctypes.addressof(child) if child is not None else 0,
+            inline,
+            int(total),
+            kinds,
+            offs,
+            dts,
+            idxs,
+            nds,
+            [x for v in sizes for x in v],
+            [x for v in strides for x in v],
+            fixed,
+            keep,
+        )
+        if self._rt_prog is None:
+            self._rt_prog = self._rt_program()
+        if self._rt_prog:
+            self._rt_sync_execs(verify_shapes)
+
     def _hot_tables(self) -> tuple[Any, ...]:
         """The per-call tables, derived once from what the build settled."""
         from torch._inductor import config
@@ -8920,28 +9381,6 @@ class DynaGraphRunner:
         if hot is None:
             hot = self._hot = self._hot_tables()
         sym_order, held_idxs, out_pass, mut_copy, mut_patch, verify_shapes = hot
-        n_in = len(inputs)
-        # The symbol values in name order (`sym_order` was sorted once), so the
-        # key is the same tuple as a sort of the pairs would give.
-        key = tuple(
-            (sym, v)
-            for sym, i in sym_order
-            if i < n_in and isinstance((v := inputs[i]), int)
-        )
-        env = dict(key)
-        if self.dev is not None:
-            bounded = self.bound_env.get(key)
-            if bounded is None:
-                bounded = self._with_bounds(env)
-                if bounded is None:
-                    _fallback("unevaluable-size", f"unbacked bounds at {env}")
-                    return None
-                if len(self.bound_env) >= 4096:
-                    self.bound_env.clear()
-                self.bound_env[key] = bounded
-            env = bounded
-            self._bounds_now = env
-
         # The lane: this call's arena. Every call of a step gets its own,
         # since the outputs of the earlier ones are still out there.
         step = _step_of(self.mode)
@@ -8966,6 +9405,42 @@ class DynaGraphRunner:
                 )
             )
         self.lane, self.arena = lane, self.lanes[lane]
+
+        # A shape already prepared is served by the C++ runtime whole.
+        rt = self._rt
+        if rt:
+            got = rt.call(inputs, lane, self.arena)
+            if got is not None:
+                if got[0].__class__ is str:
+                    _fallback("host-update", f"C++ runtime: {got[0]} returned {got[1]}")
+                    return None
+                out, ex = got
+                self.ex = ex
+                self.tick += 1
+                ex.used = self.tick
+                inputs.clear()
+                return out
+        n_in = len(inputs)
+        # The symbol values in name order (`sym_order` was sorted once), so the
+        # key is the same tuple as a sort of the pairs would give.
+        key = tuple(
+            (sym, v)
+            for sym, i in sym_order
+            if i < n_in and isinstance((v := inputs[i]), int)
+        )
+        env = dict(key)
+        if self.dev is not None:
+            bounded = self.bound_env.get(key)
+            if bounded is None:
+                bounded = self._with_bounds(env)
+                if bounded is None:
+                    _fallback("unevaluable-size", f"unbacked bounds at {env}")
+                    return None
+                if len(self.bound_env) >= 4096:
+                    self.bound_env.clear()
+                self.bound_env[key] = bounded
+            env = bounded
+            self._bounds_now = env
 
         # Held aside because `inputs` is cleared on the way out, and these are
         # the tensors that come back out or get written back into.
@@ -9239,6 +9714,10 @@ class DynaGraphRunner:
                 _fallback("runtime-mismatch", f"at {env}")
                 return None
             ex.verified.add(key)
+        if host and self._rt is not False:
+            self._rt_put(
+                key, hkey, ex, lane, total, geom, inview, out_pass, verify_shapes
+            )
         inputs.clear()
         return out
 
