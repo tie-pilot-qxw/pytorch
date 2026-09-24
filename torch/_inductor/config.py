@@ -2106,11 +2106,14 @@ class triton:
         "TORCHINDUCTOR_DYNAGRAPH_LAYOUT", "dynamic"
     )
 
-    # Under the dynamic layout, how much larger than needed the arena is made
-    # when it grows (1.0: exactly what the shape needs; every new largest
-    # total is one reallocation and, for a region with extern child sites,
-    # a fresh harvest of the shapes that recur).
-    dynagraph_grow: float = float(os.environ.get("TORCHINDUCTOR_DYNAGRAPH_GROW", "1.0"))
+    # Under the dynamic layout, how much larger than needed the arena and the
+    # input copies are made when they grow. Each growth moves them, and a
+    # region with extern child sites then harvests again every shape that
+    # recurs; exact growth (1.0) meant that on every new largest shape (24
+    # times in 40 frames of an MD22 trajectory, each shape harvested again).
+    dynagraph_grow: float = float(
+        os.environ.get("TORCHINDUCTOR_DYNAGRAPH_GROW", "1.25")
+    )
 
     # Fixed layout only: spare room in each arena slot as a multiple of what
     # the recorded shape needs. The recorded shape is whichever arrived first,

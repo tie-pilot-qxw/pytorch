@@ -116,6 +116,17 @@ class Declaration(NamedTuple):
     # address on every call.
     exact: bool = True
     variant: Callable[..., Hashable] | None = None
+    # With `share`, calls whose arguments have the same geometry and the same
+    # non-tensor values are taken to launch the same thing up to addresses
+    # (the same operator in every layer): a consumer declares once and moves
+    # the addresses for the rest. `template` adds what else the launch
+    # depends on and implies `share`; `sources` names the tensors besides the
+    # arguments whose addresses differ between calls (a layer's cache).
+    # Worth it only for an expensive declaration: moving the addresses costs
+    # about what a library's own describe does (~20 us for DeepGEMM).
+    template: Callable[..., Hashable] | None = None
+    sources: Callable[..., Any] | None = None
+    share: bool = False
 
 
 _registry: dict[str, Declaration] = {}
@@ -129,9 +140,21 @@ def register(
     prepare: Callable[..., None] | None = None,
     exact: bool = True,
     variant: Callable[..., Hashable] | None = None,
+    template: Callable[..., Hashable] | None = None,
+    sources: Callable[..., Any] | None = None,
+    share: bool = False,
 ) -> None:
     """Declare the launches of operator `qualname` ("namespace::name")."""
-    _registry[qualname] = Declaration(launches, key, prepare, exact, variant)
+    _registry[qualname] = Declaration(
+        launches,
+        key,
+        prepare,
+        exact,
+        variant,
+        template,
+        sources,
+        share or template is not None,
+    )
 
 
 def lookup(qualname: str) -> Declaration | None:
@@ -273,6 +296,48 @@ def _record_graph(
     return out, g
 
 
+def _record_raw(fn: Callable[..., Any], args: Any, kwargs: Any) -> list[Recorded]:
+    """`_record_graph` for an operator that allocates nothing while it
+    launches: a bare stream capture, read and destroyed at once. About a
+    quarter of the cost, as there is no graph pool to set up and none to keep.
+    """
+    from cuda.bindings import runtime as cr
+
+    import torch
+    from torch.cuda._utils import _check_cuda_bindings as ck
+
+    s = _side_stream()
+    s.wait_stream(torch.cuda.current_stream())
+    mode = cr.cudaStreamCaptureMode.cudaStreamCaptureModeRelaxed
+    with torch.cuda.stream(s):
+        ck(cr.cudaStreamBeginCapture(s.cuda_stream, mode))
+        try:
+            fn(*args, **kwargs)
+        finally:
+            g = ck(cr.cudaStreamEndCapture(s.cuda_stream))
+    try:
+        n = int(ck(cr.cudaGraphGetNodes(g))[1])
+        nodes = ck(cr.cudaGraphGetNodes(g, n))[0] if n else []
+        out = []
+        for nd in _chain_order(nodes):
+            r = read_node(nd)
+            if r is None:
+                raise Mismatch(
+                    "the operator's capture holds a node that is not a kernel"
+                )
+            out.append(r)
+        return out
+    finally:
+        ck(cr.cudaGraphDestroy(g))
+
+
+@functools.cache
+def _side_stream() -> Any:
+    import torch
+
+    return torch.cuda.Stream()
+
+
 def record(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> list[Recorded]:
     """The kernel launches one call of `fn` makes, captured and not run.
 
@@ -291,6 +356,24 @@ def _tensors(args: Any, kwargs: Any, extra: Any) -> list[Any]:
             if isinstance(x, torch.Tensor) and x.numel():
                 out.append(x)
     return out
+
+
+def _scalars(args: Any, kwargs: Any) -> tuple[Any, ...]:
+    """The non-tensor arguments of a call, hashable, tensors marked by place."""
+    import torch
+
+    def one(v: Any) -> Any:
+        if isinstance(v, torch.Tensor):
+            return torch.Tensor
+        if isinstance(v, (list, tuple)):
+            return tuple(one(x) for x in v)
+        try:
+            hash(v)
+        except TypeError:
+            return repr(v)
+        return v
+
+    return one(tuple(args)), tuple((k, one(v)) for k, v in sorted(kwargs.items()))
 
 
 def _extent(t: Any) -> tuple[int, int]:
@@ -341,6 +424,7 @@ def recorded(
     *,
     template_key: Callable[..., Hashable] | None = None,
     sources: Callable[..., Any] | None = None,
+    allocates: bool = True,
 ) -> Callable[..., list[Launch]]:
     """A `launches` that is whatever one call of `fn` launches (see above).
 
@@ -352,12 +436,17 @@ def recorded(
     reads, such as a layer's cache) to the same place in theirs. Nothing
     checks a moved launch here; a consumer that verifies its replays (as
     DynaGraph does for its first shapes) is what catches a `sources` that
-    left something out.
+    left something out. `allocates=False` promises the call takes no memory
+    while it launches (a GEMM writing into a given output), which lets the
+    recording skip the graph pool.
     """
     templates: dict[Hashable, Any] = {}
 
     def fresh(args: Any, kwargs: Any) -> list[Launch]:
-        rec, g = _record_graph(fn, args, kwargs)
+        if not allocates:
+            rec, g = _record_raw(fn, args, kwargs), None
+        else:
+            rec, g = _record_graph(fn, args, kwargs)
         return [
             Launch(r.func, r.grid, r.block, r.smem, tuple(r.params), r.cluster, g)
             for r in rec

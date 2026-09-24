@@ -296,6 +296,24 @@ _TUNED = (
 )
 
 
+def kernel_funcs(obj: Any) -> list[int]:
+    """The function handle of every compiled variant `obj` still holds.
+
+    Only meaningful after the warmup: autotuning unloads the configs it did
+    not pick, and the driver hands their addresses to modules loaded later
+    (a library's JIT kernel), so a handle kept from before would match that
+    library's node as this kernel's.
+    """
+    cands: list[int] = []
+    for cr in getattr(obj, "compile_results", []) or []:
+        k = getattr(cr, "kernel", None)
+        f = getattr(k, "function", None)
+        if f:
+            cands.append(int(f))
+        cands += [int(v) for v in (getattr(k, "functions", {}) or {}).values() if v]
+    return list(dict.fromkeys(cands))
+
+
 def settled_blocks(obj: Any) -> dict[str, int] | None:
     """Block sizes of the one config a kernel will launch with, or None.
 
@@ -517,16 +535,8 @@ def extract_kernel_table(
 
             # Every compiled variant of this kernel: the autotuner launches the
             # one it settled on, and the host patcher finds the node by function.
-            cands: list[int] = []
-            for cr in getattr(obj, "compile_results", []) or []:
-                k = getattr(cr, "kernel", None)
-                f = getattr(k, "function", None)
-                if f:
-                    cands.append(int(f))
-                cands += [
-                    int(v) for v in (getattr(k, "functions", {}) or {}).values() if v
-                ]
-            cands = list(dict.fromkeys(cands))
+            # Taken again after the warmup (`kernel_funcs`).
+            cands = kernel_funcs(obj)
             func = cands[0] if cands else None
             if not func:
                 raise Unsupported(f"{kname}: no cubin handle; not statically launched")
@@ -546,6 +556,16 @@ def extract_kernel_table(
                     f"site passes {len(pos) - n_grid}: {call_order} vs {pos}"
                 )
             at = {nm: call_order.index(nm) for nm in args if nm in call_order}
+            if os.environ.get("DGKPARSE") and os.environ["DGKPARSE"] in kname:
+                log.warning(
+                    "DynaGraph kparse %s: sig %s call_order %s extra %s pos %s scalar %s",
+                    kname[-40:],
+                    dict(sig),
+                    call_order,
+                    extra,
+                    pos,
+                    scalar,
+                )
             exprs = {
                 nm: _resolve(pos[at[nm]], source_code, symbols)
                 for nm in plain
@@ -4294,7 +4314,7 @@ class DynaGraphRunner:
         # combination of extern topologies it was captured for (`()` with no
         # extern sites, and always under device-side SWITCH).
         self.ex: Any = None
-        self.execs: dict[tuple[int, ...], Any] = {}
+        self.execs: dict[Any, Any] = {}
         self.host_mode = config.triton.dynagraph_topology != "switch"
         # Who patches the graph for a new shape: a planner kernel inside the
         # graph ("device") or generated C++ on the host before the launch
@@ -4495,12 +4515,25 @@ class DynaGraphRunner:
             for i, n in enumerate(self.extern_sites)
             if not n.startswith("cond:") and i not in self.inline_sites
         ]
+        # A library call replayed from its captured child is not bit-for-bit
+        # the eager call it is checked against: cuBLAS picks its algorithm by
+        # pointer alignment and by whether it may use its workspace, and both
+        # differ between the arena under capture and an eager allocation.
+        if self.child_sites:
+            self.exact = False
         # Per harvest key, the operands of every inline site; per (site,
         # harvest key, declared key), the node parameters prepared from its
         # declaration; per declared kernel name, the function it resolved to.
         self._inline_ops: dict[Any, dict[int, tuple[list[Any], dict[str, Any]]]] = {}
-        self._inline_prepared: dict[Any, tuple[Any, Any]] = {}
+        self._inline_prepared: dict[Any, tuple[Any, Any, Any]] = {}
         self._site_code: dict[int, tuple[Any, OrderedSet[str]]] = {}
+        # (site name, harvest key, declared template, tensor geometry) ->
+        # packed launches of the first site met and where their addresses
+        # came from (`_packed_launches`).
+        self._inline_templates: dict[Any, tuple[Any, Any]] = {}
+        # Under host-side selection, which graph serves a combination of
+        # child topologies and inline launch structures (see `_inline_exec`).
+        self._structure_ex: dict[Any, Any] = {}
         self._kernel_funcs: dict[Any, int] = {}
         # Device path: where in the `setctx` values the "inputs moved" flag
         # sits (the input addresses follow it, one per argument position).
@@ -5109,6 +5142,10 @@ class DynaGraphRunner:
             k["blocks"] = settled_blocks(obj)
             if k["blocks"] is None:
                 return _fallback("unsettled-config", k["name"])
+            k["funcs"] = kernel_funcs(obj)
+            if not k["funcs"]:
+                return _fallback("unsettled-config", f"{k['name']}: no cubin handle")
+            k["func"] = k["funcs"][0]
             if k.get("pgrid") and not k["grid"]:
                 k["grid"] = precomputed_grid(k, obj)
                 if k["grid"] is None:
@@ -5613,15 +5650,24 @@ class DynaGraphRunner:
         for ex in self.execs.values():
             ex.ptr_dirty = True
             ex.applied = None
+            ex.inline_applied.clear()
         self._invalidate_harvests(self.lane)
+        # Inline sites' operands are views of the arena and their packed
+        # parameters hold its addresses, under keys that do not name it: a
+        # shape met again after the move would get the old arena's launches.
+        self._inline_ops.clear()
+        self._inline_prepared.clear()
+        self._inline_templates.clear()
 
     def _grow_store(self, j: int, x: Any, n: int) -> None:
         """The copy held for input `j` is too small for this call: replace
         it. Its readers take the new address from the table on this call;
         an extern child that read the old copy is harvested again."""
         import torch
+        from torch._inductor import config
 
-        store = torch.empty(max(n, 1), dtype=x.dtype, device=x.device)
+        grow = max(1.0, float(config.triton.dynagraph_grow))
+        store = torch.empty(max(int(n * grow), n, 1), dtype=x.dtype, device=x.device)
         log.info(
             "DynaGraph input %d storage %d -> %d elements",
             j,
@@ -5941,11 +5987,25 @@ class DynaGraphRunner:
         it = iter(views)
         n_alloc = {"n": 0}
 
+        debug = bool(os.environ.get("TORCHINDUCTOR_DYNAGRAPH_DEBUG"))
+
         def alloc(*a: Any, **kw: Any) -> Any:
             n_alloc["n"] += 1
             if isinstance(views, _LazyAllocs):
                 views.pending = (a, kw)
-            return next(it)
+            v = next(it)
+            if debug and not isinstance(views, _LazyAllocs) and a:
+                want_size, want_stride = tuple(a[0]), tuple(a[1])
+                if (tuple(v.shape), tuple(v.stride())) != (want_size, want_stride):
+                    log.info(
+                        "DynaGraph debug alloc %d: wrapper wants %s %s, got view %s %s",
+                        n_alloc["n"] - 1,
+                        want_size,
+                        want_stride,
+                        tuple(v.shape),
+                        tuple(v.stride()),
+                    )
+            return v
 
         site = {"i": 0}
         saved = {}
@@ -6025,12 +6085,16 @@ class DynaGraphRunner:
             )
         return out
 
-    def _combo(self, hkey: Any) -> tuple[int, ...]:
+    def _combo(self, hkey: Any, structure: Any = None) -> Any:
         """Which graph serves `hkey`: the topology combination under host-side
-        selection, the one and only graph otherwise."""
+        selection, the one and only graph otherwise. With inline sites the
+        combination also holds their launch structure (`_inline_exec`)."""
+        child: tuple[int, ...] = ()
         if self.host_mode and self.extern_sites and hkey in self.key_bodies:
-            return tuple(self.key_bodies[hkey])
-        return ()
+            child = tuple(self.key_bodies[hkey])
+        if self.host_mode and self.inline_sites:
+            return (child, structure)
+        return child
 
     def _harvest_stream(self) -> Any:
         """The side stream every extern call is warmed up and captured on."""
@@ -6367,7 +6431,7 @@ class DynaGraphRunner:
                 results.append(r)
                 return r
             with torch.cuda.stream(s):
-                r = fn(*a, **_on_current_stream(kw))
+                warm = r = fn(*a, **_on_current_stream(kw))
             torch.cuda.current_stream().wait_stream(s)
             # The generator offset moves when the op is enqueued, not when it
             # runs, so no synchronize is needed to read it.
@@ -6434,6 +6498,13 @@ class DynaGraphRunner:
                     )
                 elif got:
                     foreign[i] = len(got)
+            # What the capture returns was allocated in its pool and never
+            # computed; the rest of the wrapper runs eagerly on it. An output
+            # used as an index (a sort's indices feeding an index_put) then
+            # reads and writes out of bounds, corrupting whatever lies there.
+            # The warm-up computed the same thing, so its values go in. (An
+            # `out=` call wrote the same tensor in its warm-up already.)
+            _copy_values(r, warm)
             graphs.append(g)
             results.append(r)
             return r
@@ -6583,7 +6654,9 @@ class DynaGraphRunner:
             # the launch: no SWITCH node, so nothing per replay. The
             # combinations seen track the largest site's tiers, not their
             # product -- the sites step together with the shape.
-            fresh = tuple(bodies) not in self.execs
+            fresh = tuple(bodies) not in (
+                [c[0] for c in self.execs] if self.inline_sites else self.execs
+            )
             if fresh and self.execs and len(self.execs) >= _max_graphs():
                 # Over budget: drop the graph used longest ago. A shape that
                 # needs it again captures again (milliseconds), so no shape
@@ -7156,7 +7229,9 @@ class DynaGraphRunner:
             step_seen, calls = self.step_seen, self.calls_in_step
             got = self(list(self.static_inputs))
             self.step_seen, self.calls_in_step = step_seen, calls
-            ok = got is not None and _same_values(got, ref, self.exact)
+            ok = got is not None and _same_values(
+                got, ref, self.exact, self.static_inputs
+            )
         if not ok:
             if got is not None:
                 log.info("DynaGraph selfcheck: %s", _mismatch_report(got, ref))
@@ -7197,7 +7272,9 @@ class DynaGraphRunner:
                         self.step_seen, self.calls_in_step = step_seen, calls
                 finally:
                     self.ex.ctx[self.ex.force0 + ci] = 0
-                if got is None or not _same_values(got, ref, self.exact):
+                if got is None or not _same_values(
+                    got, ref, self.exact, self.static_inputs
+                ):
                     if got is not None:
                         log.info(
                             "DynaGraph branch selfcheck: %s", _mismatch_report(got, ref)
@@ -7207,6 +7284,67 @@ class DynaGraphRunner:
                         f"{c.name} branch {b} ({c.branches[b][0]}) at {env}",
                     )
         return True
+
+    def _debug_node_map(self, raw: Any) -> None:
+        """Debug only: the kernel table matched to the captured graph's nodes
+        the way `dg_init` does it, and each buffer's address as every node
+        that names it holds it. One buffer at two addresses means a node was
+        matched to the wrong kernel (or a view to the wrong slot)."""
+        from cuda.bindings import runtime as cr
+
+        from torch.cuda._utils import _check_cuda_bindings as ck
+        from torch.utils import _capture_launch as cl
+
+        n = int(ck(cr.cudaGraphGetNodes(raw))[1])
+        nodes = ck(cr.cudaGraphGetNodes(raw, n))[0] if n else []
+        recs = [(nd, cl.read_node(nd)) for nd in nodes]
+        recs = [(nd, r) for nd, r in recs if r is not None]
+        addrs: dict[str, list[Any]] = {}
+        k = 0
+        for _nd, r in recs:
+            if k >= len(self.kernels):
+                break
+            kern = self.kernels[k]
+            if r.func not in kern["funcs"]:
+                continue
+            by_off = {off: j for j, (off, _sz) in enumerate(cl.param_sizes(r.func))}
+            log.info(
+                "DynaGraph debug node %d = %s grid %s params %s offsets %s",
+                k,
+                cl._name(r.func)[-40:],
+                r.grid,
+                [hex(int.from_bytes(p[:8], "little")) for p in r.params],
+                {nm: kern["offsets"][nm] for nm in (kern.get("ptrs") or {})},
+            )
+            for nm, rawv in (kern.get("ptrs") or {}).items():
+                buf, _voff = _view_of(rawv, self.alias, self.views)
+                j = by_off.get(kern["offsets"][nm][0])
+                if j is not None:
+                    v = int.from_bytes(r.params[j][:8], "little")
+                    addrs.setdefault(buf, []).append(
+                        (k, kern["name"][-28:], nm, hex(v))
+                    )
+            k += 1
+        for i, ns in self.ex.inline_nodes.items():
+            for nd in ns:
+                r = cl.read_node(nd)
+                if r is None:
+                    continue
+                vals = [
+                    hex(int.from_bytes(p[:8], "little"))
+                    for p in r.params
+                    if len(p) == 128
+                ]
+                log.info(
+                    "DynaGraph debug node-map inline %d (%s): TMA bases %s",
+                    i,
+                    self.site_args[i][:120],
+                    vals,
+                )
+        for buf, lst in addrs.items():
+            distinct = OrderedSet([a for *_x, a in lst])
+            tag = "SPLIT" if len(distinct) > 1 else "ok"
+            log.info("DynaGraph debug node-map %s %s: %s", tag, buf, lst[:6])
 
     def _debug_mismatch(self, env: dict[str, int]) -> None:
         """After a failed self-check: every node's grid inputs, and for a region
@@ -7230,8 +7368,44 @@ class DynaGraphRunner:
                 k.get("consts"),
                 k.get("grid"),
             )
-        if self.extern_sites:
+        if self.child_sites:
             return
+        if self.inline_sites:
+            planned = self.plans.get(tuple(sorted(env.items())))
+            offsets = planned[2] if planned else None
+            for (i, want), prepared in list(self._inline_prepared.items())[
+                -len(self.inline_sites) :
+            ]:
+                params, keep, _cl = prepared
+                if not keep:
+                    continue
+                bufs = keep[0][0]
+                tma = [
+                    hex(int.from_bytes(b.raw[:8], "little"))
+                    for b in bufs
+                    if len(b.raw) == 128
+                ]
+                names = re.findall(r"\b(buf\d+)\b", self.site_args[i])
+                have = {}
+                for nm in names:
+                    try:
+                        v = (
+                            self._arena_view(nm, env, offsets)
+                            if offsets is not None
+                            else None
+                        )
+                    except Exception as exc:
+                        v = exc
+                    have[nm] = (
+                        hex(v.data_ptr()) if hasattr(v, "data_ptr") else repr(v)[:40]
+                    )
+                log.info(
+                    "DynaGraph debug inline %d at %s: TMA bases %s, arena views %s",
+                    i,
+                    want[0][0],
+                    tma,
+                    have,
+                )
         views = self._arena_views(env)
         if views is None:
             return
@@ -7239,7 +7413,7 @@ class DynaGraphRunner:
         shaped = self._shape_inputs(self.static_inputs)
         try:
             with self._unwritten(shaped), self._rng_kept():
-                self._run_intercepted(shaped, views, None)
+                self._run_intercepted(shaped, views, lambda _i, fn, a, kw: fn(*a, **kw))
             torch.cuda.synchronize()
         except Exception as exc:
             log.info(
@@ -7532,15 +7706,20 @@ class DynaGraphRunner:
         torch.cuda.synchronize()
         self.ex.graph = graph
         ex.exec_h = graph.raw_cuda_graph_exec()
-        self.execs[self._combo(build_key)] = ex
+        if os.environ.get("TORCHINDUCTOR_DYNAGRAPH_DEBUG") and self.inline_sites:
+            self._debug_node_map(graph.raw_cuda_graph())
+        structure = tuple(tuple(ex.inline_cluster[i]) for i in self.inline_sites)
+        self.execs[self._combo(build_key, structure)] = ex
         self._ex_of.clear()
+        self._structure_ex.clear()
         log.info(
-            "DynaGraph captured graph %d (%s update, key %s, %d kernel nodes, %d child sites)",
+            "DynaGraph captured graph %d (%s update, key %s, %d kernel nodes, %d child sites %s)",
             len(self.execs),
             self.update,
             build_key,
             len(self.kernels),
             len(self.extern_sites),
+            self.extern_sites,
         )
         # Upload the exec now rather than letting its first launch do it: an
         # exec with conditional nodes or external event nodes (a SWITCH, an
@@ -7644,6 +7823,13 @@ class DynaGraphRunner:
             self._inline_rets[name] = out
         self.ex.inline_nodes[i] = nodes
         self.ex.inline_cluster[i] = [r.cluster for r in recorded]  # type: ignore[union-attr]
+        if os.environ.get("TORCHINDUCTOR_DYNAGRAPH_DEBUG"):
+            log.info(
+                "DynaGraph debug inline site %d (%s): nodes %s",
+                i,
+                self.extern_sites[i],
+                [cl._name(r.func)[:60] for r in recorded],  # type: ignore[union-attr]
+            )
         self.ex.child_nodes.append(None)
         self.ex.site_body_nodes.append([None])
         self.ex.site_cond.append(0)
@@ -7657,13 +7843,21 @@ class DynaGraphRunner:
         hkey: Any,
         inputs: list[Any],
         offsets: list[int],
-    ) -> bool:
-        """Rewrite every inline site's nodes for this call, where it moved.
+    ) -> Any:
+        """Rewrite every inline site's nodes for this call, where it moved; the
+        graph that serves the call, or None to hand it back.
 
         A site is rewritten when its harvest key or what its operator's `key`
         returns has changed since the last call this graph served; otherwise
         nothing is done. The operands are built once per harvest key from the
         call's text and the arena layout, not by running the wrapper.
+
+        What a site launches is worked out before a graph is picked: how many
+        kernels and each one's cluster shape are structure a node update
+        cannot change (a library choosing a 2-CTA cluster for some M), so
+        under host-side selection they pick the graph like a child topology
+        does (`_inline_exec`), and a structure not met before is captured
+        once at this shape.
         """
         from cuda.bindings import driver as cu
 
@@ -7688,29 +7882,45 @@ class DynaGraphRunner:
             for i in self.inline_sites:
                 got = self._site_operands(i, env, view_of, shaped)
                 if got is None:
-                    return _fallback("inline-operands", self.extern_sites[i])
+                    _fallback("inline-operands", self.extern_sites[i])
+                    return None
                 ops[i] = got
             if len(self._inline_ops) >= 1024:
                 self._inline_ops.clear()
             self._inline_ops[hkey] = ops
+        wanted = []
         for i, decl in self.inline_sites.items():
             a, kw = ops[i]
             want = (hkey, decl.key(*a, **kw) if decl.key is not None else None)
-            if ex.inline_applied.get(i) == want:
-                continue
             prepared = self._inline_prepared.get((i, want))
             if prepared is None:
                 try:
-                    prepared = self._prepare_inline(i, ex, decl, a, kw)
+                    prepared = self._prepare_inline(i, decl, a, kw, hkey)
                 except cl.Mismatch as exc:
-                    return _fallback(
-                        "launch-declaration", f"{self.extern_sites[i]}: {exc}"
-                    )
+                    _fallback("launch-declaration", f"{self.extern_sites[i]}: {exc}")
+                    return None
                 if len(self._inline_prepared) >= 4096:
                     self._inline_prepared.clear()
                 self._inline_prepared[(i, want)] = prepared
-            params, _keep = prepared
+            wanted.append((i, want, prepared))
+        if self.host_mode:
+            ex = self._inline_exec(hkey, wanted, inputs)
+            if ex is None:
+                return None
+            self.ex = ex
+        for i, want, prepared in wanted:
+            if ex.inline_applied.get(i) == want:
+                continue
+            params, _keep, clusters = prepared
             nodes = ex.inline_nodes[i]
+            if params is not None and clusters != tuple(ex.inline_cluster[i]):
+                _fallback(
+                    "launch-declaration",
+                    f"{self.extern_sites[i]}: launches with clusters {clusters}, "
+                    f"captured with {tuple(ex.inline_cluster[i])}; a graph "
+                    f"update cannot change that",
+                )
+                return None
             if params is None:
                 # Declared to launch nothing this time.
                 if i not in ex.inline_off:
@@ -7725,7 +7935,57 @@ class DynaGraphRunner:
                         ck(cu.cuGraphNodeSetEnabled(ex.exec_h, int(n), 1))
                     ex.inline_off.discard(i)
             ex.inline_applied[i] = want
-        return True
+        return ex
+
+    def _inline_exec(self, hkey: Any, wanted: list[Any], inputs: list[Any]) -> Any:
+        """The graph whose inline nodes have the structure this call launches.
+
+        A site declaring no launch this time fits any graph (its nodes are
+        disabled). A structure met for the first time is captured at this
+        shape, once: the library's choice follows the shape in tiers, so the
+        graphs track the tiers, as with child topologies.
+        """
+        want = tuple(p[2] for _i, _w, p in wanted)
+        child = self._combo(hkey)[0]
+        memo = (child, want)
+        ex = self._structure_ex.get(memo)
+        if ex is not None:
+            return ex
+        for (c, structure), cand in self.execs.items():
+            if c == child and all(w is None or w == s for w, s in zip(want, structure)):
+                ex = cand
+                break
+        if ex is None:
+            log.info(
+                "DynaGraph: new inline launch structure %s (have %s)",
+                want,
+                [st for _c, st in self.execs],
+            )
+            if len(self.execs) >= _max_graphs():
+                combo = min(self.execs, key=lambda c: self.execs[c].used)
+                self.execs.pop(combo)
+                self._ex_of.clear()
+                self.host_args.clear()
+            if not self._recapture(hkey, inputs):
+                return None
+            ex = next(
+                (
+                    e
+                    for (c, st), e in self.execs.items()
+                    if c == child and all(w is None or w == s for w, s in zip(want, st))
+                ),
+                None,
+            )
+            if ex is None:
+                _fallback(
+                    "inline-structure",
+                    f"captured {[st for _c, st in self.execs]}, declared {want}",
+                )
+                return None
+        if len(self._structure_ex) >= 4096:
+            self._structure_ex.clear()
+        self._structure_ex[memo] = ex
+        return ex
 
     def _ensure_prepared(self, i: int, decl: Any, a: Any, kw: Any) -> None:
         """Run the operator's one-time set-up for this call's variant, once.
@@ -7751,31 +8011,37 @@ class DynaGraphRunner:
         done.add(v)
         log.info("DynaGraph prepared %s variant %r", name, v)
 
-    def _prepare_inline(
-        self, i: int, ex: Any, decl: Any, a: Any, kw: Any
-    ) -> tuple[Any, Any]:
-        """Node parameters for site `i` from its declaration.
+    def _packed_launches(
+        self, i: int, decl: Any, a: Any, kw: Any, hkey: Any
+    ) -> list[Any]:
+        """Site `i`'s launches with every kernel resolved to its function and
+        every parameter packed to bytes.
 
-        The variant is set up first (`_ensure_prepared`); a kernel the
-        declaration names that this process has not resolved is then learned
-        from a recording of this very call. So the cost of a new kernel is
-        paid once per kernel, not per shape.
+        Sites of one operator whose arguments agree at this harvest key in
+        geometry and non-tensor values (and in the declared `template`) --
+        the same operator in every layer -- share one call of the
+        declaration: the first one's launches become a template, and the
+        others get them with the addresses moved from the first site's
+        tensors (its arguments and declared `sources`) to the same place in
+        theirs. A template whose addresses cannot all be attributed is not
+        reused.
         """
-        import ctypes as ct
-
-        from cuda.bindings import driver as cu
-
         from torch.utils import _capture_launch as cl
 
-        self._ensure_prepared(i, decl, a, kw)
-        launches = decl.launches(*a, **kw)
-        if not launches:
-            return None, None
-        nodes = ex.inline_nodes[i]
-        if len(launches) != len(nodes):
-            raise cl.Mismatch(
-                f"{len(launches)} launches where the graph holds {len(nodes)} nodes"
+        gk = src = None
+        if decl.share:
+            src = cl._tensors(a, kw, decl.sources(*a, **kw) if decl.sources else ())
+            gk = (
+                self.extern_sites[i],
+                hkey,
+                decl.template(*a, **kw) if decl.template is not None else None,
+                cl._scalars(a, kw),
+                tuple((tuple(t.shape), t.stride(), t.dtype) for t in src),
             )
+            t = self._inline_templates.get(gk)
+            if t is not None and t[1] is not None:
+                return cl._rebind(t[0], t[1], src)
+        launches = decl.launches(*a, **kw)
         unknown = [
             L
             for L in launches
@@ -7791,15 +8057,39 @@ class DynaGraphRunner:
             ):
                 if not isinstance(L.kernel, int):
                     self._kernel_funcs[L.kernel] = f
-        params, keep = [], []
-        for n, L in enumerate(launches):
-            if L.cluster != ex.inline_cluster[i][n]:
-                raise cl.Mismatch(
-                    f"launch {n} wants cluster {L.cluster}, captured with "
-                    f"{ex.inline_cluster[i][n]}; a graph update cannot change it"
-                )
+        packed = []
+        for L in launches:
             f = L.kernel if isinstance(L.kernel, int) else self._kernel_funcs[L.kernel]
-            bufs = [ct.create_string_buffer(b, len(b)) for b in cl.pack(L, f)]
+            packed.append(L._replace(kernel=f, args=tuple(cl.pack(L, f))))
+        if gk is not None and src is not None:
+            if len(self._inline_templates) >= 4096:
+                self._inline_templates.clear()
+            self._inline_templates[gk] = (packed, cl._bind_plan(packed, src))
+        return packed
+
+    def _prepare_inline(
+        self, i: int, decl: Any, a: Any, kw: Any, hkey: Any = None
+    ) -> tuple[Any, Any, Any]:
+        """Node parameters for site `i` from its declaration, and the cluster
+        shape of each launch (None for all three when it launches nothing).
+
+        The variant is set up first (`_ensure_prepared`); a kernel the
+        declaration names that this process has not resolved is then learned
+        from a recording of this very call. So the cost of a new kernel is
+        paid once per kernel, not per shape.
+        """
+        import ctypes as ct
+
+        from cuda.bindings import driver as cu
+
+        self._ensure_prepared(i, decl, a, kw)
+        launches = self._packed_launches(i, decl, a, kw, hkey)
+        if not launches:
+            return None, None, None
+        params, keep = [], []
+        for L in launches:
+            f = L.kernel
+            bufs = [ct.create_string_buffer(b, len(b)) for b in L.args]
             arr = (ct.c_void_p * max(len(bufs), 1))(*[ct.addressof(b) for b in bufs])
             p = cu.CUDA_KERNEL_NODE_PARAMS()
             p.func = f
@@ -7810,7 +8100,7 @@ class DynaGraphRunner:
             p.extra = 0
             params.append(p)
             keep.append((bufs, arr, L.owner))
-        return params, keep
+        return params, keep, tuple(L.cluster for L in launches)
 
     def _hot_tables(self) -> tuple[Any, ...]:
         """The per-call tables, derived once from what the build settled."""
@@ -8016,15 +8306,19 @@ class DynaGraphRunner:
                     env, key, hkey, inputs
                 ):
                     return SKIP_SHAPE if key in self.skip_keys else None
-                # The graph for this shape's topologies; the harvest just
-                # made it if it was new.
-                ex = self.execs[self._combo(hkey)]
-                if len(self._ex_of) >= 4096:
-                    self._ex_of.clear()
-                self._ex_of[hkey] = ex
-            self.ex = ex
-        if self.inline_sites and not self._apply_inline(ex, env, hkey, inputs, offsets):
-            return SKIP_SHAPE
+                if not (self.host_mode and self.inline_sites):
+                    # The graph for this shape's topologies; the harvest just
+                    # made it if it was new.
+                    ex = self.execs[self._combo(hkey)]
+                    if len(self._ex_of) >= 4096:
+                        self._ex_of.clear()
+                    self._ex_of[hkey] = ex
+            if ex is not None:
+                self.ex = ex
+        if self.inline_sites:
+            ex = self._apply_inline(self.ex, env, hkey, inputs, offsets)
+            if ex is None:
+                return SKIP_SHAPE
         self.tick += 1
         ex.used = self.tick
 
@@ -8166,13 +8460,27 @@ class DynaGraphRunner:
             )
 
         if ref is not None:
-            if not _same_values(out, ref, self.exact):
+            if not _same_values(out, ref, self.exact, inputs):
                 log.info("DynaGraph mismatch: %s", _mismatch_report(out, ref))
+                if os.environ.get("TORCHINDUCTOR_DYNAGRAPH_DEBUG"):
+                    self._debug_mismatch(env)
                 _fallback("runtime-mismatch", f"at {env}")
                 return None
             ex.verified.add(key)
         inputs.clear()
         return out
+
+
+def _copy_values(dst: Any, src: Any) -> None:
+    """Copy tensor values from `src` into `dst`, both the same (nested) structure."""
+    import torch
+
+    if isinstance(dst, torch.Tensor) and isinstance(src, torch.Tensor):
+        if dst.data_ptr() != src.data_ptr():
+            dst.copy_(src)
+    elif isinstance(dst, (list, tuple)) and isinstance(src, (list, tuple)):
+        for d, x in zip(dst, src):
+            _copy_values(d, x)
 
 
 def _mismatch_report(got: list[Any], ref: Any) -> str:
@@ -8196,13 +8504,16 @@ def _mismatch_report(got: list[Any], ref: Any) -> str:
         j = int(d.argmax())
         n_bad = int((d > 0).sum())
         parts.append(
-            f"out{i}{tuple(g.shape)}: {n_bad}/{d.numel()} differ, max {float(d[j]):.3e} at flat {j}"
+            f"out{i}{tuple(g.shape)} {str(r.dtype)[6:]} max|ref| {float(r.float().abs().max()):.3g}:"
+            f" {n_bad}/{d.numel()} differ, max {float(d[j]):.3e} at flat {j}"
             f" (got {float(g.reshape(-1)[j]):.6g}, ref {float(r.reshape(-1)[j]):.6g})"
         )
     return "; ".join(parts) or "no difference found"
 
 
-def _same_values(got: list[Any], ref: Any, exact: bool = True) -> bool:
+def _same_values(
+    got: list[Any], ref: Any, exact: bool = True, inputs: Any = ()
+) -> bool:
     """Agreement between a replay's outputs and an eager run's.
 
     Bit for bit by default, on purpose: both sides run the same kernels with
@@ -8220,6 +8531,21 @@ def _same_values(got: list[Any], ref: Any, exact: bool = True) -> bool:
     flat = list(ref) if isinstance(ref, (list, tuple)) else [ref]
     if len(got) != len(flat):
         return False
+    # The noise of a non-repeatable kernel travels: an fp32 gradient computed
+    # from bf16 activations carries bf16 rounding, so the bound follows the
+    # least precise floating tensor going in or coming out of the region, not
+    # each output's own dtype; and it grows through the layers and sums after
+    # it (a bf16 per-molecule sum of 18 atoms was 3 units off), so eight units
+    # of that precision. What this check is for -- a planner that set a stale
+    # size or pointer -- is off by the values themselves, not by units.
+    eps = 8 * max(
+        (
+            torch.finfo(r.dtype).eps
+            for r in [*flat, *inputs]
+            if isinstance(r, torch.Tensor) and r.is_floating_point()
+        ),
+        default=0.0,
+    )
     flags = []
     for g, r in zip(got, flat):
         if not isinstance(r, torch.Tensor) or g.numel() != r.numel():
@@ -8236,11 +8562,23 @@ def _same_values(got: list[Any], ref: Any, exact: bool = True) -> bool:
         else:
             # Run-to-run noise of such a kernel is absolute and shows up at
             # the zero crossings, so the bound is relative to the largest
-            # magnitude in the reference, not element-wise.
+            # magnitude in the reference, not element-wise. At least one unit
+            # of the region's precision: a bf16 sum that rounds the other way
+            # is 2**-9 apart at 0.4 already.
             af, bf = a.float(), b.float()
-            tol = 1e-3 * bf.abs().max().clamp_min(1.0)
+            rel = max(1e-3, eps)
+            tol = rel * bf.abs().max().clamp_min(1.0)
             close = ((af - bf).abs() <= tol) | (torch.isnan(af) & torch.isnan(bf))
-            flags.append(~close.all())
+            # Or close as a whole: a sum over channels that cancels (MACE's
+            # per-edge scalars) turns fp32 rounding into 1e-3 of its largest
+            # value on a quarter of the elements. A stale size or pointer puts
+            # a fraction of the elements off by their own size, which this
+            # still refuses.
+            d = torch.where(torch.isnan(af) & torch.isnan(bf), 0.0, af - bf)
+            whole = torch.linalg.vector_norm(d) <= rel * torch.linalg.vector_norm(
+                torch.nan_to_num(bf)
+            )
+            flags.append(~(close.all() | whole))
     if not flags:
         return True
     return not bool(torch.stack(flags).any())
