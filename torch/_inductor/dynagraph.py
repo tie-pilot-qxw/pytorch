@@ -49,6 +49,7 @@ import ctypes
 import functools
 import hashlib
 import logging
+import math
 import os
 import re
 import subprocess
@@ -2075,6 +2076,88 @@ def generate_host_patcher(
 _host_lib_cache: dict[str, Any] = {}
 
 
+_INLINE_SRC = r"""
+#include <cuda.h>
+#include <cstring>
+#include <vector>
+
+static int g_inline_err = 0;
+
+// Rewrite n kernel nodes of `ex`, one launch each: the parameter bytes of
+// launch i are blobs[i] (blob_len[i] bytes, parameter q at poffs[..q]) with
+// npatch[i] 8-byte words overwritten (byte pw[..], value pv[..]) -- how a site
+// sharing another's launch gets its own addresses. The driver copies the
+// parameters, so one scratch buffer serves every node. Returns 0, or 1 + the
+// index of the node that failed (`dg_inline_error` gives the CUDA error).
+extern "C" int dg_inline_set(CUgraphExec ex, int n, const CUgraphNode* nodes,
+                             const CUfunction* funcs, const unsigned* dims,
+                             const char* const* blobs, const int* blob_len,
+                             const int* nparam, const int* poffs,
+                             const int* npatch, const int* pw,
+                             const unsigned long long* pv) {
+  static std::vector<char> scratch;
+  static std::vector<void*> kp;
+  int po = 0, pp = 0;
+  for (int i = 0; i < n; ++i) {
+    int len = blob_len[i];
+    if ((int)scratch.size() < len) scratch.resize(len);
+    memcpy(scratch.data(), blobs[i], len);
+    for (int q = 0; q < npatch[i]; ++q)
+      memcpy(scratch.data() + pw[pp + q], &pv[pp + q], 8);
+    pp += npatch[i];
+    kp.resize(nparam[i] > 0 ? nparam[i] : 1);
+    for (int q = 0; q < nparam[i]; ++q) kp[q] = scratch.data() + poffs[po + q];
+    po += nparam[i];
+    CUDA_KERNEL_NODE_PARAMS p;
+    memset(&p, 0, sizeof(p));
+    p.func = funcs[i];
+    p.gridDimX = dims[7 * i];
+    p.gridDimY = dims[7 * i + 1];
+    p.gridDimZ = dims[7 * i + 2];
+    p.blockDimX = dims[7 * i + 3];
+    p.blockDimY = dims[7 * i + 4];
+    p.blockDimZ = dims[7 * i + 5];
+    p.sharedMemBytes = dims[7 * i + 6];
+    p.kernelParams = kp.data();
+    p.extra = nullptr;
+    CUresult rc = cuGraphExecKernelNodeSetParams(ex, nodes[i], &p);
+    if (rc != CUDA_SUCCESS) {
+      g_inline_err = rc;
+      return 1 + i;
+    }
+  }
+  return 0;
+}
+
+extern "C" int dg_inline_error(void) { return g_inline_err; }
+"""
+
+
+def _inline_lib() -> Any:
+    """The C helper that rewrites a call's inline nodes in one call."""
+    lib = _compile_host(_INLINE_SRC)
+    if lib is not None and not getattr(lib, "_dg_typed", False):
+        c = ctypes
+        lib.dg_inline_set.restype = c.c_int
+        lib.dg_inline_set.argtypes = [
+            c.c_void_p,
+            c.c_int,
+            c.c_void_p,
+            c.c_void_p,
+            c.c_void_p,
+            c.c_void_p,
+            c.c_void_p,
+            c.c_void_p,
+            c.c_void_p,
+            c.c_void_p,
+            c.c_void_p,
+            c.c_void_p,
+        ]
+        lib.dg_inline_error.restype = c.c_int
+        lib._dg_typed = True
+    return lib
+
+
 def _compile_host(src: str) -> Any:
     """Build the region's host patcher into a shared object and load it.
 
@@ -2122,6 +2205,10 @@ def _compile_host(src: str) -> Any:
         os.replace(tmp, path)
     ctypes.CDLL("libcuda.so.1", mode=ctypes.RTLD_GLOBAL)
     lib = ctypes.CDLL(path)
+    _host_lib_cache[src] = lib
+    if not hasattr(lib, "dg_init"):
+        # A helper, not a region's patcher (`_inline_lib`).
+        return lib
     lib.dg_init.restype = ctypes.c_void_p
     lib.dg_init.argtypes = [
         ctypes.c_void_p,
@@ -2238,22 +2325,102 @@ _ARITH_NODES = (
 )
 
 
+def _dg_all(*vs: Any) -> int:
+    return int(all(vs))
+
+
+def _dg_any(*vs: Any) -> int:
+    return int(any(vs))
+
+
+# What a compiled expression may name besides the symbols.
+_EXPR_GLOBALS: dict[str, Any] = {
+    "__builtins__": {},
+    "min": min,
+    "max": max,
+    "math": math,
+    "_dg_all": _dg_all,
+    "_dg_any": _dg_any,
+}
+
+
+def _compilable(node: ast.AST) -> bool:
+    """Whether `eval` of `node` gives what `_eval_int`'s walk gives: plain
+    arithmetic, single comparisons, conditionals and the calls the walk knows
+    (`and` / `or` are rewritten first, see `_compiled_expr`)."""
+    for n in ast.walk(node):
+        if isinstance(n, ast.Constant):
+            if isinstance(n.value, bool) or not isinstance(n.value, (int, float)):
+                return False
+        elif isinstance(n, ast.Compare):
+            if len(n.ops) != 1 or type(n.ops[0]) not in _PY_COMPARE:
+                return False
+        elif isinstance(n, ast.Call):
+            f = n.func
+            if n.keywords:
+                return False
+            if isinstance(f, ast.Name) and f.id in ("min", "max", "_dg_all", "_dg_any"):
+                continue
+            if not (
+                isinstance(f, ast.Attribute)
+                and isinstance(f.value, ast.Name)
+                and f.value.id == "math"
+                and f.attr in ("floor", "ceil")
+                and len(n.args) == 1
+            ):
+                return False
+        elif isinstance(n, ast.Attribute):
+            # Only as the callee checked above.
+            if not (isinstance(n.value, ast.Name) and n.value.id == "math"):
+                return False
+        elif isinstance(n, ast.cmpop):
+            continue
+        elif not isinstance(n, _ARITH_NODES):
+            return False
+    return True
+
+
+class _BoolOpsToCalls(ast.NodeTransformer):
+    """`a and b` -> `_dg_all(a, b)`: the walk evaluates every operand and
+    answers 0 / 1, where Python's `and` / `or` answer an operand."""
+
+    def visit_BoolOp(self, n: ast.BoolOp) -> Any:
+        self.generic_visit(n)
+        name = "_dg_all" if isinstance(n.op, ast.And) else "_dg_any"
+        return ast.copy_location(
+            ast.Call(
+                func=ast.Name(id=name, ctx=ast.Load()), args=n.values, keywords=[]
+            ),
+            n,
+        )
+
+
 @functools.cache
 def _compiled_expr(expr: str) -> Any:
-    """`expr` compiled, when it is plain arithmetic `eval` gives the same
-    answer for as `_eval_int`'s walk; None otherwise. The walk is what every
-    layout and operand evaluation paid per expression per shape."""
+    """`expr` compiled, when `eval` gives the same answer for it as
+    `_eval_int`'s walk; None otherwise. The walk is what every layout and
+    operand evaluation paid per expression per shape."""
     node = _parse_expr(expr)
     if node is None:
         return None
-    for n in ast.walk(node):
-        if not isinstance(n, _ARITH_NODES):
-            return None
-        if isinstance(n, ast.Constant) and (
-            isinstance(n.value, bool) or not isinstance(n.value, (int, float))
-        ):
-            return None
+    # A fresh tree: the parsed one is cached and shared with the walk.
+    node = _BoolOpsToCalls().visit(ast.parse(expr.strip(), mode="eval"))
+    ast.fix_missing_locations(node)
+    if not _compilable(node):
+        return None
     return compile(node, "<dynagraph-expr>", "eval")
+
+
+@functools.cache
+def _compiled_tuple(exprs: tuple[str, ...]) -> Any:
+    """Several expressions compiled into one that evaluates to their tuple,
+    or None if one of them is not one `_compiled_expr` takes."""
+    if any(_compiled_expr(e) is None for e in exprs):
+        return None
+    node = ast.parse("(" + "".join(f"({e.strip()})," for e in exprs) + ")", mode="eval")
+    node = _BoolOpsToCalls().visit(node)
+    ast.fix_missing_locations(node)
+    return compile(node, "<dynagraph-exprs>", "eval")
 
 
 def _eval_int(expr: str, env: dict[str, int]) -> int | None:
@@ -2262,11 +2429,13 @@ def _eval_int(expr: str, env: dict[str, int]) -> int | None:
     code = _compiled_expr(expr)
     if code is not None:
         try:
-            v = eval(code, {"__builtins__": {}}, env)
-        except (NameError, ZeroDivisionError, TypeError):
+            v = eval(code, _EXPR_GLOBALS, env)
+        except (NameError, ArithmeticError, TypeError, ValueError):
             return None
         if isinstance(v, float):
             return int(v) if v == int(v) else None
+        if isinstance(v, bool):
+            return int(v)
         return v
     node = _parse_expr(expr)
     if node is None:
@@ -3761,6 +3930,66 @@ def lifetimes_from_source(src: str) -> dict[str, tuple[int, int]]:
     return out
 
 
+_OUTS_SRC = r"""
+#include <torch/extension.h>
+
+// One fresh tensor per (byte offset, dtype, geometry) over `base`'s storage,
+// as `_over_storage` makes them, in one call: the dtype is the one of
+// protos[dt[i]], sizes / strides are consecutive runs of nd[i] values.
+std::vector<at::Tensor> make_outputs(const at::Tensor& base,
+                                     const std::vector<at::Tensor>& protos,
+                                     const std::vector<int64_t>& off,
+                                     const std::vector<int64_t>& dt,
+                                     const std::vector<int64_t>& nd,
+                                     const std::vector<int64_t>& sizes,
+                                     const std::vector<int64_t>& strides) {
+  std::vector<at::Tensor> out;
+  out.reserve(off.size());
+  c10::Storage st = base.storage();
+  size_t k = 0;
+  for (size_t i = 0; i < off.size(); ++i) {
+    at::Tensor t = at::empty({0}, protos[dt[i]].options());
+    int64_t n = nd[i];
+    t.set_(st, off[i] / t.element_size(),
+           at::IntArrayRef(sizes.data() + k, n),
+           at::IntArrayRef(strides.data() + k, n));
+    out.push_back(std::move(t));
+    k += n;
+  }
+  return out;
+}
+"""
+
+_outs_ext_state: list[Any] = []
+
+
+def _outs_ext() -> Any:
+    """The C++ helper that makes a call's arena outputs in one call (5 us a
+    tensor from Python, ~1 from here), or None when it cannot be built."""
+    if not _outs_ext_state:
+        try:
+            from torch.utils.cpp_extension import load_inline
+
+            ext = load_inline(
+                "dynagraph_outputs",
+                cpp_sources=_OUTS_SRC,
+                functions=["make_outputs"],
+                extra_cflags=["-O2"],
+            )
+        except Exception as exc:
+            log.warning("DynaGraph output helper unavailable: %s", exc)
+            ext = None
+        _outs_ext_state.append(ext)
+    return _outs_ext_state[0]
+
+
+@functools.cache
+def _torch_dtype(name: str) -> Any:
+    import torch
+
+    return getattr(torch, name.split(".")[-1])
+
+
 def _over_storage(t: Any, byte_off: int, dtype: Any, sizes: Any, strides: Any) -> Any:
     """A fresh tensor over `t`'s storage at a byte offset: not a view of `t`,
     so it has a version counter of its own."""
@@ -3860,6 +4089,11 @@ class _Exec:
         self.inline_cluster: dict[int, list[Any]] = {}
         self.inline_applied: dict[int, Any] = {}
         self.inline_off: OrderedSet[int] = OrderedSet()
+        # With no declared keys, a harvest key fixes every inline node: the
+        # arrays that rewrite them all for it (`dg_inline_set`), and which one
+        # the nodes hold now (None when that is not one of them).
+        self.inline_batches: dict[Any, Any] = {}
+        self.inline_state: Any = None
         # Shapes whose replay has already been checked against eager.
         self.verified: OrderedSet[Any] = OrderedSet()
         # Host-side path: the patcher's per-exec state (`dg_init`), and the
@@ -4524,9 +4758,20 @@ class DynaGraphRunner:
         # Per harvest key, the operands of every inline site; per (site,
         # harvest key, declared key), the node parameters prepared from its
         # declaration; per declared kernel name, the function it resolved to.
-        self._inline_ops: dict[Any, dict[int, tuple[list[Any], dict[str, Any]]]] = {}
+        self._inline_ops: dict[Any, dict[int, Any]] = {}
         self._inline_prepared: dict[Any, tuple[Any, Any, Any]] = {}
-        self._site_code: dict[int, tuple[Any, OrderedSet[str]]] = {}
+        self._site_code: dict[int, tuple[Any, OrderedSet[str], str] | None] = {}
+        self._site_recipes: dict[int, Any] = {}
+        # Per harvest key, what every inline site launches (`_apply_inline`),
+        # kept when no site declares a key (then nothing else decides it).
+        self._inline_wanted: dict[Any, list[Any]] = {}
+        self._inline_no_keys = all(
+            d.key is None for d in (self.inline_sites or {}).values()
+        )
+        # Per (representative site, harvest key, declared key): its packed
+        # launches and where their addresses sit (`_address_plan`), which the
+        # sites sharing its signature are built from.
+        self._inline_rep: dict[Any, Any] = {}
         # (site name, harvest key, declared template, tensor geometry) ->
         # packed launches of the first site met and where their addresses
         # came from (`_packed_launches`).
@@ -5419,6 +5664,223 @@ class DynaGraphRunner:
             deps,
         )
 
+    def _site_compiled(self, i: int) -> tuple[Any, OrderedSet[str], str] | None:
+        """Site `i`'s call text compiled, the names it mentions, and the text
+        with those names replaced by their position (what two sites share
+        when they differ only in which buffers they are handed)."""
+        if i in self._site_code:
+            return self._site_code[i]
+        text = self.site_args[i]
+        depth, j = 1, 0
+        while j < len(text) and depth:
+            if text[j] == "(":
+                depth += 1
+            elif text[j] == ")":
+                depth -= 1
+            j += 1
+        got = None
+        if not depth:
+            try:
+                tree = ast.parse(f"__call({text[: j - 1]})", mode="eval")
+            except SyntaxError:
+                tree = None
+            if tree is not None:
+                names = OrderedSet(
+                    n.id
+                    for n in ast.walk(tree)
+                    if isinstance(n, ast.Name)
+                    and n.id not in ("__call", "reinterpret_tensor")
+                )
+                pos = {v: k for k, v in enumerate(names)}
+                norm = ast.parse(f"__call({text[: j - 1]})", mode="eval")
+                for n in ast.walk(norm):
+                    if isinstance(n, ast.Name) and n.id in pos:
+                        n.id = f"_n{pos[n.id]}"
+                got = (
+                    compile(tree, "<dynagraph-site>", "eval"),
+                    names,
+                    ast.dump(norm),
+                )
+        self._site_code[i] = got
+        return got
+
+    def _site_signature(
+        self, i: int, env: dict[str, int], offsets: list[int], args: list[Any]
+    ) -> tuple[Any, list[int], Any] | None:
+        """What site `i`'s launches are a function of at this shape, apart
+        from addresses; with the base address and extent of every name its
+        call mentions. None when the site is not one to share.
+
+        Two sites with the same signature are handed operands of the same
+        geometry in the same arrangement: the same call text up to which
+        names it mentions, an arena buffer of the same layout expressions
+        (so the same at every shape) or an input of the same geometry now,
+        and the same pattern of names that are one buffer. Their launches
+        then differ only in the addresses, by where each name is. An input's
+        alignment is part of it (a library may choose by it), its place in
+        its storage is not: a backward's saved activations are all views of
+        one buffer, at a different offset per layer.
+
+        The last element is (per-name extents, the storages the inputs live
+        in); `_address_plan` attributes words by the first and refuses a word
+        that lands in the second but in none of the names.
+        """
+        recipe = self._site_recipes.get(i, False)
+        if recipe is False:
+            recipe = self._site_recipes[i] = self._site_recipe(i, env)
+        if recipe is None:
+            return None
+        norm, items = recipe
+        arena = self.arena.data_ptr()
+        parts: list[Any] = []
+        bases: list[int] = []
+        exts: list[tuple[int, int]] = []
+        stores: list[tuple[int, int]] = []
+        for it in items:
+            kind = it[0]
+            if kind == "sym":
+                parts.append(("sym", env[it[1]]))
+                bases.append(0)
+                exts.append((0, 0))
+                continue
+            if kind == "torch":
+                parts.append(("torch",))
+                bases.append(0)
+                exts.append((0, 0))
+                continue
+            if kind == "arena":
+                _k, slot, itemsize, code, nd, dtype_name, owner = it
+                try:
+                    g = eval(code, _EXPR_GLOBALS, env)
+                except (NameError, ArithmeticError, TypeError, ValueError):
+                    return None
+                base = arena + offsets[slot]
+                ext = (base, base + g[0] * itemsize)
+                # What the operand is (a view's geometry when it is one, by
+                # value: one view is written many ways), not what the buffer
+                # under it was allocated as.
+                parts.append(
+                    (
+                        ("arena", (g[1 : 1 + nd], g[1 + nd : 1 + 2 * nd]), dtype_name),
+                        g[-1],
+                        owner,
+                    )
+                )
+            else:
+                _k, j, code, nd, owner = it
+                if j >= len(args):
+                    return None
+                t = args[j]
+                if not hasattr(t, "data_ptr"):
+                    return None
+                geo = None
+                if code is not None:
+                    try:
+                        g = eval(code, _EXPR_GLOBALS, env)
+                    except (NameError, ArithmeticError, TypeError, ValueError):
+                        return None
+                    geo = (g[:nd], g[nd : 2 * nd], g[-1])
+                st = t.untyped_storage()
+                base = t.data_ptr()
+                sp = st.data_ptr()
+                shape = tuple(t.shape)
+                stride = t.stride()
+                span = sum((m - 1) * abs(x) for m, x in zip(shape, stride))
+                ext = (base, base + (span + 1) * t.element_size())
+                stores.append((sp, sp + st.nbytes()))
+                parts.append((("in", shape, stride, t.dtype, base % 256), geo, owner))
+            bases.append(base)
+            exts.append(ext)
+        return (self.extern_sites[i], norm, tuple(parts)), bases, (exts, stores)
+
+    def _site_recipe(self, i: int, env: dict[str, int]) -> Any:
+        """What `_site_signature` needs of site `i` that no shape changes:
+        per name it mentions, what it is (a symbol, an arena buffer and its
+        slot, an input and its position), its geometry as one compiled
+        expression, and which earlier name is the same buffer. None when a
+        name is something the signature does not cover."""
+        compiled = self._site_compiled(i)
+        if compiled is None:
+            return None
+        _code, names, norm = compiled
+        items: list[Any] = []
+        owners: dict[Any, int] = {}
+        for k, v in enumerate(names):
+            if v in env:
+                items.append(("sym", v))
+                continue
+            if v == "torch":
+                items.append(("torch",))
+                continue
+            n = self.alias.get(v, v)
+            if n in self._inline_rets:
+                return None
+            geo = self.views.get(v)
+            owner = owners.setdefault(n, k)
+            if n in self.slot_of:
+                span, itemsize = self.sizes[n]
+                sizes_e, strides_e, dtype_name = self.layouts[n]
+                if geo is not None:
+                    sizes_e, strides_e, off_e = geo
+                else:
+                    off_e = "0"
+                code = _compiled_tuple((span, *sizes_e, *strides_e, off_e))
+                if code is None:
+                    return None
+                items.append(
+                    (
+                        "arena",
+                        self.slot_of[n],
+                        itemsize,
+                        code,
+                        len(sizes_e),
+                        dtype_name,
+                        owner,
+                    )
+                )
+            elif n in self.argv:
+                code = None
+                nd = 0
+                if geo is not None:
+                    nd = len(geo[0])
+                    code = _compiled_tuple((*geo[0], *geo[1], geo[2]))
+                    if code is None:
+                        return None
+                items.append(("in", self.argv[n], code, nd, owner))
+            else:
+                return None
+        return norm, items
+
+    def _address_plan(
+        self, launches: list[Any], where: Any, bases: list[int]
+    ) -> list[tuple[int, int, int, int, int]] | None:
+        """Where `launches` hold an address inside one of the names a site
+        mentions: (launch, parameter, byte, name, distance from its base).
+        None when a word lands in the arena or an input's storage but in
+        none of them (which name it follows is then unknown)."""
+        exts, stores = where
+        arena = self.arena.data_ptr()
+        stores = [
+            (arena, arena + self.arena.numel() * self.arena.element_size())
+        ] + list(stores)
+        plan = []
+        for n, L in enumerate(launches):
+            for j, b in enumerate(L.args):
+                for w in range(0, len(b) - 7, 8):
+                    v = int.from_bytes(b[w : w + 8], "little")
+                    if not v:
+                        continue
+                    best = None
+                    for k, (lo, hi) in enumerate(exts):
+                        if lo <= v < hi and (best is None or hi - lo < best[0]):
+                            best = (hi - lo, k)
+                    if best is not None:
+                        k = best[1]
+                        plan.append((n, j, w, k, v - bases[k]))
+                    elif any(lo <= v < hi for lo, hi in stores):
+                        return None
+        return plan
+
     def _site_operands(
         self, i: int, env: dict[str, int], view_of: Any, args: list[Any]
     ) -> tuple[list[Any], dict[str, Any]] | None:
@@ -5438,33 +5900,10 @@ class DynaGraphRunner:
         mentions are resolved. None when a name is something this does not
         build (another extern call's result, unless inline).
         """
-        compiled = self._site_code.get(i)
+        compiled = self._site_compiled(i)
         if compiled is None:
-            text = self.site_args[i]
-            depth, j = 1, 0
-            while j < len(text) and depth:
-                if text[j] == "(":
-                    depth += 1
-                elif text[j] == ")":
-                    depth -= 1
-                j += 1
-            if depth:
-                return None
-            try:
-                tree = ast.parse(f"__call({text[: j - 1]})", mode="eval")
-            except SyntaxError:
-                return None
-            names = OrderedSet(
-                n.id
-                for n in ast.walk(tree)
-                if isinstance(n, ast.Name)
-                and n.id not in ("__call", "reinterpret_tensor")
-            )
-            compiled = self._site_code[i] = (
-                compile(tree, "<dynagraph-site>", "eval"),
-                names,
-            )
-        code, names = compiled
+            return None
+        code, names, _norm = compiled
         reinterpret = self.model.__globals__["reinterpret_tensor"]
 
         def tensor_of(name: str) -> Any:
@@ -5651,12 +6090,16 @@ class DynaGraphRunner:
             ex.ptr_dirty = True
             ex.applied = None
             ex.inline_applied.clear()
+            ex.inline_batches.clear()
+            ex.inline_state = None
         self._invalidate_harvests(self.lane)
         # Inline sites' operands are views of the arena and their packed
         # parameters hold its addresses, under keys that do not name it: a
         # shape met again after the move would get the old arena's launches.
         self._inline_ops.clear()
         self._inline_prepared.clear()
+        self._inline_rep.clear()
+        self._inline_wanted.clear()
         self._inline_templates.clear()
 
     def _grow_store(self, j: int, x: Any, n: int) -> None:
@@ -6819,7 +7262,9 @@ class DynaGraphRunner:
         self.ex.child_applied = hkey
         return True
 
-    def slot_offsets(self, env: dict[str, int]) -> list[int] | None:
+    def slot_offsets(
+        self, env: dict[str, int], sz: list[int] | None = None
+    ) -> list[int] | None:
         """Byte offset of every slot, plus the total, computed on the host.
 
         The same prefix sum the generated code does per shape (setctx on the
@@ -6828,9 +7273,11 @@ class DynaGraphRunner:
         device would cost a synchronize on every call, so the arithmetic is
         duplicated deliberately and must agree. Under a fixed layout these
         are the build's constants, and None for a shape that outgrows one of
-        its slots (the caller rebuilds).
+        its slots (the caller rebuilds). `sz` is `_slot_sizes(env)` when the
+        caller has it already.
         """
-        sz = self._slot_sizes(env)
+        if sz is None:
+            sz = self._slot_sizes(env)
         if sz is None:
             return None
         if self.fixed_off is not None:
@@ -6847,7 +7294,65 @@ class DynaGraphRunner:
         return off
 
     def _slot_sizes(self, env: dict[str, int]) -> list[int] | None:
-        return slot_sizes(self.sizes, self.slot_of, self.n_slots, env)
+        # Every span as one compiled expression (`_compiled_tuple`), keyed by
+        # the tables it was built from (a build replaces them).
+        key = (id(self.sizes), id(self.slot_of), self.n_slots)
+        c = getattr(self, "_slot_code", None)
+        if c is None or c[0] != key:
+            items = [
+                (self.slot_of[nm], itemsize)
+                for nm, (_span, itemsize) in self.sizes.items()
+                if nm in self.slot_of
+            ]
+            code = _compiled_tuple(
+                tuple(
+                    span for nm, (span, _i) in self.sizes.items() if nm in self.slot_of
+                )
+            )
+            c = self._slot_code = (key, items, code)
+        _key, items, code = c
+        if code is None or not items:
+            return slot_sizes(self.sizes, self.slot_of, self.n_slots, env)
+        try:
+            vals = eval(code, _EXPR_GLOBALS, env)
+        except (NameError, ArithmeticError, TypeError, ValueError):
+            return None
+        sz = [0] * self.n_slots
+        for (slot, itemsize), v in zip(items, vals):
+            if v.__class__ is not int:
+                if isinstance(v, float) and v == int(v):
+                    v = int(v)
+                elif isinstance(v, bool):
+                    v = int(v)
+                else:
+                    return None
+            nbytes = v * itemsize
+            if nbytes > sz[slot]:
+                sz[slot] = nbytes
+        return sz
+
+    def _outputs_code(self) -> Any:
+        """Every output's span, offset, sizes and strides as one compiled
+        expression, with where each output's values start; None when one of
+        them is not arithmetic `_compiled_expr` takes."""
+        key = (id(self.outputs), id(self.output_views), id(self.layouts))
+        c = getattr(self, "_out_code", None)
+        if c is not None and c[0] == key:
+            return c[1]
+        exprs: list[str] = []
+        meta = []
+        for name, view in zip(self.outputs, self.output_views):
+            span, itemsize = self.sizes[name]
+            sizes_e, strides_e, dtype_name = self.layouts[name]
+            off_e = "0"
+            if view is not None:
+                sizes_e, strides_e, off_e = view
+            meta.append((len(exprs), len(sizes_e)))
+            exprs += [span, off_e, *sizes_e, *strides_e]
+        code = _compiled_tuple(tuple(exprs))
+        got = (code, meta) if code is not None else None
+        self._out_code = (key, got)
+        return got
 
     def _read_symbols(self, cu: Any, stream: int) -> tuple[int, ...] | None:
         """The device-resolved symbols an output needs, read back from the
@@ -6928,12 +7433,34 @@ class DynaGraphRunner:
                         "arena-too-small", f"slot {i} needs {need} > {cap} at {env}"
                     )
                     return REBUILD
-        offsets = self.slot_offsets(env)
+        offsets = self.slot_offsets(env, sz)
         if offsets is None:
             _fallback("unevaluable-size", f"layout at {env}")
             return None
 
         plan = []
+        oc = self._outputs_code()
+        if oc is not None:
+            code, meta = oc
+            try:
+                vals = eval(code, _EXPR_GLOBALS, env)
+            except (NameError, ArithmeticError, TypeError, ValueError):
+                vals = None
+            if vals is not None and all(v.__class__ is int for v in vals):
+                for name, (at, nd) in zip(self.outputs, meta):
+                    _span, itemsize = self.sizes[name]
+                    dtype_name = self.layouts[name][2]
+                    n, off = vals[at], vals[at + 1]
+                    plan.append(
+                        (
+                            offsets[self.slot_of[name]] + off * itemsize,
+                            (n - off) * itemsize,
+                            _torch_dtype(dtype_name),
+                            list(vals[at + 2 : at + 2 + nd]),
+                            list(vals[at + 2 + nd : at + 2 + 2 * nd]),
+                        )
+                    )
+                return plan, offsets[-1], offsets
         for name, view in zip(self.outputs, self.output_views):
             span, itemsize = self.sizes[name]
             sizes_e, strides_e, dtype_name = self.layouts[name]
@@ -7356,6 +7883,7 @@ class DynaGraphRunner:
         Debug only (`TORCHINDUCTOR_DYNAGRAPH_DEBUG`).
         """
         import torch
+        from torch.utils import _capture_launch as cl
 
         for k in self.kernels:
             vals = {n: _eval_int(e, env) for n, e in k["exprs"].items()}
@@ -7376,14 +7904,17 @@ class DynaGraphRunner:
             for (i, want), prepared in list(self._inline_prepared.items())[
                 -len(self.inline_sites) :
             ]:
-                params, keep, _cl = prepared
-                if not keep:
+                entries, _keep, _cl = prepared
+                if not entries:
                     continue
-                bufs = keep[0][0]
+                f, _dims, raw, offs, pt = entries[0]
+                raw = bytearray(raw)
+                for w, v in pt:
+                    raw[w : w + 8] = v.to_bytes(8, "little")
                 tma = [
-                    hex(int.from_bytes(b.raw[:8], "little"))
-                    for b in bufs
-                    if len(b.raw) == 128
+                    hex(int.from_bytes(raw[o : o + 8], "little"))
+                    for o, (_o, sz) in zip(offs, cl.param_sizes(f))
+                    if sz == 128
                 ]
                 names = re.findall(r"\b(buf\d+)\b", self.site_args[i])
                 have = {}
@@ -7859,12 +8390,13 @@ class DynaGraphRunner:
         does (`_inline_exec`), and a structure not met before is captured
         once at this shape.
         """
-        from cuda.bindings import driver as cu
-
-        from torch.cuda._utils import _check_cuda_bindings as ck
         from torch.utils import _capture_launch as cl
 
-        ops = self._inline_ops.get(hkey)
+        if self._inline_no_keys:
+            wanted = self._inline_wanted.get(hkey)
+            if wanted is not None:
+                return self._apply_wanted(ex, hkey, wanted, inputs)
+        ops: dict[int, Any] | None = self._inline_ops.get(hkey)
         if ops is None:
             memo: dict[str, Any] = {}
 
@@ -7879,37 +8411,132 @@ class DynaGraphRunner:
 
             shaped = self._shape_inputs(inputs)
             ops = {}
-            for i in self.inline_sites:
+            # Sites with one signature (every layer's same GEMM) are built
+            # from the first of them: its operands, its declaration and
+            # packing, the others only their names' addresses.
+            reps: dict[Any, int] = {}
+            for i, decl in self.inline_sites.items():
+                sig = (
+                    self._site_signature(i, env, offsets, shaped)
+                    if decl.key is None
+                    else None
+                )
+                if sig is not None and sig[0] in reps:
+                    ops[i] = (None, None, ("member", reps[sig[0]], sig[1]))
+                    continue
                 got = self._site_operands(i, env, view_of, shaped)
                 if got is None:
                     _fallback("inline-operands", self.extern_sites[i])
                     return None
-                ops[i] = got
+                grp: Any = None
+                if sig is not None:
+                    reps[sig[0]] = i
+                    grp = ("rep", sig[1], sig[2])
+                ops[i] = (got[0], got[1], grp)
             if len(self._inline_ops) >= 1024:
                 self._inline_ops.clear()
             self._inline_ops[hkey] = ops
         wanted = []
         for i, decl in self.inline_sites.items():
-            a, kw = ops[i]
-            want = (hkey, decl.key(*a, **kw) if decl.key is not None else None)
+            a, kw, grp = ops[i]
+            if grp is not None:
+                want = (hkey, None)
+            else:
+                want = (hkey, decl.key(*a, **kw) if decl.key is not None else None)
             prepared = self._inline_prepared.get((i, want))
             if prepared is None:
                 try:
-                    prepared = self._prepare_inline(i, decl, a, kw, hkey)
+                    if grp is None:
+                        prepared = self._prepare_inline(i, decl, a, kw, hkey)
+                    elif grp[0] == "rep":
+                        self._ensure_prepared(i, decl, a, kw)
+                        packed = self._packed_launches(i, decl, a, kw, hkey)
+                        prepared = self._node_params(packed)
+                        self._inline_rep[(i, want)] = (
+                            (prepared, self._address_plan(packed, grp[2], grp[1]))
+                            if packed
+                            else None
+                        )
+                    else:
+                        prepared = self._member_params(
+                            i, decl, grp, want, ops, env, offsets, inputs, hkey
+                        )
+                        if prepared is None:
+                            return None
                 except cl.Mismatch as exc:
                     _fallback("launch-declaration", f"{self.extern_sites[i]}: {exc}")
                     return None
-                if len(self._inline_prepared) >= 4096:
+                # Bounded by shapes, not entries: every shape holds one entry
+                # per site, and a bound below the sites times the shapes seen
+                # would drop the table on every call.
+                if len(self._inline_prepared) >= 512 * len(self.inline_sites):
                     self._inline_prepared.clear()
+                    self._inline_rep.clear()
                 self._inline_prepared[(i, want)] = prepared
             wanted.append((i, want, prepared))
+        if self._inline_no_keys:
+            if len(self._inline_wanted) >= 1024:
+                self._inline_wanted.clear()
+            self._inline_wanted[hkey] = wanted
+        return self._apply_wanted(ex, hkey, wanted, inputs)
+
+    def _apply_wanted(
+        self, ex: Any, hkey: Any, wanted: list[Any], inputs: list[Any]
+    ) -> Any:
+        """Pick the graph for what the inline sites launch and rewrite its
+        nodes that hold something else; the graph, or None to hand it back.
+
+        With no declared keys the harvest key fixes every node, so the first
+        time a graph serves one the arrays for all its nodes are kept, and
+        from then on it costs one `dg_inline_set` call -- or nothing when the
+        graph already holds that key."""
+        from cuda.bindings import driver as cu
+
+        from torch.cuda._utils import _check_cuda_bindings as ck
+
         if self.host_mode:
             ex = self._inline_exec(hkey, wanted, inputs)
             if ex is None:
                 return None
             self.ex = ex
+        fast = self._inline_no_keys
+        if fast:
+            if ex.inline_state == hkey:
+                return ex
+            got = ex.inline_batches.get(hkey)
+            if got is not None:
+                lib = _inline_lib()
+                args, applied = got
+                rc = lib.dg_inline_set(int(ex.exec_h), *args)
+                if rc != 0:
+                    ex.inline_applied.clear()
+                    ex.inline_state = None
+                    _fallback(
+                        "launch-declaration",
+                        f"inline node update failed at node {rc - 1} "
+                        f"(CUDA error {lib.dg_inline_error()})",
+                    )
+                    return None
+                ex.inline_applied = dict(applied)
+                ex.inline_state = hkey
+                return ex
+        ex.inline_state = None
+        # Every node's arrays are kept only when every site launches and
+        # none had to be switched on or off.
+        whole = fast
+        # The nodes to rewrite, gathered for one `dg_inline_set` call.
+        b_nodes: list[int] = []
+        b_funcs: list[int] = []
+        b_dims: list[int] = []
+        b_blobs: list[bytes] = []
+        b_len: list[int] = []
+        b_np: list[int] = []
+        b_offs: list[int] = []
+        b_npt: list[int] = []
+        b_pw: list[int] = []
+        b_pv: list[int] = []
         for i, want, prepared in wanted:
-            if ex.inline_applied.get(i) == want:
+            if not whole and ex.inline_applied.get(i) == want:
                 continue
             params, _keep, clusters = prepared
             nodes = ex.inline_nodes[i]
@@ -7922,19 +8549,65 @@ class DynaGraphRunner:
                 )
                 return None
             if params is None:
+                whole = False
                 # Declared to launch nothing this time.
                 if i not in ex.inline_off:
                     for n in nodes:
                         ck(cu.cuGraphNodeSetEnabled(ex.exec_h, int(n), 0))
                     ex.inline_off.add(i)
             else:
-                for n, p in zip(nodes, params):
-                    ck(cu.cuGraphExecKernelNodeSetParams(ex.exec_h, int(n), p))
+                for n, (f, dims, blob, offs, pt) in zip(nodes, params):
+                    b_nodes.append(int(n))
+                    b_funcs.append(f)
+                    b_dims.extend(dims)
+                    b_blobs.append(blob)
+                    b_len.append(len(blob))
+                    b_np.append(len(offs))
+                    b_offs.extend(offs)
+                    b_npt.append(len(pt))
+                    for w, v in pt:
+                        b_pw.append(w)
+                        b_pv.append(v)
                 if i in ex.inline_off:
+                    whole = False
                     for n in nodes:
                         ck(cu.cuGraphNodeSetEnabled(ex.exec_h, int(n), 1))
                     ex.inline_off.discard(i)
             ex.inline_applied[i] = want
+        if b_nodes:
+            c = ctypes
+            n = len(b_nodes)
+            lib = _inline_lib()
+            if lib is None:
+                _fallback("planner-build", "inline node helper")
+                return None
+            args = (
+                n,
+                (c.c_void_p * n)(*b_nodes),
+                (c.c_void_p * n)(*b_funcs),
+                (c.c_uint * (7 * n))(*b_dims),
+                (c.c_char_p * n)(*b_blobs),
+                (c.c_int * n)(*b_len),
+                (c.c_int * n)(*b_np),
+                (c.c_int * max(len(b_offs), 1))(*b_offs),
+                (c.c_int * n)(*b_npt),
+                (c.c_int * max(len(b_pw), 1))(*b_pw),
+                (c.c_ulonglong * max(len(b_pv), 1))(*b_pv),
+            )
+            rc = lib.dg_inline_set(int(ex.exec_h), *args)
+            if rc != 0:
+                ex.inline_applied.clear()
+                _fallback(
+                    "launch-declaration",
+                    f"inline node update failed at node {rc - 1} "
+                    f"(CUDA error {lib.dg_inline_error()})",
+                )
+                return None
+            if whole:
+                if len(ex.inline_batches) >= 1024:
+                    ex.inline_batches.clear()
+                ex.inline_batches[hkey] = (args, dict(ex.inline_applied))
+                ex.inline_state = hkey
         return ex
 
     def _inline_exec(self, hkey: Any, wanted: list[Any], inputs: list[Any]) -> Any:
@@ -8078,29 +8751,121 @@ class DynaGraphRunner:
         from a recording of this very call. So the cost of a new kernel is
         paid once per kernel, not per shape.
         """
-        import ctypes as ct
-
-        from cuda.bindings import driver as cu
-
         self._ensure_prepared(i, decl, a, kw)
-        launches = self._packed_launches(i, decl, a, kw, hkey)
+        return self._node_params(self._packed_launches(i, decl, a, kw, hkey))
+
+    def _member_params(
+        self,
+        i: int,
+        decl: Any,
+        grp: Any,
+        want: Any,
+        ops: dict[int, Any],
+        env: dict[str, int],
+        offsets: list[int],
+        inputs: list[Any],
+        hkey: Any,
+    ) -> tuple[Any, Any, Any] | None:
+        """Node parameters for site `i` from its representative's launches,
+        the addresses moved to where `i`'s names are. A representative whose
+        launches hold an address this cannot attribute is not shared: the
+        site is then built from its own operands."""
+        _kind, r, bases = grp
+        got = self._inline_rep.get((r, want))
+        if got is None:
+            ra, rkw, rgrp = ops[r]
+            packed = self._packed_launches(r, self.inline_sites[r], ra, rkw, hkey)
+            got = (
+                (
+                    self._node_params(packed),
+                    self._address_plan(packed, rgrp[2], rgrp[1]),
+                )
+                if packed
+                else None
+            )
+            self._inline_rep[(r, want)] = got
+        if got is None:
+            # The representative launches nothing; neither does this site.
+            return None, None, None
+        (entries, owners, clusters), plan = got
+        if plan is not None:
+            return self._member_entries(entries, plan, bases), owners, clusters
+        own = self._site_operands(
+            i,
+            env,
+            lambda nm: self._arena_view(nm, env, offsets)
+            if nm in self.slot_of
+            else None,
+            self._shape_inputs(inputs),
+        )
+        if own is None:
+            _fallback("inline-operands", self.extern_sites[i])
+            return None
+        return self._prepare_inline(i, decl, own[0], own[1], hkey)
+
+    def _node_params(self, launches: list[Any]) -> tuple[Any, Any, Any]:
+        """What `dg_inline_set` needs to rewrite a node per packed launch --
+        (function, grid and block and smem, parameter bytes, each parameter's
+        offset in them, words to overwrite) -- with what the launches point
+        into, and each launch's cluster shape (None for all three when there
+        is no launch)."""
+        from torch.utils import _capture_launch as cl
+
         if not launches:
             return None, None, None
-        params, keep = [], []
+        entries = []
         for L in launches:
             f = L.kernel
-            bufs = [ct.create_string_buffer(b, len(b)) for b in L.args]
-            arr = (ct.c_void_p * max(len(bufs), 1))(*[ct.addressof(b) for b in bufs])
-            p = cu.CUDA_KERNEL_NODE_PARAMS()
-            p.func = f
-            p.gridDimX, p.gridDimY, p.gridDimZ = L.grid
-            p.blockDimX, p.blockDimY, p.blockDimZ = L.block
-            p.sharedMemBytes = L.smem
-            p.kernelParams = ct.addressof(arr)
-            p.extra = 0
-            params.append(p)
-            keep.append((bufs, arr, L.owner))
-        return params, keep, tuple(L.cluster for L in launches)
+            offs = tuple(off for off, _sz in cl.param_sizes(f))
+            blob = bytearray(max((o + len(b) for o, b in zip(offs, L.args)), default=1))
+            for o, b in zip(offs, L.args):
+                blob[o : o + len(b)] = b
+            entries.append((f, (*L.grid, *L.block, L.smem), bytes(blob), offs, ()))
+        return (
+            entries,
+            [L.owner for L in launches],
+            tuple(L.cluster for L in launches),
+        )
+
+    @staticmethod
+    def _member_entries(rep: list[Any], plan: list[Any], bases: list[int]) -> list[Any]:
+        """A representative's node entries with the words `plan` names
+        pointing where this site's names are: the bytes are shared, only the
+        patches are this site's."""
+        patches: list[list[tuple[int, int]]] = [[] for _ in rep]
+        for n, j, w, k, delta in plan:
+            patches[n].append((rep[n][3][j] + w, bases[k] + delta))
+        return [
+            (f, dims, blob, offs, tuple(pt))
+            for (f, dims, blob, offs, _p), pt in zip(rep, patches)
+        ]
+
+    def _out_batch(self, geom: list[Any]) -> tuple[Any, ...] | None:
+        """`geom`'s arena outputs as the flat arrays `make_outputs` takes (in
+        order), or None when there is none."""
+        import torch
+
+        protos: dict[Any, int] = {}
+        off, dt, nd, sizes, strides = [], [], [], [], []
+        for g in geom:
+            if g is None or g[0] != "arena":
+                continue
+            off.append(g[1])
+            dt.append(protos.setdefault(g[2], len(protos)))
+            nd.append(len(g[3]))
+            sizes.extend(g[3])
+            strides.extend(g[4])
+        if not off:
+            return None
+        dev = self.arena.device
+        return (
+            [torch.empty(0, dtype=d, device=dev) for d in protos],
+            off,
+            dt,
+            nd,
+            sizes,
+            strides,
+        )
 
     def _hot_tables(self) -> tuple[Any, ...]:
         """The per-call tables, derived once from what the build settled."""
@@ -8425,21 +9190,28 @@ class DynaGraphRunner:
                     geom.append(("arena", base, dtype, sizes, strides))
             if len(self.out_cache) >= 4096:
                 self.out_cache.clear()
-            cached = self.out_cache[ukey] = (geom, inview)
-        geom, inview = cached
+            cached = self.out_cache[ukey] = (geom, inview, self._out_batch(geom))
+        geom, inview, batch = cached
         arena = self.arena
         out: list[Any] = []
+        # A tensor of its own over the arena's storage per output (the layout
+        # keeps every slot 256-byte aligned, so the element offset is exact),
+        # not a view of the arena tensor: views share their base's version
+        # counter, and one in-place write to any output would make autograd
+        # refuse every other output of this arena it had saved.
+        made = None
+        ext = _outs_ext() if batch is not None else None
+        if ext is not None:
+            made = iter(ext.make_outputs(arena, *batch))
         for g in geom:
             if g is None:
                 out.append(None)
             elif g[0] == "arena":
-                # A tensor of its own over the arena's storage (the layout
-                # keeps every slot 256-byte aligned, so the element offset is
-                # exact), not a view of the arena tensor: views share their
-                # base's version counter, and one in-place write to any
-                # output would make autograd refuse every other output of
-                # this arena it had saved.
-                out.append(_over_storage(arena, g[1], g[2], g[3], g[4]))
+                out.append(
+                    next(made)
+                    if made is not None
+                    else _over_storage(arena, g[1], g[2], g[3], g[4])
+                )
             else:
                 out.append(self._ext_value(hkey, g[1]))
         # An input handed back is the caller's own tensor, never a view of
