@@ -1,0 +1,333 @@
+diff -ruN a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt	2026-10-05 19:46:56.731370349 +0000
++++ b/CMakeLists.txt	2026-10-05 19:46:56.731370349 +0000
+@@ -4,7 +4,7 @@
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_EXTENSIONS OFF)
+ 
+-set(FA2_ENABLED ON)
++set(FA2_ENABLED OFF)
+ set(FA3_ENABLED ON)
+ 
+ # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
+@@ -260,7 +260,10 @@
+         "hopper/instantiations/flash_fwd_hdim192_128_e4m3*_sm90.cu")
+     list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
+ 
+-    set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS})
++    file(GLOB FA3_GEN_SRCS
++        "hopper/instantiations/flash_fwd_hdim128_bf16_*packgqa_sm90.cu"
++        "hopper/instantiations/flash_fwd_hdim128_bf16_split*_sm90.cu"
++        "hopper/instantiations/flash_fwd_hdim128_bf16_paged*_sm90.cu")
+ 
+     # For CUDA we set the architectures on a per file basis
+     # FaV3 is not yet supported in Blackwell
+@@ -279,7 +282,7 @@
+     endif()
+ 
+     define_gpu_extension_target(
+-        _vllm_fa3_C
++        _fa3d_C
+         DESTINATION vllm_flash_attn
+         LANGUAGE ${VLLM_GPU_LANG}
+         SOURCES
+@@ -293,13 +296,13 @@
+         USE_SABI 3
+         WITH_SOABI)
+ 
+-    target_include_directories(_vllm_fa3_C PRIVATE
++    target_include_directories(_fa3d_C PRIVATE
+         hopper
+         csrc/common
+         csrc/cutlass/include)
+ 
+     # custom definitions
+-    target_compile_definitions(_vllm_fa3_C PRIVATE
++    target_compile_definitions(_fa3d_C PRIVATE
+         FLASHATTENTION_DISABLE_BACKWARD
+         FLASHATTENTION_DISABLE_DROPOUT
+         # FLASHATTENTION_DISABLE_ALIBI
+@@ -314,6 +317,14 @@
+         # FLASHATTENTION_DISABLE_HDIMDIFF64
+         # FLASHATTENTION_DISABLE_HDIMDIFF192
+         FLASHATTENTION_DISABLE_APPENDKV
++        FLASHATTENTION_DISABLE_HDIM64
++        FLASHATTENTION_DISABLE_HDIM96
++        FLASHATTENTION_DISABLE_HDIM192
++        FLASHATTENTION_DISABLE_HDIM256
++        FLASHATTENTION_DISABLE_HDIMDIFF64
++        FLASHATTENTION_DISABLE_HDIMDIFF192
++        FLASHATTENTION_DISABLE_FP16
++        FLASHATTENTION_DISABLE_FP8
+         CUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED
+         CUTLASS_ENABLE_GDC_FOR_SM90
+         TORCH_TARGET_VERSION=0x020A000000000000ULL
+@@ -321,7 +332,7 @@
+     )
+ 
+     # See _vllm_fa2_C above: enforce C++20 on the target for the vLLM subproject build.
+-    set_target_properties(_vllm_fa3_C PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
++    set_target_properties(_fa3d_C PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+ elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_LESS 12.0)
+     message(STATUS "FA3 is disabled because CUDA version is not 12.0 or later.")
+ endif ()
+diff -ruN a/hopper/flash_api.cpp b/hopper/flash_api.cpp
+--- a/hopper/flash_api.cpp	2026-10-05 19:46:56.735370423 +0000
++++ b/hopper/flash_api.cpp	2026-10-05 19:46:56.743370573 +0000
+@@ -5,6 +5,7 @@
+ #include <cutlass/numeric_types.h>
+ 
+ #include "flash.h"
++#include "launch_sink.h"
+ #include "static_switch.h"
+ #include "tile_size.h"
+ #include "heuristics.h"
+@@ -1101,7 +1102,7 @@
+             tile_count_semaphore = torch::stable::new_empty(q, {metadata_size}, ScalarType::Int);
+         }
+         if (scheduler_needs_semaphore && !use_prepare_varlen) {
+-            torch::stable::zero_(tile_count_semaphore);  // If varlen we'll manually do the zero-ing
++            if (!flash::sink_memset(tile_count_semaphore.data_ptr(), tile_count_semaphore.numel() * 4)) { torch::stable::zero_(tile_count_semaphore); }  // If varlen we'll manually do the zero-ing
+         }
+         // ORDER: {prepare_seqlen_q, num_splits_dynamic, varlen_batch_idx, num_nheads_in_l2}
+         params.prepare_seqlen_q_ptr =  use_prepare_varlen ? tile_count_semaphore.mutable_data_ptr<int>() : nullptr;
+@@ -1300,10 +1301,11 @@
+         } else if (scheduler_needs_semaphore && params.skip_scheduler_metadata_computation) {
+             // need to zero out the semaphore in this case
+             auto slice = torch::stable::narrow(tile_count_semaphore, 0, params.tile_count_semaphore_offset, 1);
+-            torch::stable::zero_(slice);
++            if (!flash::sink_memset(slice.data_ptr(), 4)) { torch::stable::zero_(slice); }
+         }
+     } else if (total_q > 0 && num_heads_k > 0) {
+         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
++        flash::sink_refuse("describe: empty key/value is not declared");
+         torch::stable::zero_(out);
+         torch::stable::fill_(softmax_lse, std::numeric_limits<float>::infinity());
+     }
+diff -ruN a/hopper/flash_api_torch_lib.cpp b/hopper/flash_api_torch_lib.cpp
+--- a/hopper/flash_api_torch_lib.cpp	2026-10-05 19:46:56.747370649 +0000
++++ b/hopper/flash_api_torch_lib.cpp	2026-10-05 19:46:56.751370724 +0000
+@@ -1,4 +1,5 @@
+ #include "registration.h"
++#include "launch_sink.h"
+ 
+ #include <torch/csrc/stable/tensor.h>
+ #include <torch/csrc/stable/library.h>
+@@ -196,6 +197,40 @@
+       cp_tot_seqused_k);
+ }
+ 
++// Same arguments as fwd, plus a CPU int64 `sink` the launches are written
++// into (see launch_sink.h). Returns what fwd returns: the buffers fwd
++// allocated, which the recorded parameters point into, so the caller keeps
++// them for as long as it uses the launches.
++std::vector<Tensor> mha_fwd_describe_stable(
++    Tensor sink, Tensor q, Tensor k, Tensor v, std::optional<Tensor> k_new, std::optional<Tensor> v_new,
++    std::optional<Tensor> q_v, std::optional<Tensor> out, std::optional<Tensor> cu_seqlens_q,
++    std::optional<Tensor> cu_seqlens_k, std::optional<Tensor> cu_seqlens_k_new, std::optional<Tensor> seqused_q,
++    std::optional<Tensor> seqused_k, std::optional<int64_t> max_seqlen_q, std::optional<int64_t> max_seqlen_k,
++    std::optional<Tensor> page_table, std::optional<Tensor> kv_batch_idx, std::optional<Tensor> leftpad_k,
++    std::optional<Tensor> rotary_cos, std::optional<Tensor> rotary_sin, std::optional<Tensor> seqlens_rotary,
++    std::optional<Tensor> q_descale, std::optional<Tensor> k_descale, std::optional<Tensor> v_descale,
++    double softmax_scale, bool is_causal, int64_t window_size_left, int64_t window_size_right, double softcap,
++    bool is_rotary_interleaved, std::optional<Tensor> scheduler_metadata, int64_t num_splits,
++    std::optional<bool> pack_gqa, int64_t sm_margin, std::optional<Tensor> s_aux, int64_t cp_world_size,
++    int64_t cp_rank, std::optional<Tensor> cp_tot_seqused_k) {
++  flash::LaunchSink s{reinterpret_cast<int64_t*>(sink.data_ptr()), sink.numel(), 1};
++  s.buf[0] = 0;
++  flash::launch_sink = &s;
++  try {
++    auto r = mha_fwd_stable(q, k, v, k_new, v_new, q_v, out, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new,
++                            seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx, leftpad_k,
++                            rotary_cos, rotary_sin, seqlens_rotary, q_descale, k_descale, v_descale, softmax_scale,
++                            is_causal, window_size_left, window_size_right, softcap, is_rotary_interleaved,
++                            scheduler_metadata, num_splits, pack_gqa, sm_margin, s_aux, cp_world_size, cp_rank,
++                            cp_tot_seqused_k);
++    flash::launch_sink = nullptr;
++    return r;
++  } catch (...) {
++    flash::launch_sink = nullptr;
++    throw;
++  }
++}
++
+ Tensor mha_fwd_get_scheduler_metadata_stable(
+     int64_t batch_size,
+     int64_t max_seqlen_q,
+@@ -290,6 +325,45 @@
+             "    int      cp_rank,"
+             "    Tensor?  cp_tot_seqused_k) -> Tensor[]");
+ 
++    ops.def("fwd_describe(Tensor(s!) sink,"
++            "    Tensor!  q,"
++            "    Tensor   k,"
++            "    Tensor   v,"
++            "    Tensor?  k_new,"
++            "    Tensor?  v_new,"
++            "    Tensor?  q_v,"
++            "    Tensor!? out,"
++            "    Tensor?  cu_seqlens_q,"
++            "    Tensor?  cu_seqlens_k,"
++            "    Tensor?  cu_seqlens_k_new,"
++            "    Tensor?  seqused_q,"
++            "    Tensor?  seqused_k,"
++            "    int?     max_seqlen_q,"
++            "    int?     max_seqlen_k,"
++            "    Tensor?  page_table,"
++            "    Tensor?  kv_batch_idx,"
++            "    Tensor?  leftpad_k,"
++            "    Tensor?  rotary_cos,"
++            "    Tensor?  rotary_sin,"
++            "    Tensor?  seqlens_rotary,"
++            "    Tensor?  q_descale,"
++            "    Tensor?  k_descale,"
++            "    Tensor?  v_descale,"
++            "    float    softmax_scale,"
++            "    bool     is_causal,"
++            "    int      window_size_left,"
++            "    int      window_size_right,"
++            "    float    softcap,"
++            "    bool     is_rotary_interleaved,"
++            "    Tensor?  scheduler_metadata,"
++            "    int      num_splits,"
++            "    bool?    pack_gqa,"
++            "    int      sm_margin,"
++            "    Tensor?  s_aux,"
++            "    int      cp_world_size,"
++            "    int      cp_rank,"
++            "    Tensor?  cp_tot_seqused_k) -> Tensor[]");
++
+     ops.def("get_scheduler_metadata("
+             "    int      batch_size,"
+             "    int      max_seqlen_q,"
+@@ -318,6 +392,7 @@
+ 
+ STABLE_TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, ops) {
+     ops.impl("fwd", TORCH_BOX(&mha_fwd_stable));
++    ops.impl("fwd_describe", TORCH_BOX(&mha_fwd_describe_stable));
+     ops.impl("get_scheduler_metadata",
+              TORCH_BOX(&mha_fwd_get_scheduler_metadata_stable));
+ }
+diff -ruN a/hopper/flash_fwd_combine_launch_template.h b/hopper/flash_fwd_combine_launch_template.h
+--- a/hopper/flash_fwd_combine_launch_template.h	2026-10-05 19:46:56.755370798 +0000
++++ b/hopper/flash_fwd_combine_launch_template.h	2026-10-05 19:46:56.759370874 +0000
+@@ -10,6 +10,7 @@
+ #include "cutlass/arch/arch.h"  // For cutlass::arch::Sm80
+ #include "cutlass/device_kernel.h"  // For device_kernel
+ #include "cutlass/kernel_launch.h"  // For kernel_launch
++#include "launch_sink.h"
+ 
+ #include "static_switch.h"
+ #include "flash.h"
+@@ -56,6 +57,8 @@
+         CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+     }
+     // kernel<<<grid_m, CombineKernel::MaxThreadsPerBlock, smem_size, stream>>>(kernel_params);
++    if (flash::sink_kernel((void const*)kernel, grid_m, dim3(CombineKernel::MaxThreadsPerBlock, 1, 1), dim3(1, 1, 1), smem_size,
++                           Arch >= 90 && enable_pdl, kernel_params)) { return; }
+     cutlass::kernel_launch<CombineKernel>(grid_m, CombineKernel::MaxThreadsPerBlock, smem_size, stream, kernel_params, Arch >= 90 && enable_pdl /*launch_with_pdl*/);
+     CHECK_CUDA_KERNEL_LAUNCH();
+ }
+diff -ruN a/hopper/flash_fwd_launch_template.h b/hopper/flash_fwd_launch_template.h
+--- a/hopper/flash_fwd_launch_template.h	2026-10-05 19:46:56.763370948 +0000
++++ b/hopper/flash_fwd_launch_template.h	2026-10-05 19:46:56.767371024 +0000
+@@ -11,6 +11,7 @@
+ #include <cutlass/kernel_hardware_info.h>
+ #include "cutlass/cluster_launch.hpp"
+ #include "cutlass/kernel_launch.h"
++#include "launch_sink.h"
+ 
+ #include "static_switch.h"
+ #include "flash.h"
+@@ -167,6 +168,7 @@
+     };
+ 
+     if (Varlen && !params.skip_scheduler_metadata_computation) {
++        flash::sink_refuse("describe: scheduler metadata must be supplied");
+         prepare_varlen_num_blocks(params, stream, PackGQA, kBlockM, kBlockN, Arch >= 90 && params.prepare_varlen_pdl /*enable_pdl*/);
+         CHECK_CUDA_KERNEL_LAUNCH();
+     }
+@@ -192,6 +194,7 @@
+         }
+         dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));
+         cutlass::ClusterLaunchParams launch_params{grid_dims, block_dims, cluster_dims, smem_size, stream};
++        if (flash::sink_kernel(kernel, grid_dims, block_dims, cluster_dims, smem_size, false, kernel_params)) { return; }
+         cutlass::launch_kernel_on_cluster(launch_params, kernel, kernel_params);
+     } else {
+         auto kernel = cutlass::device_kernel<AttnKernel>;
+@@ -199,6 +202,9 @@
+             CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+         }
+         // kernel<<<grid_dims, block_dims, smem_size, stream>>>(kernel_params);
++        if (flash::sink_kernel((void const*)kernel, grid_dims, block_dims, dim3(1, 1, 1), smem_size,
++                               Arch >= 90 && Varlen && !params.skip_scheduler_metadata_computation && params.prepare_varlen_pdl,
++                               kernel_params)) { return; }
+         cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params,
+                                            Arch >= 90 && Varlen && !params.skip_scheduler_metadata_computation && params.prepare_varlen_pdl /*launch_with_pdl*/);
+     }
+diff -ruN a/hopper/launch_sink.h b/hopper/launch_sink.h
+--- a/hopper/launch_sink.h	1970-01-01 00:00:00.000000000 +0000
++++ b/hopper/launch_sink.h	2026-10-05 19:46:56.771371098 +0000
+@@ -0,0 +1,62 @@
++#pragma once
++// Describe mode: while `launch_sink` is set on this thread, every launch the
++// forward pass would make is written into it instead of being made. What a
++// CUDA graph needs to hold the launch as a node -- function, grid, block,
++// cluster, dynamic smem, PDL, and the kernel parameter bytes -- and nothing
++// reaches the GPU. Memsets are recorded the same way.
++#include <cuda_runtime.h>
++#include <cstdint>
++#include <cstring>
++#include <stdexcept>
++
++namespace flash {
++
++struct LaunchSink {
++    int64_t* buf;   // buf[0] = number of records, records follow
++    int64_t cap;    // in int64 words
++    int64_t len;
++};
++
++inline thread_local LaunchSink* launch_sink = nullptr;
++
++inline void sink_put(int64_t v) {
++    if (launch_sink->len >= launch_sink->cap) { throw std::runtime_error("launch sink full"); }
++    launch_sink->buf[launch_sink->len++] = v;
++}
++
++// Record: 0, func, grid xyz, block xyz, cluster xyz, smem, pdl, nbytes, bytes...
++template <class Params>
++inline bool sink_kernel(void const* func, dim3 grid, dim3 block, dim3 cluster, int smem, bool pdl,
++                        Params const& params) {
++    if (launch_sink == nullptr) { return false; }
++    cudaFunction_t f;
++    if (cudaGetFuncBySymbol(&f, func) != cudaSuccess) { throw std::runtime_error("cudaGetFuncBySymbol"); }
++    launch_sink->buf[0] += 1;
++    for (int64_t v : {int64_t(0), int64_t(reinterpret_cast<intptr_t>(f)),
++                      int64_t(grid.x), int64_t(grid.y), int64_t(grid.z),
++                      int64_t(block.x), int64_t(block.y), int64_t(block.z),
++                      int64_t(cluster.x), int64_t(cluster.y), int64_t(cluster.z),
++                      int64_t(smem), int64_t(pdl), int64_t(sizeof(Params))}) {
++        sink_put(v);
++    }
++    int64_t words = (int64_t(sizeof(Params)) + 7) / 8;
++    if (launch_sink->len + words > launch_sink->cap) { throw std::runtime_error("launch sink full"); }
++    std::memset(launch_sink->buf + launch_sink->len, 0, words * 8);
++    std::memcpy(launch_sink->buf + launch_sink->len, &params, sizeof(Params));
++    launch_sink->len += words;
++    return true;
++}
++
++// Record: 1, ptr, nbytes (set to zero)
++inline bool sink_memset(void* ptr, int64_t nbytes) {
++    if (launch_sink == nullptr) { return false; }
++    launch_sink->buf[0] += 1;
++    sink_put(1); sink_put(int64_t(reinterpret_cast<intptr_t>(ptr))); sink_put(nbytes);
++    return true;
++}
++
++inline void sink_refuse(char const* what) {
++    if (launch_sink != nullptr) { throw std::runtime_error(what); }
++}
++
++}  // namespace flash

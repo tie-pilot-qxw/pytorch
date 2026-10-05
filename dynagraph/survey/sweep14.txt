@@ -1,0 +1,14 @@
+tv:resnet18
+tv:mobilenet_v3_small
+tv:efficientnet_b0
+tv:vit_b_16
+tvdet:fasterrcnn_resnet50_fpn
+tv:vit_b_16
+tv:convnext_tiny
+tv:swin_t
+tv:maxvit_t
+tv:inception_v3
+tv:regnet_y_400mf
+tv:mobilenet_v2
+timm:beit_base_patch16_224
+hf:BertForMaskedLM

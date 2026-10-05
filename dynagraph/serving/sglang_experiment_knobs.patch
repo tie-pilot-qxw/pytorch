@@ -1,0 +1,122 @@
+diff --git a/python/sglang/kernels/ops/diffusion/modulate/timestep_embedding_jit.py b/python/sglang/kernels/ops/diffusion/modulate/timestep_embedding_jit.py
+index 7aaedd8..e525124 100644
+--- a/python/sglang/kernels/ops/diffusion/modulate/timestep_embedding_jit.py
++++ b/python/sglang/kernels/ops/diffusion/modulate/timestep_embedding_jit.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import os
+ from typing import TYPE_CHECKING
+ 
+ import torch
+@@ -27,6 +28,32 @@ def _jit_timestep_embedding_module(dtype: torch.dtype) -> Module:
+     )
+ 
+ 
++# Local experiment knob: SGLANG_TE_CUSTOM_OP=1 routes the JIT kernel through a torch custom op so
++# dynamo sees an opaque op instead of breaking the graph on the tvm_ffi call.
++@torch.library.custom_op("sgl_diffusion_exp::timestep_embedding", mutates_args=())
++def _timestep_embedding_op(
++    t: torch.Tensor,
++    dim: int,
++    flip_sin_to_cos: bool,
++    downscale_freq_shift: float,
++    scale: float,
++    max_period: int,
++) -> torch.Tensor:
++    output = torch.empty((t.shape[0], dim), dtype=torch.float32, device=t.device)
++    _jit_timestep_embedding_module(t.dtype).timestep_embedding(
++        t, output, dim, flip_sin_to_cos, float(downscale_freq_shift), float(scale), int(max_period)
++    )
++    return output
++
++
++@_timestep_embedding_op.register_fake
++def _(t, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period):
++    return t.new_empty((t.shape[0], dim), dtype=torch.float32)
++
++
++_TE_CUSTOM_OP = os.environ.get("SGLANG_TE_CUSTOM_OP") == "1"
++
++
+ @debug_kernel_api
+ def timestep_embedding(
+     t: torch.Tensor,
+@@ -39,6 +66,10 @@ def timestep_embedding(
+ ) -> torch.Tensor:
+     if t.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+         t = t.to(dtype)
++    if _TE_CUSTOM_OP:
++        return _timestep_embedding_op(
++            t, dim, flip_sin_to_cos, float(downscale_freq_shift), float(scale), int(max_period)
++        )
+     output = torch.empty((t.shape[0], dim), dtype=torch.float32, device=t.device)
+     module = _jit_timestep_embedding_module(t.dtype)
+     module.timestep_embedding(
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/decoding.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/decoding.py
+index b0e5df6..5eb7d9f 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/decoding.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/decoding.py
+@@ -7,6 +7,8 @@ Decoding stage for diffusion pipelines.
+ 
+ import weakref
+ 
++import os
++
+ import torch
+ import torch.nn as nn
+ 
+@@ -175,7 +177,7 @@ class DecodingStage(PipelineStage):
+         compiled_callable: ActiveTargetCompiledCallable | None = None,
+     ):
+         decode_fn = decode_fn or vae.decode
+-        if not server_args.enable_torch_compile or not isinstance(vae, nn.Module):
++        if os.environ.get("SGLANG_NO_VAE_COMPILE") or not server_args.enable_torch_compile or not isinstance(vae, nn.Module):
+             return decode_fn
+ 
+         compiled_callable = compiled_callable or self._compiled_vae_decode
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/denoising.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/denoising.py
+index bd6a088..782466b 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/denoising.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/denoising.py
+@@ -8,6 +8,7 @@ Denoising stage for diffusion pipelines.
+ import gc
+ import inspect
+ import math
++import os
+ import time
+ import weakref
+ from collections.abc import Callable
+@@ -2499,11 +2500,15 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
+             **guidance_kwargs,
+             **kwargs,
+         )
++        if os.environ.get("SGLANG_MARK_STEP"):  # local experiment knob
++            torch.compiler.cudagraph_mark_step_begin()
+         runner = self._maybe_get_bcg_runner(current_model)
+         if runner is not None:
+             model_output = self._bcg_run(runner, call_kwargs, current_model)
+         else:
+             model_output = current_model(**call_kwargs)
++        if os.environ.get("SGLANG_CLONE_OUT") and isinstance(model_output, torch.Tensor):  # local experiment knob
++            model_output = model_output.clone()
+         return _ensure_tensor_model_output(model_output)
+ 
+     @staticmethod
+diff --git a/python/sglang/multimodal_gen/runtime/utils/torch_compile.py b/python/sglang/multimodal_gen/runtime/utils/torch_compile.py
+index d67f350..dca3ec0 100644
+--- a/python/sglang/multimodal_gen/runtime/utils/torch_compile.py
++++ b/python/sglang/multimodal_gen/runtime/utils/torch_compile.py
+@@ -26,6 +26,12 @@ def build_torch_compile_kwargs(
+     enable_inductor_compute_comm_overlap: bool = False,
+ ) -> dict[str, object]:
+     compile_kwargs: dict[str, object] = {"fullgraph": False, "dynamic": None}
++    if os.environ.get("SGLANG_NO_DUCK_SHAPE"):  # local experiment knob
++        import torch.fx.experimental._config as _fx_cfg
++
++        _fx_cfg.use_duck_shape = False
++    if os.environ.get("SGLANG_TORCH_COMPILE_DYNAMIC"):  # local experiment knob
++        compile_kwargs["dynamic"] = os.environ["SGLANG_TORCH_COMPILE_DYNAMIC"] == "1"
+     if current_platform.is_out_of_tree():
+         backend = current_platform.get_compile_backend(mode)
+         compile_kwargs["backend"] = backend

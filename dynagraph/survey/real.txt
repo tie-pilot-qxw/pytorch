@@ -1,0 +1,5 @@
+tv:resnet18
+tv:mobilenet_v3_small
+tv:efficientnet_b0
+tv:vit_b_16
+tvdet:fasterrcnn_resnet50_fpn

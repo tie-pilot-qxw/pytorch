@@ -1,0 +1,2 @@
+hf:BertForMaskedLM
+timm:beit_base_patch16_224

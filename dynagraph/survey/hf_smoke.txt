@@ -1,0 +1,12 @@
+hf:AlbertForMaskedLM
+hf:AlbertForQuestionAnswering
+hf:BartForCausalLM
+hf:BartForConditionalGeneration
+hf:BertForMaskedLM
+hf:BertForQuestionAnswering
+hf:BlenderbotForCausalLM
+hf:BlenderbotForConditionalGeneration
+hf:BlenderbotSmallForCausalLM
+hf:BlenderbotSmallForConditionalGeneration
+hf:CamemBert
+hf:DebertaForMaskedLM

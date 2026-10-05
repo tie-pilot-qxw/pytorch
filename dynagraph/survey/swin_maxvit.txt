@@ -1,0 +1,2 @@
+tv:swin_t
+tv:maxvit_t

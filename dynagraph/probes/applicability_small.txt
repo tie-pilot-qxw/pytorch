@@ -1,0 +1,18 @@
+# Small applicability sample: GEMMs routed to Triton, convolutions left on cuDNN (the default).
+# Picked on purpose -- the question is "what still blocks us once GEMMs are routed".
+# Conv nets always fall back because extern_kernels.convolution gives no handle (handle-mismatch);
+# that is a known result, so only 4 are kept here as a control, to save GPU time.
+hf:BertForMaskedLM
+hf:BertForQuestionAnswering
+hf:AlbertForMaskedLM
+hf:DistilBertForMaskedLM
+hf:BartForCausalLM
+hf:ElectraForCausalLM
+hf:GPT2ForSequenceClassification
+hf:RobertaForCausalLM
+hf:XLNetLMHeadModel
+hf:T5ForConditionalGeneration
+tv:resnet18
+tv:mobilenet_v3_small
+timm:resnet50
+tv:vit_b_16

@@ -1,0 +1,6 @@
+hf:BlenderbotForCausalLM
+hf:BlenderbotForConditionalGeneration
+hf:GPTJForCausalLM
+hf:GPTJForQuestionAnswering
+hf:GPTNeoForCausalLM
+hf:GPTNeoForSequenceClassification

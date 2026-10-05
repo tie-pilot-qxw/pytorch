@@ -1,0 +1,10 @@
+# Local outputs. Scripts write logs and artifacts under $DG_OUT (default /tmp/dynagraph_out)
+# and datasets under $DG_DATA (default /workspace/_deps/data); these patterns catch anything
+# that still lands next to the scripts.
+__pycache__/
+*.log
+*.out
+*.dglog
+*_logs/
+data/
+outputs/
