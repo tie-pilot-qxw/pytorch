@@ -147,6 +147,14 @@ Known limitations to be aware of:
 
 ## Getting started
 
+**If you were given a container to log in to over SSH as a normal user**, you are already inside
+it: `/workspace` is your project directory (the `<host-project-dir>` below), so skip `docker run`,
+clone and run git inside the container, and run the commands shown as
+`docker exec dynagraph bash -lc '...'` directly (for `docker exec -d`, use `nohup ... > log 2>&1 &`).
+You cannot see who owns the processes on a GPU from inside a container, so ask whoever gave you the
+container which cards to use. Anything that needs docker or root (restarting the container,
+installing system packages) also goes through them.
+
 ### 1. Environment
 
 Everything was developed on 8x H100 80GB (sm_90a), CUDA 13.1, inside the NVIDIA container
@@ -162,13 +170,21 @@ holds the fork checkout, a torchvision checkout, a venv and third-party sources:
 ```
 
 ```bash
-docker run -d --name dynagraph --privileged --gpus all --ipc=host --shm-size=32g \
+docker run -d --name dynagraph --gpus all \
+  $(for d in /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools /dev/nvidia-modeset; do echo --device $d; done) \
+  --shm-size=32g --ulimit memlock=-1 --ulimit stack=67108864 \
   -v <host-project-dir>:/workspace -v <hf-cache>:/root/.cache/huggingface \
   -w /workspace nvcr.io/nvidia/pytorch:26.02-py3 sleep infinity
 ```
 
-`--privileged` matters. Without it, a long-running container can lose GPU access after a host
-`systemctl daemon-reload` ("Failed to initialize NVML: Unknown Error").
+List the device nodes with `--device` as well as `--gpus all`. `--gpus all` alone adds the GPU
+permissions when the container is created, but not to its device rules, so a host
+`systemctl daemon-reload` (systemd, cgroup v2) revokes them and the container loses its GPUs
+("Failed to initialize NVML: Unknown Error"). Devices listed with `--device` are part of the
+container's configuration and survive. `--device nvidia.com/gpu=all` (CDI) does the same, but on
+this host the CDI spec lives in `/var/run` and is regenerated at boot with no ordering against
+docker, so a CDI container may not come back after a reboot. The notes used `--privileged` for the
+same reason; it works too, but it gives root in the container full access to the host.
 
 One-time setup. Clone on the host (git stays on the host, see below), then create the venv inside
 the container:
@@ -210,16 +226,13 @@ break the build) and puts the self-built libraries first on `LD_LIBRARY_PATH`.
 
 **Do not run git as root inside the container.** A git command run as root leaves files in `.git`
 owned by root, and the next commit from your own account fails. With a root container, run git on
-the host.
-
-If you were given a container to log in to over SSH as a normal user, you are already inside it:
-skip `docker run`, run the commands inside `docker exec dynagraph bash -lc '...'` directly, and
-run git there.
+the host. If root's git refuses with "detected dubious ownership", do not add a `safe.directory`
+exception; run git as the user who owns the checkout.
 
 ### 3. Smoke test
 
 ```bash
-GPU=0 bash /workspace/pytorch-main/dynagraph/probes/regress_quick.sh   # 12 probes, all should PASS
+GPU=<card> bash /workspace/pytorch-main/dynagraph/probes/regress_quick.sh   # 12 probes, all should PASS
 ```
 
 Logs go to `$DG_OUT/_regress_logs` (`DG_OUT` defaults to `/tmp/dynagraph_out`). A failing probe's
@@ -227,6 +240,15 @@ log ends with the DynaGraph fallback tag. Before picking a card, see who else is
 ([docs/METHODOLOGY.md](docs/METHODOLOGY.md), "The machine"): other people's jobs distort timings,
 and yours can make theirs OOM. If every probe fails with `CUDA_ERROR_UNKNOWN` or "devices busy or
 unavailable" on a card that looks idle, see "A container can lose its GPUs" in METHODOLOGY.
+
+**Clean the Inductor cache regularly.** Most probe and survey scripts set
+`force_disable_caches = True`, and with it Inductor leaves one `tmp*` directory per compilation
+under its cache directory (`/tmp/torchinductor_<user>` unless `TORCHINDUCTOR_CACHE_DIR` is set) and
+never deletes it. A week of probe runs left about 100 GB there. Prune it now and then:
+
+```bash
+find "${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_$USER}" -maxdepth 1 -name 'tmp*' -mmin +60 -exec rm -rf {} +
+```
 
 ### 4. Run a workload
 
@@ -289,7 +311,9 @@ Environment variables used by the scripts in this directory:
 
 `probes/regress_quick.sh` and the HF-model zoo need nothing beyond the build above. `probes/regress.sh`
 also needs FA3 and fa4site (for `probe_train_varlen_fa`). Other scripts need the following; install
-only what you use.
+only what you use. In a container you were given, `$DG_DEPS` may already hold these sources (and
+the datasets in `$DG_DATA`): check before downloading, and see `third_party_patches/README.md`
+before patching anything there.
 
 | dependency | used by | how it was set up |
 |---|---|---|
@@ -298,9 +322,9 @@ only what you use.
 | `$DG_DEPS/flash-attention` | the two rows below | `git clone https://github.com/Dao-AILab/flash-attention.git` at `edb5c76` |
 | FA3 (`flash_attn_interface`) in the venv | `probes/probe_train_varlen_fa.py` (`--attn fa3_varlen`, the default) | `cd $DG_DEPS/flash-attention/hopper && pip install --no-build-isolation .` with the venv active |
 | `$DG_DEPS/fa4site` (FA4, `flash_attn.cute`) | `probes/probe_train_varlen_fa.py`, `serving/probe_vllm_*.py` | `pip install --no-deps --target $DG_DEPS/fa4site $DG_DEPS/flash-attention/flash_attn/cute einops==0.8.2 apache-tvm-ffi==0.1.14.post0 torch-c-dlpack-ext==0.1.5 quack-kernels==0.6.5`, then `touch $DG_DEPS/fa4site/flash_attn/__init__.py`. Use `--no-deps`: otherwise pip puts a PyPI torch into the directory, and these scripts put it first on `sys.path`. `nvidia-cutlass-dsl` comes from the venv (`docs/notes/SETUP.md`, pitfall 10). The empty `flash_attn/__init__.py` shadows the container's flash_attn 2.7.4, which is built against its own torch and fails to import |
-| vLLM, built from source in `/opt/vllm` | `serving/probe_vllm_*.py`, `serving/vllm_launches.py` | `docs/notes/SETUP.md`, the last pitfall (building third-party CUDA extensions against this torch) |
-| SGLang | `serving/sglang_bench.sh`, `serving/bcg_bench.py` | A separate container with stock torch 2.11 (a local image, `sglang-ab:base`, with SGLang and its kernels installed), not the self-built torch. The SGLang code came from `$DG_DEPS/sglang-main` (`2a1c477` plus `serving/sglang_experiment_knobs.patch`, `git apply`) via `PYTHONPATH`; the diffusion extras were installed with `--no-deps`. Fake weights: `python serving/fake_hf_repo.py <hf-repo> <out-dir>`, with `<out-dir>` mounted at `/fake`. Details in `docs/notes/DIFFUSION.md` |
-| ShareGPT | `serving/probe_vllm_mixed.py` | `huggingface-cli download anon8231489123/ShareGPT_Vicuna_unfiltered ShareGPT_V3_unfiltered_cleaned_split.json --repo-type dataset`; point `SHAREGPT` at the file if it is not in the default HF cache path |
+| vLLM, built from source | `serving/probe_vllm_*.py`, `serving/vllm_launches.py` | `docs/notes/SETUP.md`, the last pitfall (building third-party CUDA extensions against this torch). It was built in `/opt/vllm`, which needs root; without root, build it under `$DG_DEPS/vllm` |
+| SGLang | `serving/sglang_bench.sh`, `serving/bcg_bench.py` | Needs its own container, set up by whoever administers the machine. A separate container with stock torch 2.11 (a local image, `sglang-ab:base`, with SGLang and its kernels installed), not the self-built torch. The SGLang code came from `$DG_DEPS/sglang-main` (`2a1c477` plus `serving/sglang_experiment_knobs.patch`, `git apply`) via `PYTHONPATH`; the diffusion extras were installed with `--no-deps`. Fake weights: `python serving/fake_hf_repo.py <hf-repo> <out-dir>`, with `<out-dir>` mounted at `/fake`. Details in `docs/notes/DIFFUSION.md` |
+| ShareGPT | `serving/probe_vllm_mixed.py` | `hf download anon8231489123/ShareGPT_Vicuna_unfiltered ShareGPT_V3_unfiltered_cleaned_split.json --repo-type dataset`; set `SHAREGPT` to the file if it is not in the HF cache under `$HF_HOME` (default `~/.cache/huggingface`) |
 | `$DG_DEPS/deepgemm-src` | `GEMM=deepgemm` runs (`e2e/sage.py`, `schnet.py`, `esm.py`), and always `e2e/pointcloud.py` (its grouped GEMM) | [third_party_patches/README.md](third_party_patches/README.md) |
 | `$DG_DEPS/fa3d-src` | FA3 describe (tier 3): `serving/vllm_launches.py` | [third_party_patches/README.md](third_party_patches/README.md) |
 

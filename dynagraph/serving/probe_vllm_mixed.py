@@ -41,8 +41,11 @@ MAXOUT = int(os.environ.get("MAXOUT", "256"))
 STEPS = os.environ.get("STEPS", "0") == "1"
 SHAREGPT = os.environ.get(
     "SHAREGPT",
-    "/root/.cache/huggingface/hub/datasets--anon8231489123--ShareGPT_Vicuna_unfiltered/snapshots/"
-    "192ab2185289094fc556ec8ce5ce1e8e587154ca/ShareGPT_V3_unfiltered_cleaned_split.json",
+    os.path.join(
+        os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")),
+        "hub/datasets--anon8231489123--ShareGPT_Vicuna_unfiltered/snapshots/"
+        "192ab2185289094fc556ec8ce5ce1e8e587154ca/ShareGPT_V3_unfiltered_cleaned_split.json",
+    ),
 )
 
 import torch  # noqa: E402

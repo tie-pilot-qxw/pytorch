@@ -11,10 +11,12 @@ them. Read this before trusting any number, ours included.
   share a card with for correctness runs. A job that is being timed (a benchmark, a serving server
   under a load generator) is not: you corrupt the other person's numbers and your own. Utilization
   alone does not tell you which kind of job it is. For timing, use an empty card, and if you had to
-  share, say so next to the numbers.
-- **All cards are power-capped at 550 W** (the default is 700 W). They hit the cap a large part of the
-  time, and SM clocks then drop by up to ~30%. The same kernel can differ by 40% between cards or
-  between hours. Check before timing:
+  share, say so next to the numbers. Inside a container, `nvidia-smi` shows host PIDs that `ps`
+  cannot resolve, so you cannot tell whose job it is; ask whoever gave you the container.
+- **The cards are power-capped below their 700 W default.** The cap was 550 W for every measurement
+  in MEASUREMENTS.md and 600 W in October 2026; it can change again. The cards hit the cap a large
+  part of the time, and SM clocks then drop by up to ~30%. The same kernel can differ by 40% between
+  cards or between hours. Check before timing, and record `power.limit` next to your numbers:
   `nvidia-smi --query-gpu=index,power.limit,power.draw,clocks.sm,clocks_event_reasons.sw_power_cap --format=csv`.
   Keep an A/B comparison on one card, run interleaved.
 - **The host is usually loaded by other people's jobs.** That is not necessarily contamination:
@@ -27,11 +29,28 @@ them. Read this before trusting any number, ours included.
   `Failed to initialize NVML: Unknown Error`, or `CUDA_ERROR_UNKNOWN from cuDevicePrimaryCtxRetain`
   / `cudaErrorDevicesUnavailable` on a card that `nvidia-smi` on the host shows as idle. Before a
   long run, check the card with a one-line `torch.randn(4, device="cuda").sum()`. If it fails,
-  repeat the check in a fresh `docker run --rm --gpus '"device=N"' <image>`. If only your container
-  fails, `docker restart` it. If the fresh container fails too, the card itself is broken (seen on
-  card 6 in October 2026); use another card and tell whoever administers the machine.
-- **Run git on the host, never inside the container.** The container runs as root; a `git stash`
-  inside it once left `.git` objects and source files owned by root, and the next commit failed.
+  repeat the check in a fresh `docker run --rm --gpus '"device=N"' <image>`. If only your
+  container fails, it was most likely created with `--gpus all` alone, and a host
+  `systemctl daemon-reload` revoked its device permissions: `docker restart` it, and create
+  containers with the device nodes listed (see the README) so it does not happen again. If the
+  fresh container fails too, the card itself is broken (seen on card 6 in October 2026); use another
+  card and tell whoever administers the machine. If you are in a container you were given and have
+  no docker, report the error and the card number to whoever gave it to you.
+- **GPU performance counters need admin rights.** The driver default
+  `NVreg_RestrictProfilingToAdminUsers=1` (`RmProfilingAdminOnly: 1` in
+  `/proc/driver/nvidia/params`; see CVE-2018-6260) limits them to processes with `CAP_SYS_ADMIN`
+  (root on the host, or root in a container started with `--privileged` or `--cap-add SYS_ADMIN`).
+  Without it, `ncu` and `nsys --gpu-metrics-devices` fail with `ERR_NVGPUCTRPERM`, and the CUPTI
+  metric APIs with `CUPTI_ERROR_INSUFFICIENT_PRIVILEGES`. CUDA and NVTX timelines (`nsys`,
+  `torch.profiler` kernel traces) and CUDA-event timing are not affected. `nsys` CPU sampling and
+  backtraces do not work for normal users here either (`perf_event_paranoid` is 4); use cProfile or
+  py-spy for host-side cost. When you need counters, ask someone with admin rights to run `ncu`,
+  and pass `--clock-control none` on a shared card: by default `ncu` locks the card's clocks to base,
+  which slows down everyone else on it.
+- **Do not run git as root inside a container.** A `git stash` run as root once left `.git` objects
+  and source files owned by root, and the next commit from a normal account failed. With a root
+  container, run git on the host. If root's git refuses with "detected dubious ownership", do not
+  add a `safe.directory` exception; run git as the user who owns the checkout.
 
 ## What to compare against
 

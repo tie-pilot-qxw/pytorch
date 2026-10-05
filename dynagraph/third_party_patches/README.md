@@ -9,6 +9,14 @@ They modify other people's libraries, so they are experiments, not the default p
 private copies under `$DG_DEPS` (default `/workspace/_deps`), never to the copies vLLM or SGLang
 use.
 
+**If `$DG_DEPS/deepgemm-src` or `$DG_DEPS/fa3d-src` already exists** (a container you were given may
+come with them), it is already patched and built against the same branch: skip the `cp` and patch
+steps below. The patch scripts refuse to run twice (they assert the source is unpatched), and
+`patch` asks "Reversed (or previously applied) patch detected! Assume -R?": answer `n`, because `y`
+removes the patch. Rebuild only if your torch comes from a different commit (`./develop.sh` for
+DeepGEMM; `rm -rf build` and the cmake and ninja lines for FA3). The `cp` lines record where the
+sources came from; `/opt/vllm` exists only where vLLM was built from source.
+
 ## DeepGEMM: `patch_dgd.py`, `patch_dgd_c.py`
 
 Base: the DeepGEMM bundled with vLLM (`/opt/vllm/.deps/deepgemm-src`, commit `8b1392b`).

@@ -8,7 +8,9 @@ These are the project's working notes, written as the work happened between 2026
   trust the later date.
 - `../MEASUREMENTS.md` has the current numbers and `../METHODOLOGY.md` has the measurement lessons.
   Read those first and come here for the history and reasoning behind a design decision.
-- Card numbers ("GPU 6, exclusive") record which H100 a run used on the shared machine.
+- Card numbers ("GPU 6, exclusive") record which H100 a run used on the shared machine. Rules in
+  the notes about which cards may be used, and SETUP.md's container recipe (`--privileged`), are
+  historical; follow the top-level README and `../METHODOLOGY.md`.
 
 ## Start here
 

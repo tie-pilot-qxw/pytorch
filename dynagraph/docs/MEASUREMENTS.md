@@ -8,7 +8,8 @@ latest numbers are given and marked as such.
 
 ## Conditions
 
-- 8x H100 80GB HBM3 (sm_90a). **All cards are power-capped at 550 W** and are power-limited a large
+- 8x H100 80GB HBM3 (sm_90a). **All cards were power-capped at 550 W** for every number on this
+  page (700 W is the default; the cap was 600 W in October 2026), and were power-limited a large
   fraction of the time.
 - Self-built PyTorch main `2.15.0a0+git71b3251` plus the `dynagraph` branch. CUDA 13.1, NVIDIA
   container `nvcr.io/nvidia/pytorch:26.02-py3`.
