@@ -7181,19 +7181,7 @@ class DynaGraphRunner:
                 # Over budget: drop the graph used longest ago. A shape that
                 # needs it again captures again (milliseconds), so no shape
                 # is ever handed back to per-shape recording for this.
-                combo = min(self.execs, key=lambda c: self.execs[c].used)
-                gone = self.execs.pop(combo)
-                self._rt_clear()
-                for k2 in [k2 for k2, e2 in self._ex_of.items() if e2 is gone]:
-                    del self._ex_of[k2]
-                self.host_args.clear()
-                log.info(
-                    "DynaGraph dropped graph %s (%d kept) for %s at %s",
-                    combo,
-                    len(self.execs),
-                    counts,
-                    env,
-                )
+                self._drop_lru_exec()
         # Bounded like `plans`: the shape space is long-tailed. The dropped
         # harvests hold child handles and output addresses a re-harvested
         # shape must not find (and a handle may be reused by the driver).
@@ -7208,6 +7196,15 @@ class DynaGraphRunner:
         if fresh and self.execs and not self._recapture(hkey, inputs):
             return False
         return True
+
+    def _drop_lru_exec(self) -> None:
+        combo = min(self.execs, key=lambda c: self.execs[c].used)
+        gone = self.execs.pop(combo)
+        self._rt_clear()
+        for k2 in [k2 for k2, e2 in self._ex_of.items() if e2 is gone]:
+            del self._ex_of[k2]
+        self.host_args.clear()
+        log.info("DynaGraph dropped graph %s (%d kept)", combo, len(self.execs))
 
     def _recapture(self, hkey: Any, inputs: list[Any]) -> bool:
         """Capture another main graph: this shape's extern topologies are new.
@@ -9551,7 +9548,15 @@ class DynaGraphRunner:
                 if not (self.host_mode and self.inline_sites):
                     # The graph for this shape's topologies; the harvest just
                     # made it if it was new.
-                    ex = self.execs[self._combo(hkey)]
+                    ex = self.execs.get(self._combo(hkey))
+                    if ex is None:
+                        # Harvested before, but its graph was dropped over
+                        # budget since: capture it again from the harvest.
+                        if len(self.execs) >= _max_graphs():
+                            self._drop_lru_exec()
+                        if not self._recapture(hkey, inputs):
+                            return None
+                        ex = self.execs[self._combo(hkey)]
                     if len(self._ex_of) >= 4096:
                         self._ex_of.clear()
                     self._ex_of[hkey] = ex
