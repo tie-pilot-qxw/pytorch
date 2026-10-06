@@ -24,8 +24,8 @@ bakes in shapes and pointers. Today a dynamic-shape program has three options, e
 
 **DynaGraph's goal is to make CUDA graphs work for dynamic-shape PyTorch programs automatically:
 compile once, capture once, and serve every shape from that graph at close to graph-replay speed,
-with no per-model engineering.** Xinwei set four axes. They pull against each other, and
-every change should say which one it spends and which one it buys:
+with no per-model engineering.** Progress is judged on four axes. They pull against each other,
+and every change should say which one it spends and which one it buys:
 
 1. **Coverage.** Serve as much real code as possible from the graph: Inductor Triton kernels,
    library calls (cuBLAS, cuDNN, FlashAttention, DeepGEMM), user Triton kernels, `torch.cond`,
@@ -52,8 +52,9 @@ piecewise graphs and SGLang breakable CUDA graphs. "Beat" can mean any of:
 - **engineering effort** (how much per-model work the alternative needs).
 
 [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md) records everything measured so far, with the exact
-setups, so it can be reproduced, extended or challenged. The "Open directions" section below lists
-starting points; it is not a plan.
+setups, so it can be reproduced, extended or challenged. "Milestones" at the end of this file turns
+the question into concrete targets, and "Improvement directions" lists the technical ideas that
+came up; neither is a fixed plan.
 
 ## How DynaGraph works (short version)
 
@@ -376,34 +377,84 @@ This directory:
 The `.lintrunner.toml` excludes `dynagraph/**`: these are research scripts, not library code. Lint
 `torch/` changes as usual (`lintrunner -a`) before committing.
 
-## Open directions
+## Milestones
 
-These are starting points that came up during the work. None of them is settled.
+Concrete targets, one per workload class. Each says what "done" means and where things stand. They
+are proposals to refine, not a fixed plan; measure every one against the strongest practical
+baseline (see `docs/METHODOLOGY.md`, "What to compare against").
 
-- **Find the workloads.** List workloads where shapes change often and the same shape repeats
-  rarely, so per-shape recording does not amortize; where padding is not free; and where per-model
-  engineering is expensive. Candidates touched so far are listed in docs/MEASUREMENTS.md
-  (HF encoders with random (B, L), protein LMs, GNN/MD, LLM mixed batches, diffusion DiTs,
-  speculative decoding verify, elastic parallelism). None has been studied exhaustively, and
-  multi-GPU (TP shards) has not been measured at all. The `e2e/` bucket baseline is a stand-in
-  (one static compile per power-of-two bucket); a vLLM-style baseline (one `dynamic=True` compile,
-  one graph per capture size) has not been run against DG on these workloads.
-- **Library GEMMs as fixed variants.** Instead of harvesting cuBLAS per exact M, capture it at
-  bucketed M (rows are independent, so padding M only needs buffer capacity) and slice the output.
-  Measured: padding M to a multiple of 128 costs 1.01x to 1.05x GPU time over 17 sizes
-  (`e2e/probes/probe_gemm_pad.py`), versus 1.23x to 1.34x for powers of two. This would remove most
-  tier-2 harvests.
+1. **LLM decode in vLLM and SGLang.** One capture serves every batch size from 1 to the engine's
+   maximum, with no loss: decode step time within noise of the engine's own per-batch-size graphs at
+   every batch size (host time and GPU time measured separately), graph memory no larger, and
+   startup capture time lower. If this holds, LLM decode is solved and the remaining LLM work is in
+   the other milestones.
+   Now: on Qwen3-14B bs=8 in vLLM, DG's patching costs ~180-240 us of host time per step (about 2%)
+   and nothing on the GPU, once a buffer-lifetime bug in vLLM's FA3 path is accounted for
+   (`docs/notes/ENGINE.md`). But the 168 extern calls per step become child graphs per shape, so DG
+   holds 4048 graphs where vLLM captures 354. The library-GEMM direction below is what would bring
+   that to one. On small models (0.6B) the host patching is about 10% of a step.
+2. **LLM mixed prefill and decode (chunked prefill).** One graph across token counts, attention
+   included, at least as fast as vLLM's FULL mode (which pads mixed batches to capture sizes:
+   1.89 s against 2.48 s for the default mode on the Qwen3-0.6B run in `docs/MEASUREMENTS.md`),
+   with no padding to capture sizes.
+3. **Diffusion serving (SGLang: SANA, Z-Image).** Match breakable CUDA graphs at the resolutions they
+   pre-warm, and do not fall back to eager or recompile at unseen resolutions and prompt lengths,
+   without per-model padders and allow-lists. Peak memory is part of the target: DG used 35.6 GB
+   against 6.2 GB for compile on the SANA DiT at 1024 bins.
+4. **Variable-shape training (ESM-2 with token-budget batches).** New-shape step at or below
+   `torch.compile` (now 20.4 vs 17.4 ms with Triton GEMMs; GPU time is 14.6 ms, so the headroom is
+   host time).
+5. **Scientific and graph workloads (GraphSAGE, SchNet, MACE, point clouds).** Beat pad-to-max where
+   it is the strongest baseline, or show with `survey/workload_shapes/bucket_cost.py` which
+   distributions make padding expensive enough to matter.
+6. **Multi-GPU.** Tensor-parallel decode (TP 2/4/8) with the collectives inside the graph. Nothing is
+   measured yet; kernels shrink with TP, so launch overhead matters more.
+7. **Badly written code.** Coverage on research repositories with no shape discipline
+   (`docs/notes/MESSY.md`): what fraction of their compiled regions DG serves without fallbacks.
+
+## Improvement directions
+
+Technical ideas that came up during the work, roughly in order of how much they would unblock. None
+of them is settled.
+
+- **Library GEMMs as automatic shape buckets.** Today each new shape harvests cuBLAS into a fresh
+  child graph, which is where the 4048 graphs and most of the new-shape cost come from. Instead,
+  for each extern GEMM whose M is dynamic, pick bucket boundaries automatically at build time,
+  capture one variant per bucket (a fixed kernel per interval), and at run time pad M up to the
+  bucket, select that variant and truncate the output. Rows are independent, so padding only needs
+  buffer capacity, and the selection is a SWITCH body or a host-side choice of graph. Measured cost
+  of padding M to a multiple of 128: 1.01x to 1.05x GPU time over 17 sizes, against 1.23x to 1.34x
+  for powers of two (`e2e/probes/probe_gemm_pad.py`). Very small M needs its own variant (padding 7
+  rows to 128 costs 1.54x on the LM head), for example a small-M GEMM kernel such as FlashInfer's.
+  The same scheme applies to cuDNN convolutions and other opaque calls whose kernel choice depends
+  on one dimension.
+- **Let operators declare their per-call scratch.** vLLM's FA3 path writes through a buffer that is
+  allocated outside the op's arguments and freed after the call; a captured graph keeps the pointer
+  but not the storage. It ran correctly but slower, and next time it could compute wrong results.
+  Extending the declaration API (`torch/utils/_capture_deps.py`, `_capture_launch.py`) so an op
+  names such buffers would let DG own their lifetime.
+- **Attention inside the graph.** Serving systems break the graph at attention because its metadata
+  (varlen lengths, paged KV) changes per batch. A declared-launch (tier-3) attention kernel keeps it
+  in the graph; FA3 with a describe entry point is the worked example (`third_party_patches/`).
+- **Operator variants.** Kernels that pick a variant by shape (split-K, cluster size, block size) can
+  live as SWITCH bodies with a patched selector, instead of one graph per combination.
 - **Cut the per-call cost.** The host patcher already skips nodes whose parameter bytes did not
   change, but on a shape change grids and pointers move, so nearly every node is touched (see the
   end of `docs/notes/BENCH.md`). The open part is moving sizes into device memory: kernels read them
   from a small buffer and launch a max grid with early exit, so a call costs one memcpy instead of
-  N `SetParams`.
+  N `SetParams`. This matters most for small models.
+- **Dynamic-shape kernel quality.** Static-shape kernels can be much faster at the same shape (SchNet:
+  pad 2.9 ms against DG replay 5.2 ms). Per-bucket specialization or autotuning of the Triton
+  kernels would close part of that gap.
 - **Graph breaks and non-Inductor code.** Serving frameworks (SGLang) avoid `torch.compile` and
-  capture eager code in segments ("breakable CUDA graphs"). The DG idea, patching instead of
-  re-capturing, could apply at that level too. See docs/notes/DIFFUSION.md for what SGLang does
-  and which PT2 issues blocked the automatic path there.
-- **Attention inside the graph.** Serving systems break the graph at attention because its
-  metadata (varlen lengths, paged KV) changes per batch. A declared-launch (tier-3) attention kernel
-  could keep it in the graph.
-- **Cold start and memory.** Count compiles, captures and graph memory against bucketing, for
-  example 30 compiles for 2-D (B, L) buckets versus 1.
+  capture eager code in segments ("breakable CUDA graphs"). Patching instead of re-capturing could
+  apply at that level too. See `docs/notes/DIFFUSION.md` for what SGLang does and which PT2 issues
+  blocked the automatic path there.
+- **Elastic parallelism.** The parallel width (TP/EP/CP degree) changes rarely and takes few values,
+  so it can be handled on the host with `cudaGraphExecKernelNodeSetParams` when it changes, unlike
+  shapes, which change every step (`docs/notes/ELASTIC.md`).
+- **Memory, cold start and baselines.** Reduce the arena and lane memory, count compiles and captures
+  against bucketing (for example 30 compiles for 2-D (B, L) buckets against 1), and run a vLLM-style
+  baseline (one `dynamic=True` compile, one graph per capture size) on the `e2e/` workloads; the
+  current `e2e/` bucket baseline compiles one static graph per power-of-two bucket. Candidate
+  workloads touched so far are listed in `docs/MEASUREMENTS.md`; none has been studied exhaustively.
