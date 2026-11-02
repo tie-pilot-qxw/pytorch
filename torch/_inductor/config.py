@@ -2092,6 +2092,14 @@ class triton:
     # one buffer grow as another shrinks.
     dynagraph: bool = os.environ.get("TORCHINDUCTOR_DYNAGRAPH", "0") == "1"
 
+    # Experimental opt-in cuBLAS M bucketing for dynamic fp16/bf16 mm/addmm. Pad only the
+    # GEMM to a multiple of this many rows, then slice back to the true M.
+    # Bucketed extern sites reuse a capture by operand geometry even when
+    # dynagraph_clone_sites is off. Zero disables; 128 is a useful first trial.
+    dynagraph_cublas_bucket_size: int = int(
+        os.environ.get("TORCHINDUCTOR_DYNAGRAPH_CUBLAS_BUCKET_SIZE", "0")
+    )
+
     # How DynaGraph lays its arena out. "dynamic": per shape, from the symbol
     # values (each slot is the largest buffer assigned to it, offsets a prefix
     # sum), so memory is the maximum over shapes of the live total -- a packed

@@ -4,6 +4,8 @@ import logging
 from collections.abc import Sequence
 from typing import Any
 
+import sympy
+
 import torch
 from torch._dynamo.utils import counters
 from torch._inductor.autoheuristic.autoheuristic import AutoHeuristicSelectAlgorithm
@@ -178,6 +180,15 @@ aten_mm_dtype = ExternKernelChoice(
 
 aten_addmm = ExternKernelChoice(
     torch.addmm, "at::addmm_out", op_overload=aten.addmm.out
+)
+
+# Distinct names let DynaGraph reuse these padded captures without enabling
+# signature cloning for unrelated opaque operators.
+dynagraph_bucket_mm = ExternKernelChoice(
+    torch.mm, name="dynagraph_bucket_mm", op_overload=aten.mm.out
+)
+dynagraph_bucket_addmm = ExternKernelChoice(
+    torch.addmm, name="dynagraph_bucket_addmm", op_overload=aten.addmm.out
 )
 
 aten__int_mm = ExternKernelChoice(
@@ -523,11 +534,109 @@ addmm_contiguous_subgraph_template = ContiguousTemplate(
 )
 
 
+def _dynagraph_bucket_gemm(mat1, mat2, *, inp=None, alpha=1, beta=1, layout=None):
+    """Pad only M; the rest of the region retains its actual geometry.
+
+    Padding and the output copy are ordinary pointwise IR, so DynaGraph's
+    existing patcher handles their dynamic bounds and arena addresses. The
+    cuBLAS call sees only the bucket ceiling. Returning None leaves unsupported
+    cases to the normal lowering, without adding shape guards.
+    """
+    from torch.fx.experimental.symbolic_shapes import has_free_unbacked_symbols
+
+    from ..ir import ExternKernel, FixedLayout, Pointwise
+
+    width = inductor_config.triton.dynagraph_cublas_bucket_size
+    if not (
+        width > 0
+        and inductor_config.triton.dynagraph
+        and inductor_config.triton.dynagraph_extern_child
+        and not V.graph.cpp_wrapper
+        and layout is None
+        and torch.version.hip is None
+        and mat1.get_device().type == "cuda"
+        and mat2.get_device() == mat1.get_device()
+        and mat1.get_dtype() in (torch.float16, torch.bfloat16)
+        and mat2.get_dtype() == mat1.get_dtype()
+        and len(mat1.get_size()) == len(mat2.get_size()) == 2
+        and "ATEN" in inductor_config.max_autotune_gemm_backends.upper().split(",")
+    ):
+        return None
+    m, k = mat1.get_size()
+    k2, n = mat2.get_size()
+    if not (
+        isinstance(m, sympy.Expr)
+        and m.free_symbols
+        and not has_free_unbacked_symbols(m)
+        and all(isinstance(v, (int, sympy.Integer)) and v > 0 for v in (k, k2, n))
+        and k == k2
+    ):
+        return None
+    mat1, mat2 = realize_inputs(mat1, mat2)
+    if not (
+        tuple(mat1.get_stride()) == (k, 1)
+        and tuple(mat2.get_stride()) in ((n, 1), (1, k))
+    ):
+        return None
+    row_bias = False
+    if inp is not None:
+        _check_addmm_input_metadata(inp, mat1, mat2)
+        shape = inp.get_size()
+        row_bias = len(shape) <= 1 or (len(shape) == 2 and shape[0] == 1)
+        # Broadcast validation remains the same as the ordinary addmm path.
+        expanded = L.expand(inp, [m, n])
+        if not row_bias:
+            inp = expanded
+
+    mb = ceildiv(m, width) * width
+
+    def pad_rows(x):
+        # Make a fresh contiguous buffer even if padding is zero at this M.
+        # Do not use inplace padding: callers may still need the original.
+        load = x.make_loader()
+
+        def inner(index):
+            row, col = index
+            valid = ops.lt(
+                ops.index_expr(row, torch.int64), ops.index_expr(m, torch.int64)
+            )
+            return ops.masked(valid, lambda: load([row, col]), 0.0)
+
+        padded = Pointwise.create(
+            device=x.get_device(),
+            dtype=x.get_dtype(),
+            inner_fn=inner,
+            ranges=[mb, x.get_size()[1]],
+        )
+        return ExternKernel.require_contiguous(padded)
+
+    mat1 = pad_rows(mat1)
+    out_layout = FixedLayout(mat1.get_device(), mat1.get_dtype(), [mb, n])
+    if inp is None:
+        result = dynagraph_bucket_mm.bind(
+            realize_inputs(mat1, mat2), out_layout
+        ).output_node()
+    else:
+        if not row_bias:
+            inp = pad_rows(inp)
+        result = dynagraph_bucket_addmm.bind(
+            realize_inputs(inp, mat1, mat2), out_layout, alpha=alpha, beta=beta
+        ).output_node()
+    counters["inductor"]["dynagraph_bucket_gemm"] += 1
+    # Materialize the true output extent; downstream pointwise work can fuse
+    # with this copy, and no padded rows escape through an output alias.
+    return L.clone(L.slice_(result, 0, 0, m, clamp=False))
+
+
 @register_lowering(aten.mm, type_promotion_kind=None)
 def tuned_mm(mat1, mat2, out_dtype=None, *, layout=None):
     """
     Lowering for autotuning aten.mm with different backends (Aten, Triton, CUTLASS, etc.)
     """
+    if out_dtype is None:
+        bucketed = _dynagraph_bucket_gemm(mat1, mat2, layout=layout)
+        if bucketed is not None:
+            return bucketed
     use_bf16x9 = is_bf16x9_matmul(mat1.get_device().type, mat1.get_dtype())
     if out_dtype is not None:
         input_dtype = mat1.get_dtype()
@@ -874,6 +983,11 @@ def tuned_addmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
     """
     Lowering for autotuning aten.addmm with different backends (Aten, Triton, CUTLASS, etc.)
     """
+    bucketed = _dynagraph_bucket_gemm(
+        mat1, mat2, inp=inp, alpha=alpha, beta=beta, layout=layout
+    )
+    if bucketed is not None:
+        return bucketed
     use_bf16x9 = is_bf16x9_matmul(mat1.get_device().type, mat1.get_dtype())
     if not use_bf16x9 and beta == 0 and mat1.get_device().type == "cuda":
         _check_addmm_input_metadata(inp, mat1, mat2)

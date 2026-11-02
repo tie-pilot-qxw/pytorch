@@ -1,0 +1,16 @@
+         9265 function calls (7909 primitive calls) in 0.018 seconds
+
+   Ordered by: internal time
+   List reduced from 165 to 10 due to restriction <10>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+      216    0.006    0.000    0.006    0.000 {built-in method torch._C._nn.linear}
+    639/3    0.001    0.000    0.018    0.006 module.py:1791(_call_impl)
+       75    0.001    0.000    0.001    0.000 {built-in method torch.layer_norm}
+       36    0.001    0.000    0.001    0.000 {built-in method torch._C._nn.scaled_dot_product_attention}
+     1239    0.001    0.000    0.001    0.000 module.py:1963(__getattr__)
+    639/3    0.001    0.000    0.018    0.006 module.py:1783(_wrapped_call_impl)
+       36    0.001    0.000    0.006    0.000 modeling_bert.py:168(forward)
+       36    0.000    0.000    0.003    0.000 modeling_bert.py:293(forward)
+       36    0.000    0.000    0.003    0.000 modeling_bert.py:351(forward)
+       36    0.000    0.000    0.000    0.000 {built-in method torch._C._nn.gelu}

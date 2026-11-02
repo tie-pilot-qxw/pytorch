@@ -1,0 +1,16 @@
+         2789 function calls (2780 primitive calls) in 0.009 seconds
+
+   Ordered by: internal time
+   List reduced from 155 to 10 due to restriction <10>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+      216    0.003    0.000    0.003    0.000 {built-in method torch.addmm}
+      6/3    0.001    0.000    0.009    0.003 module.py:1791(_call_impl)
+       36    0.001    0.000    0.001    0.000 {built-in method torch._ops.aten.}
+        3    0.001    0.000    0.007    0.002 c4njgjn4x5u47btyytf36ygewhbj2he3et7b52welz6d3nufmixq.py:666(call)
+      786    0.001    0.000    0.001    0.000 {built-in method torch._C._dynamo.guards._reinterpret_tensor}
+      111    0.000    0.000    0.000    0.000 {built-in method torch._C._dynamo.guards._empty_strided_cuda}
+      291    0.000    0.000    0.000    0.000 {built-in method torch._C._dynamo.guards.assert_size_stride_grouped}
+      120    0.000    0.000    0.001    0.000 triton_heuristics.py:2457(run)
+        3    0.000    0.000    0.007    0.002 cublas_buckets.py:58(forward)
+        3    0.000    0.000    0.009    0.003 eval_frame.py:1146(compile_wrapper)

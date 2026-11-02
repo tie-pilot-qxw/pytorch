@@ -1,0 +1,16 @@
+         36141 function calls (35245 primitive calls) in 0.032 seconds
+
+   Ordered by: internal time
+   List reduced from 416 to 10 due to restriction <10>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+  432/216    0.004    0.000    0.011    0.000 {built-in method torch.addmm}
+        3    0.003    0.001    0.019    0.006 cdooa2z7f6crisgj5xcv4yf7elgppyk52pcpe3ffaikacazvtagz.py:654(partition_0)
+    261/9    0.002    0.000    0.037    0.004 eval_frame.py:1523(_fn)
+   108/36    0.002    0.000    0.002    0.000 {built-in method torch._ops.aten.}
+       12    0.002    0.000    0.003    0.000 _config_module.py:814(_get_dict)
+        3    0.002    0.001    0.003    0.001 compile_fx.py:2175(get_input_idxs_to_check)
+       12    0.001    0.000    0.001    0.000 encoder.py:205(iterencode)
+    10866    0.001    0.000    0.001    0.000 {built-in method builtins.isinstance}
+      786    0.001    0.000    0.001    0.000 {built-in method torch._C._dynamo.guards._reinterpret_tensor}
+        7    0.001    0.000    0.001    0.000 {built-in method torch._C._cuda_checkPoolLiveAllocations}

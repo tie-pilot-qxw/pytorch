@@ -283,6 +283,32 @@ f = torch.compile(model, dynamic=True, mode="reduce-overhead")
 To route GEMMs to Triton templates as the harness's `GEMM=triton` does, also set
 `ic.max_autotune_gemm = True` and `ic.max_autotune_gemm_backends = "TRITON"`.
 
+**Experimental: per-GEMM cuBLAS bucketing.** Capture reduction is established,
+but an incremental latency win over existing signature cloning is not. To try it, set
+`ic.triton.dynagraph_cublas_bucket_size = 128` before compilation, or export
+`TORCHINDUCTOR_DYNAGRAPH_CUBLAS_BUCKET_SIZE=128`. The default is 0 (disabled).
+This requires `dynagraph` and `dynagraph_extern_child` and keeps the ATen GEMM
+backend. Supported fp16/bf16 `mm`/`addmm` calls with dynamic M and fixed N/K pad M
+to the next multiple of 128, then return only the actual M rows. Dense row-major
+activations and row-major or transposed dense weights are supported; other cases
+use their existing lowering. Bias broadcasting and `alpha`/`beta` are preserved.
+
+Padding and output copies are generated Triton kernels, patched like the rest of
+the region. cuBLAS is captured once per bucket and operand signature; later shapes
+clone that capture with their current arena/input addresses. This works without
+enabling `dynagraph_clone_sites` for other operators. New shapes still prepare a
+layout and child graph, but skip cuBLAS warmup and stream capture on a bucket hit.
+Captures that cannot safely be cloned retain the per-shape capture path.
+The representative cache holds at most 1024 signatures; eviction can cause a later
+recapture, and live clones retain their source graph and workspace.
+
+Each runner exposes `cublas_bucket_stats` (`captures`, `clones`, `fallbacks`);
+the harvest log also reports captured versus cloned sites. Run
+`python dynagraph/probes/test_cublas_buckets.py` from the repository root to check
+bucket boundaries, bias variants, gradients, arena growth and host/device updates.
+The setting trades extra copies and padded compute for fewer library captures;
+model latency still needs measurement.
+
 Set `logging.getLogger("torch._inductor.dynagraph").setLevel(logging.INFO)` to see what is served
 and why something fell back. All knobs live in `torch/_inductor/config.py` under `triton.dynagraph_*`.
 Each one has a comment, and each can be set with an environment variable

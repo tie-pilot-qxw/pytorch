@@ -445,10 +445,11 @@ def cudagraphify_impl(
 
     With `config.triton.dynagraph` a single DynaGraph runner serves every shape
     of the region first; it hands a shape back here (SKIP_SHAPE), asks to be
-    rebuilt on it (REBUILD, bounded), or retires (None), and this then records
-    the ordinary way.
+    rebuilt on it (REBUILD, bounded), or retires (None). If it cannot serve
+    the call, raise rather than replay through ordinary graph trees, which do
+    not evaluate launch declaration keys for external state.
     """
-    fn_cache: dict[tuple[int, ...], Callable[..., Any]] = {}
+    fn_cache: dict[Any, Callable[..., Any]] = {}
 
     # Detect int inputs: we need to index on these
     int_key = [i for i, v in enumerate(inputs) if isinstance(v, int)]
@@ -498,25 +499,18 @@ def cudagraphify_impl(
                         if dynagraph_runner is not False
                         else None
                     )
-                if out is dg_skip_shape or out is dg_rebuild:
-                    # This one shape is recorded the ordinary way below; the
-                    # runner keeps serving the rest. `inputs` is untouched.
-                    pass
-                elif out is not None:
+                if (
+                    out is not None
+                    and out is not dg_skip_shape
+                    and out is not dg_rebuild
+                ):
                     return out
-                else:
-                    # A replay stopped matching eager, so the region retires and
-                    # recording takes over from here. `inputs` is untouched.
-                    dynagraph_runner = False
-            from torch._inductor import dynagraph as dg
-
-            if config.triton.dynagraph_unbacked == "device" and dg.device_scalar_region(
-                model
-            ):
-                # The region keeps its `.item()` inside; recording it would
-                # sync in the capture, so what DynaGraph does not serve runs
-                # eagerly.
-                return model(inputs)
+            raise RuntimeError(
+                f"DynaGraph could not serve symint key {int_key}; "
+                "fallback to Inductor CUDA graph trees is disabled because they "
+                "do not account for external launch declaration keys. "
+                "See DynaGraph fallback diagnostics for the refusal reason."
+            )
 
         fn = fn_cache.get(int_key)
         if fn is not None:

@@ -1,0 +1,16 @@
+         29110 function calls (29064 primitive calls) in 0.021 seconds
+
+   Ordered by: internal time
+   List reduced from 237 to 10 due to restriction <10>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+      144    0.003    0.000    0.003    0.000 {built-in method torch.addmm}
+       72    0.001    0.000    0.013    0.000 cublas_buckets.py:160(capture)
+       72    0.001    0.000    0.002    0.000 dynagraph.py:7331(_node_sig)
+       72    0.001    0.000    0.001    0.000 graphs.py:608(capture_begin)
+      438    0.001    0.000    0.005    0.000 _utils.py:615(_get_device_index)
+      441    0.001    0.000    0.001    0.000 <frozen os>:680(__getitem__)
+      288    0.001    0.000    0.005    0.000 __init__.py:1358(current_stream)
+      435    0.000    0.000    0.004    0.000 _utils.py:880(_get_device_index)
+     4329    0.000    0.000    0.000    0.000 {built-in method builtins.isinstance}
+      144    0.000    0.000    0.000    0.000 {function Event.record at 0x7f02ce09f2e0}

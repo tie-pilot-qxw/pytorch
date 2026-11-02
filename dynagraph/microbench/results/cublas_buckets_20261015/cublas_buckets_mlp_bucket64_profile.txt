@@ -1,0 +1,16 @@
+         23824 function calls (23778 primitive calls) in 0.015 seconds
+
+   Ordered by: internal time
+   List reduced from 219 to 10 due to restriction <10>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+       72    0.003    0.000    0.005    0.000 dynagraph.py:3814(_clone_child)
+       72    0.001    0.000    0.003    0.000 dynagraph.py:3692(_call_signature)
+    57/19    0.001    0.000    0.043    0.002 dynagraph.py:6572(call)
+       72    0.001    0.000    0.002    0.000 dynagraph.py:7331(_node_sig)
+      792    0.001    0.000    0.001    0.000 _utils.py:85(_check_cuda_bindings)
+        3    0.000    0.000    0.000    0.000 {built-in method torch._C._cuda_synchronize}
+     1950    0.000    0.000    0.000    0.000 {method 'data_ptr' of 'torch._C.TensorBase' objects}
+      288    0.000    0.000    0.001    0.000 dynagraph.py:4096(_extent)
+       81    0.000    0.000    0.001    0.000 dynagraph.py:6399(_arena_view)
+       72    0.000    0.000    0.008    0.000 cublas_buckets.py:165(clone)

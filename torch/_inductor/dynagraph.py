@@ -62,6 +62,8 @@ from torch.utils._ordered_set import OrderedSet
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
+    from torch.utils import _capture_launch
+
 
 log = logging.getLogger(__name__)
 
@@ -218,18 +220,17 @@ def _fallback(tag: str, detail: str = "") -> bool:
 
 
 # Returned by DynaGraphRunner.__call__ for a shape it will not serve while the
-# region itself stays good: the caller records that one shape the ordinary way
-# and keeps asking for the others. Distinct from None, which retires the region.
+# region itself stays good. The caller raises instead of falling back to
+# ordinary graph trees. Distinct from None, which retires the region.
 SKIP_SHAPE = object()
 
 # Returned by DynaGraphRunner.__call__ for a shape the region was built too
 # small for: an input past its storage, or a buffer past its arena slot. Both
 # are sized from whichever shape arrived at build, times the headroom, and a
 # data-dependent length or a buffer quadratic in a symbol walks past that
-# easily. The caller records this one shape the ordinary way and builds a new
-# runner on it, so the larger shape now sets the sizes -- one recording, which
-# is what recording per shape would have charged for it anyway -- instead of
-# retiring the region for good on the first shape it did not foresee.
+# easily. The caller can build a new runner on this shape, within its rebuild
+# budget, so the larger shape now sets the sizes. An unsuccessful rebuild
+# raises instead of handing the shape to ordinary graph trees.
 REBUILD = object()
 
 
@@ -3730,7 +3731,7 @@ def _call_signature(a: Any, kw: Any) -> tuple[tuple[Any, ...], list[Any]] | None
 
 class _ClonedChild:
     """A child graph made by cloning another site's capture and rewriting the
-    operand addresses in its kernel parameters.
+    operand addresses in its kernel and copy nodes.
 
     Stands where a `CUDAGraph` would in a harvest's graph list, which only
     ever asks it for the raw handle. Holds the graph it was cloned from: the
@@ -3754,15 +3755,18 @@ class _ClonedChild:
             pass
 
 
-def _clone_plan(raw: Any, ts: list[Any]) -> tuple[list[Any], list[Any]] | None:
+def _clone_plan(
+    raw: Any, ts: list[Any], *, memory: bool = False
+) -> tuple[list[Any], list[Any], list[Any]] | None:
     """Where a captured call holds each of its operands' addresses.
 
     Returns the graph's nodes and, per kernel node that needs rewriting, its
     index and a list of (byte offset, operand index, distance into the
-    operand). None when the capture is not one this can re-point: a node
-    that is not a kernel (a memset or copy holds addresses where this does
-    not look), or a word that lands just past an operand, which is an end
-    pointer that would not move with it.
+    operand), followed by the copy nodes' endpoint patches. Bucketed addmm
+    may also copy its matrix bias to the output:
+    `memory` permits device-to-device copies whose endpoints are both named
+    operands. Other node types or unowned copy endpoints are refused, as is
+    a word just past an operand (an end pointer that would not move with it).
     """
     from cuda.bindings import runtime as cr
 
@@ -3771,9 +3775,29 @@ def _clone_plan(raw: Any, ts: list[Any]) -> tuple[list[Any], list[Any]] | None:
     n = int(ck(cr.cudaGraphGetNodes(raw))[1])
     nodes = ck(cr.cudaGraphGetNodes(raw, n))[0]
     kernel = cr.cudaGraphNodeType.cudaGraphNodeTypeKernel
-    if any(ck(cr.cudaGraphNodeGetType(nd)) != kernel for nd in nodes):
-        return None
     ext = [_byte_span(t) for t in ts]
+
+    def operand(v: int) -> tuple[int, int] | None:
+        hits = sorted((hi - lo, k) for k, (lo, hi) in enumerate(ext) if lo <= v < hi)
+        if not hits:
+            return None
+        k = hits[0][1]
+        return k, v - ts[k].data_ptr()
+
+    copies = []
+    for i, nd in enumerate(nodes):
+        ty = ck(cr.cudaGraphNodeGetType(nd))
+        if ty == kernel:
+            continue
+        if not memory or ty != cr.cudaGraphNodeType.cudaGraphNodeTypeMemcpy:
+            return None
+        p = ck(cr.cudaGraphMemcpyNodeGetParams(nd))
+        if int(p.srcArray) or int(p.dstArray):
+            return None
+        src, dst = operand(int(p.srcPtr.ptr)), operand(int(p.dstPtr.ptr))
+        if src is None or dst is None:
+            return None
+        copies.append((i, src, dst))
     at: dict[int, list[tuple[int, int, int]]] = {}
     for node, off, v in DynaGraphRunner._pointer_words(raw):
         # Narrowest operand first: two views into one buffer both contain an
@@ -3785,7 +3809,7 @@ def _clone_plan(raw: Any, ts: list[Any]) -> tuple[list[Any], list[Any]] | None:
             at.setdefault(node, []).append((off, k, v - ts[k].data_ptr()))
         elif any(hi <= v < hi + 4096 for _lo, hi in ext):
             return None
-    return nodes, sorted(at.items())
+    return nodes, sorted(at.items()), copies
 
 
 def _clone_child(source: Any, plan: Any, ts: list[Any]) -> _ClonedChild | None:
@@ -3796,9 +3820,15 @@ def _clone_child(source: Any, plan: Any, ts: list[Any]) -> _ClonedChild | None:
 
     from torch.cuda._utils import _check_cuda_bindings as ck
 
-    nodes, at = plan
+    nodes, at, copies = plan
     clone = ck(cr.cudaGraphClone(source.raw_cuda_graph()))
     out = _ClonedChild(clone, source)
+    for i, src, dst in copies:
+        nd = ck(cr.cudaGraphNodeFindInClone(nodes[i], clone))
+        p = ck(cr.cudaGraphMemcpyNodeGetParams(nd))
+        p.srcPtr.ptr = ts[src[0]].data_ptr() + src[1]
+        p.dstPtr.ptr = ts[dst[0]].data_ptr() + dst[1]
+        ck(cr.cudaGraphMemcpyNodeSetParams(nd, p))
     keep: list[Any] = []
     for i, words in at:
         nd = ck(cr.cudaGraphNodeFindInClone(nodes[i], clone))
@@ -4817,10 +4847,11 @@ class DynaGraphRunner:
         # differ between the arena under capture and an eager allocation.
         if self.child_sites:
             self.exact = False
-        # Per harvest key, the operands of every inline site; per (site,
-        # harvest key, declared key), the node parameters prepared from its
-        # declaration; per declared kernel name, the function it resolved to.
-        self._inline_ops: dict[Any, dict[int, Any]] = {}
+        # Per harvest key, an integer identity and every inline site's operands.
+        # Per (site, identity, declared key), its prepared node parameters.
+        self._inline_ops: dict[Any, tuple[int, dict[int, Any]]] = {}
+        # Never reuse IDs: prepared/applied state can outlive operand entries.
+        self._inline_next_id = 0
         self._inline_prepared: dict[Any, tuple[Any, Any, Any]] = {}
         self._site_code: dict[int, tuple[Any, OrderedSet[str], str] | None] = {}
         self._site_recipes: dict[int, Any] = {}
@@ -4830,14 +4861,13 @@ class DynaGraphRunner:
         self._inline_no_keys = all(
             d.key is None for d in (self.inline_sites or {}).values()
         )
-        # Per (representative site, harvest key, declared key): its packed
+        # Per (representative site, identity, declared key): its packed
         # launches and where their addresses sit (`_address_plan`), which the
         # sites sharing its signature are built from.
         self._inline_rep: dict[Any, Any] = {}
-        # (site name, harvest key, declared template, tensor geometry) ->
-        # packed launches of the first site met and where their addresses
-        # came from (`_packed_launches`).
-        self._inline_templates: dict[Any, tuple[Any, Any]] = {}
+        # Per operator, region ID, declared template, scalars and geometry:
+        # packed launches with relocation binding deferred until sharing.
+        self._inline_templates: dict[Any, _capture_launch._LaunchTemplate] = {}
         # Under host-side selection, which graph serves a combination of
         # child topologies and inline launch structures (see `_inline_exec`).
         self._structure_ex: dict[Any, Any] = {}
@@ -4894,6 +4924,15 @@ class DynaGraphRunner:
         # harvests and arena moves: the plan records distances into operands,
         # not addresses.
         self._reps: dict[Any, tuple[Any, Any]] = {}
+        # Separate, bounded cache for explicitly bucketed cuBLAS calls. A
+        # clone holds its source graph, so evicting a representative cannot
+        # release workspace still used by a live child/exec.
+        self._bucket_reps: dict[Any, tuple[Any, Any]] = {}
+        self.cublas_bucket_stats: dict[str, int] = {
+            "captures": 0,
+            "clones": 0,
+            "fallbacks": 0,
+        }
         self.harvests = 0
         # Call counter, stamped on the graph that served each call (LRU).
         self.tick = 0
@@ -5930,6 +5969,10 @@ class DynaGraphRunner:
         mentions: (launch, parameter, byte, name, distance from its base).
         None when a word lands in the arena or an input's storage but in
         none of them (which name it follows is then unknown)."""
+        from torch.utils import _capture_launch as cl
+
+        if any(isinstance(launch, cl.ZeroFill) for launch in launches):
+            return None
         exts, stores = where
         arena = self.arena.data_ptr()
         stores = [
@@ -6910,8 +6953,13 @@ class DynaGraphRunner:
                 results.append(kw.get("out", r))
                 return results[-1]
             first = None
+            bucketed = self.extern_sites[i] in (
+                "dynagraph_bucket_mm",
+                "dynagraph_bucket_addmm",
+            )
+            reps = self._bucket_reps if bucketed else self._reps
             if (
-                cloning
+                (cloning or bucketed)
                 and not self.extern_sites[i].startswith(("ops:", "tk:"))
                 and "out" in kw
                 and i not in self.cond_of
@@ -6928,16 +6976,31 @@ class DynaGraphRunner:
                 got = _call_signature(a, kw)
                 if got is not None:
                     gkey = (self.extern_sites[i], got[0])
-                    rep = self._reps.get(gkey)
+                    rep = reps.get(gkey)
                     if rep is None:
                         first = (gkey, got[1])
                     elif rep[1] is not None:
-                        h = _clone_child(rep[0], rep[1], got[1])
+                        try:
+                            h = _clone_child(rep[0], rep[1], got[1])
+                        except RuntimeError as exc:
+                            if not bucketed:
+                                raise
+                            # A driver may refuse a node update even when its
+                            # pointers were attributable. Capture this shape
+                            # normally instead of retiring the whole region.
+                            log.info("DynaGraph bucket clone refused: %s", exc)
+                            h = None
                         if h is not None:
                             made[1] += 1
+                            if bucketed:
+                                self.cublas_bucket_stats["clones"] += 1
+                                # Refresh insertion order for bounded LRU.
+                                reps[gkey] = reps.pop(gkey)
                             graphs.append(h)
                             results.append(kw["out"])
                             return kw["out"]
+                    if bucketed and rep is not None:
+                        self.cublas_bucket_stats["fallbacks"] += 1
             s = self._harvest_stream()
             s.wait_stream(torch.cuda.current_stream())
             gen = torch.cuda.default_generators[self.device_index]
@@ -6987,8 +7050,15 @@ class DynaGraphRunner:
                 finally:
                     g.capture_end()
             made[0] += 1
+            if bucketed:
+                self.cublas_bucket_stats["captures"] += 1
             if first is not None:
-                self._reps[first[0]] = (g, _clone_plan(g.raw_cuda_graph(), first[1]))
+                if bucketed and len(reps) >= 1024:
+                    del reps[next(iter(reps))]
+                reps[first[0]] = (
+                    g,
+                    _clone_plan(g.raw_cuda_graph(), first[1], memory=bucketed),
+                )
             if ranges is not None:
                 every = mode == "classify"
                 got = self._foreign_pointers(g.raw_cuda_graph(), *ranges, every)
@@ -7035,7 +7105,7 @@ class DynaGraphRunner:
                 self._run_intercepted(shaped, views, on_extern)
         except Unsupported as exc:
             return _fallback("extern-harvest", str(exc))
-        if cloning:
+        if cloning or self._bucket_reps:
             log.info(
                 "DynaGraph harvest at %s captured %d sites, cloned %d",
                 env,
@@ -8008,9 +8078,9 @@ class DynaGraphRunner:
                         hex(v.data_ptr()) if hasattr(v, "data_ptr") else repr(v)[:40]
                     )
                 log.info(
-                    "DynaGraph debug inline %d at %s: TMA bases %s, arena views %s",
+                    "DynaGraph debug inline %d configuration %s: TMA bases %s, arena views %s",
                     i,
-                    want[0][0],
+                    want[0],
                     tma,
                     have,
                 )
@@ -8414,16 +8484,24 @@ class DynaGraphRunner:
             todo += list(ck(cr.cudaGraphNodeGetDependencies(n, cnt))[0]) if cnt else []
         try:
             nodes = cl._chain_order(list(seen.values()))
-            recorded = [cl.read_node(n) for n in nodes]
+            recorded = [cl.read_node(n) or cl.read_zero_fill(n) for n in nodes]
             if any(r is None for r in recorded):
-                raise cl.Mismatch("the call added a node that is not a kernel")
+                raise cl.Mismatch(
+                    "the call added a node that is not a kernel or zero fill"
+                )
             decl = self.inline_sites[i]
             # A recorded declaration would only record this same call again.
-            if not getattr(decl.launches, "records", False):
+            # A predicate permits a recorded profiling branch and described inference.
+            records = getattr(decl.launches, "records", False)
+            if callable(records):
+                records = records(*a, **kw)
+            if not records:
                 launches = decl.launches(*a, **kw)
                 funcs = cl.check(launches, recorded, decl.exact)  # type: ignore[arg-type]
                 for launch, f in zip(launches, funcs):
-                    if not isinstance(launch.kernel, int):
+                    if not isinstance(launch, cl.ZeroFill) and not isinstance(
+                        launch.kernel, int
+                    ):
                         self._kernel_funcs[launch.kernel] = f
         except cl.Mismatch as exc:
             raise Unsupported(f"{self.extern_sites[i]}: {exc}") from exc
@@ -8437,7 +8515,11 @@ class DynaGraphRunner:
                 "DynaGraph debug inline site %d (%s): nodes %s",
                 i,
                 self.extern_sites[i],
-                [cl._name(r.func)[:60] for r in recorded],  # type: ignore[union-attr]
+                [
+                    "zero fill" if isinstance(r, cl.ZeroFill) else cl._name(r.func)[:60]
+                    for r in recorded
+                    if r is not None
+                ],
             )
         self.ex.child_nodes.append(None)
         self.ex.site_body_nodes.append([None])
@@ -8474,8 +8556,8 @@ class DynaGraphRunner:
             wanted = self._inline_wanted.get(hkey)
             if wanted is not None:
                 return self._apply_wanted(ex, hkey, wanted, inputs)
-        ops: dict[int, Any] | None = self._inline_ops.get(hkey)
-        if ops is None:
+        cached_ops = self._inline_ops.get(hkey)
+        if cached_ops is None:
             memo: dict[str, Any] = {}
 
             def view_of(name: str) -> Any:
@@ -8488,7 +8570,7 @@ class DynaGraphRunner:
                 return memo[name]
 
             shaped = self._shape_inputs(inputs)
-            ops = {}
+            ops: dict[int, Any] = {}
             # Sites with one signature (every layer's same GEMM) are built
             # from the first of them: its operands, its declaration and
             # packing, the others only their names' addresses.
@@ -8513,22 +8595,26 @@ class DynaGraphRunner:
                 ops[i] = (got[0], got[1], grp)
             if len(self._inline_ops) >= 1024:
                 self._inline_ops.clear()
-            self._inline_ops[hkey] = ops
+            inline_id = self._inline_next_id
+            self._inline_next_id += 1
+            self._inline_ops[hkey] = (inline_id, ops)
+        else:
+            inline_id, ops = cached_ops
         wanted = []
         for i, decl in self.inline_sites.items():
             a, kw, grp = ops[i]
             if grp is not None:
-                want = (hkey, None)
+                want = (inline_id, None)
             else:
-                want = (hkey, decl.key(*a, **kw) if decl.key is not None else None)
+                want = (inline_id, decl.key(*a, **kw) if decl.key is not None else None)
             prepared = self._inline_prepared.get((i, want))
             if prepared is None:
                 try:
                     if grp is None:
-                        prepared = self._prepare_inline(i, decl, a, kw, hkey)
+                        prepared = self._prepare_inline(i, decl, a, kw, inline_id)
                     elif grp[0] == "rep":
                         self._ensure_prepared(i, decl, a, kw)
-                        packed = self._packed_launches(i, decl, a, kw, hkey)
+                        packed = self._packed_launches(i, decl, a, kw, inline_id)
                         prepared = self._node_params(packed)
                         self._inline_rep[(i, want)] = (
                             (prepared, self._address_plan(packed, grp[2], grp[1]))
@@ -8537,7 +8623,7 @@ class DynaGraphRunner:
                         )
                     else:
                         prepared = self._member_params(
-                            i, decl, grp, want, ops, env, offsets, inputs, hkey
+                            i, decl, grp, want, ops, env, offsets, inputs
                         )
                         if prepared is None:
                             return None
@@ -8568,9 +8654,10 @@ class DynaGraphRunner:
         time a graph serves one the arrays for all its nodes are kept, and
         from then on it costs one `dg_inline_set` call -- or nothing when the
         graph already holds that key."""
-        from cuda.bindings import driver as cu
+        from cuda.bindings import driver as cu, runtime as cr
 
         from torch.cuda._utils import _check_cuda_bindings as ck
+        from torch.utils import _capture_launch as cl
 
         if self.host_mode:
             ex = self._inline_exec(hkey, wanted, inputs)
@@ -8634,7 +8721,23 @@ class DynaGraphRunner:
                         ck(cu.cuGraphNodeSetEnabled(ex.exec_h, int(n), 0))
                     ex.inline_off.add(i)
             else:
-                for n, (f, dims, blob, offs, pt) in zip(nodes, params):
+                for n, entry in zip(nodes, params):
+                    if isinstance(entry, cl.ZeroFill):
+                        whole = False
+                        memset = cr.cudaMemsetParams()
+                        memset.dst = entry.dst
+                        memset.value = 0
+                        memset.elementSize = 1
+                        memset.width = entry.nbytes
+                        memset.height = 1
+                        memset.pitch = 0
+                        ck(
+                            cr.cudaGraphExecMemsetNodeSetParams(
+                                ex.exec_h, int(n), memset
+                            )
+                        )
+                        continue
+                    f, dims, blob, offs, pt = entry
                     b_nodes.append(int(n))
                     b_funcs.append(f)
                     b_dims.extend(dims)
@@ -8764,7 +8867,7 @@ class DynaGraphRunner:
         log.info("DynaGraph prepared %s variant %r", name, v)
 
     def _packed_launches(
-        self, i: int, decl: Any, a: Any, kw: Any, hkey: Any
+        self, i: int, decl: Any, a: Any, kw: Any, inline_id: int
     ) -> list[Any]:
         """Site `i`'s launches with every kernel resolved to its function and
         every parameter packed to bytes.
@@ -8776,28 +8879,32 @@ class DynaGraphRunner:
         others get them with the addresses moved from the first site's
         tensors (its arguments and declared `sources`) to the same place in
         theirs. A template whose addresses cannot all be attributed is not
-        reused.
+        reused. Relocation binding is deferred until a sharing hit.
         """
         from torch.utils import _capture_launch as cl
 
-        gk = src = None
+        gk = src = t = None
         if decl.share:
             src = cl._tensors(a, kw, decl.sources(*a, **kw) if decl.sources else ())
             gk = (
                 self.extern_sites[i],
-                hkey,
+                inline_id,
                 decl.template(*a, **kw) if decl.template is not None else None,
                 cl._scalars(a, kw),
                 tuple((tuple(t.shape), t.stride(), t.dtype) for t in src),
             )
             t = self._inline_templates.get(gk)
-            if t is not None and t[1] is not None:
-                return cl._rebind(t[0], t[1], src)
+            if t is not None:
+                rebound = t.rebind(src)
+                if rebound is not None:
+                    return rebound
         launches = decl.launches(*a, **kw)
         unknown = [
             L
             for L in launches
-            if not isinstance(L.kernel, int) and L.kernel not in self._kernel_funcs
+            if not isinstance(L, cl.ZeroFill)
+            and not isinstance(L.kernel, int)
+            and L.kernel not in self._kernel_funcs
         ]
         if unknown:
             # Resolution, not set-up: a kernel named by the declaration is
@@ -8807,20 +8914,23 @@ class DynaGraphRunner:
             for L, f in zip(
                 launches, cl.check(launches, cl.record(fn, *a, **kw), decl.exact)
             ):
-                if not isinstance(L.kernel, int):
+                if not isinstance(L, cl.ZeroFill) and not isinstance(L.kernel, int):
                     self._kernel_funcs[L.kernel] = f
-        packed = []
+        packed: list[cl.Launch | cl.ZeroFill] = []
         for L in launches:
+            if isinstance(L, cl.ZeroFill):
+                packed.append(L)
+                continue
             f = L.kernel if isinstance(L.kernel, int) else self._kernel_funcs[L.kernel]
             packed.append(L._replace(kernel=f, args=tuple(cl.pack(L, f))))
-        if gk is not None and src is not None:
+        if gk is not None and src is not None and t is None:
             if len(self._inline_templates) >= 4096:
                 self._inline_templates.clear()
-            self._inline_templates[gk] = (packed, cl._bind_plan(packed, src))
+            self._inline_templates[gk] = cl._LaunchTemplate(packed, src)
         return packed
 
     def _prepare_inline(
-        self, i: int, decl: Any, a: Any, kw: Any, hkey: Any = None
+        self, i: int, decl: Any, a: Any, kw: Any, inline_id: int
     ) -> tuple[Any, Any, Any]:
         """Node parameters for site `i` from its declaration, and the cluster
         shape of each launch (None for all three when it launches nothing).
@@ -8831,7 +8941,7 @@ class DynaGraphRunner:
         paid once per kernel, not per shape.
         """
         self._ensure_prepared(i, decl, a, kw)
-        return self._node_params(self._packed_launches(i, decl, a, kw, hkey))
+        return self._node_params(self._packed_launches(i, decl, a, kw, inline_id))
 
     def _member_params(
         self,
@@ -8843,7 +8953,6 @@ class DynaGraphRunner:
         env: dict[str, int],
         offsets: list[int],
         inputs: list[Any],
-        hkey: Any,
     ) -> tuple[Any, Any, Any] | None:
         """Node parameters for site `i` from its representative's launches,
         the addresses moved to where `i`'s names are. A representative whose
@@ -8853,7 +8962,7 @@ class DynaGraphRunner:
         got = self._inline_rep.get((r, want))
         if got is None:
             ra, rkw, rgrp = ops[r]
-            packed = self._packed_launches(r, self.inline_sites[r], ra, rkw, hkey)
+            packed = self._packed_launches(r, self.inline_sites[r], ra, rkw, want[0])
             got = (
                 (
                     self._node_params(packed),
@@ -8880,7 +8989,7 @@ class DynaGraphRunner:
         if own is None:
             _fallback("inline-operands", self.extern_sites[i])
             return None
-        return self._prepare_inline(i, decl, own[0], own[1], hkey)
+        return self._prepare_inline(i, decl, own[0], own[1], want[0])
 
     def _node_params(self, launches: list[Any]) -> tuple[Any, Any, Any]:
         """What `dg_inline_set` needs to rewrite a node per packed launch --
@@ -8892,8 +9001,11 @@ class DynaGraphRunner:
 
         if not launches:
             return None, None, None
-        entries = []
+        entries: list[Any] = []
         for L in launches:
+            if isinstance(L, cl.ZeroFill):
+                entries.append(L)
+                continue
             f = L.kernel
             offs = tuple(off for off, _sz in cl.param_sizes(f))
             blob = bytearray(max((o + len(b) for o, b in zip(offs, L.args)), default=1))
@@ -9370,9 +9482,8 @@ class DynaGraphRunner:
     def __call__(self, inputs: list[Any]) -> Any:
         """Serve one call, or return None once this region can no longer be trusted.
 
-        None rather than an exception: the caller still holds `inputs`, which this
-        only clears on the way out, so it can just record the shape the ordinary
-        way.
+        The caller raises on refusal instead of recording the shape through
+        ordinary graph trees. `inputs` is only cleared after successful serving.
         """
         import torch
 

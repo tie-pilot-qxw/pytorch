@@ -182,13 +182,23 @@ def _fa3d():
     return torch.ops._fa3d_C.fwd_describe
 
 
-def _parse_sink(buf, owner):
+def _parse_sink(buf, owner, scheduler_metadata=None):
     # Only the records written, not the whole buffer.
     arr = buf.numpy()
     n, at, out = int(arr[0]), 1, []
     for _ in range(n):
+        if arr[at] == 1:
+            ptr, nbytes = arr[at + 1:at + 3].tolist()
+            at += 3
+            if scheduler_metadata is None or scheduler_metadata.dtype != torch.int32 or nbytes != 4:
+                raise cl.Mismatch("FA3 zero-fill is not a scheduler semaphore")
+            offset = ptr - scheduler_metadata.data_ptr()
+            if offset < 0 or offset % 4 or offset + nbytes > scheduler_metadata.numel() * 4:
+                raise cl.Mismatch("FA3 semaphore is outside scheduler metadata")
+            out.append(cl.ZeroFill(ptr, nbytes, (owner, scheduler_metadata)))
+            continue
         if arr[at] != 0:
-            raise cl.Mismatch("FA3 described a memset; not declared yet")
+            raise cl.Mismatch(f"unknown FA3 launch record {arr[at]}")
         func, gx, gy, gz, bx, by, bz, cx, cy, cz, smem, pdl, nbytes = arr[at + 1:at + 14].tolist()
         at += 14
         nw = (nbytes + 7) // 8
@@ -201,6 +211,8 @@ def _parse_sink(buf, owner):
 
 def _attention_described(*args, **kwargs):
     global _SINK
+    if _attn_key(*args, **kwargs) is None:
+        return _recorded_attention(*args, **kwargs)
     describe = _fa3d()
     if _SINK is None:
         _SINK = torch.zeros(1 << 16, dtype=torch.int64)
@@ -224,13 +236,35 @@ def _attention_described(*args, **kwargs):
     finally:
         setattr(ns, "fwd", real)
     if not held:
-        return []   # no metadata this call (a profiling run): nothing launched
+        return []
     if len(held) != 1:
         raise cl.Mismatch(f"attention made {len(held)} FA3 calls")
-    return _parse_sink(_SINK, held)
+    from vllm.model_executor.layers.attention.attention import (
+        _resolve_layer_name, get_attention_context)
+    layer_name = args[4] if len(args) > 4 else kwargs["layer_name"]
+    md, _, _, _ = get_attention_context(_resolve_layer_name(layer_name))
+    return _parse_sink(_SINK, held, md.scheduler_metadata)
+
+
+def _attention_variant(*args, **kwargs):
+    if _attn_key(*args, **kwargs) is None:
+        output = args[3] if len(args) > 3 else kwargs["output"]
+        return ("profile", tuple(output.shape), output.stride(), output.dtype)
+    return None
+
+
+def _prepare_described_attention(*args, **kwargs):
+    # vLLM's metadata-free profiling call fills the output with zeros. Record
+    # that kernel before capture, so the declaration can be checked in capture.
+    if _attn_key(*args, **kwargs) is None:
+        _recorded_attention(*args, **kwargs)
+
+
+_attention_described.records = lambda *a, **kw: _attn_key(*a, **kw) is None
 
 
 def use_described_attention():
     cl.register("vllm::unified_attention_with_output", _attention_described,
-                key=_attn_key, prepare=lambda *a, **k: None, exact=False,
+                key=_attn_key, prepare=_prepare_described_attention, exact=False,
+                variant=_attention_variant,
                 template=_attn_structure, sources=_attn_sources)

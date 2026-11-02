@@ -1,0 +1,16 @@
+         1317 function calls (1304 primitive calls) in 0.004 seconds
+
+   Ordered by: internal time
+   List reduced from 202 to 10 due to restriction <10>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        3    0.002    0.001    0.002    0.001 {built-in method torch._C._cuda_synchronize}
+        3    0.001    0.000    0.002    0.001 cublas_buckets.py:58(forward)
+        3    0.000    0.000    0.000    0.000 graphs.py:720(replay)
+        6    0.000    0.000    0.000    0.000 {built-in method torch._C._tensors_data_ptrs_at_indices_equal}
+        9    0.000    0.000    0.001    0.000 eval_frame.py:1523(_fn)
+        3    0.000    0.000    0.000    0.000 {built-in method torch._foreach_copy_}
+      6/3    0.000    0.000    0.003    0.001 module.py:1783(_wrapped_call_impl)
+       26    0.000    0.000    0.000    0.000 _config_module.py:571(__getattr__)
+    48/45    0.000    0.000    0.000    0.000 configuration_utils.py:431(__getattribute__)
+       36    0.000    0.000    0.000    0.000 module.py:1963(__getattr__)

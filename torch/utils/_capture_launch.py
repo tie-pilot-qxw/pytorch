@@ -12,11 +12,12 @@ up to that operator, which costs as much as capturing the whole graph again.
 So the operator declares it. `register` takes the operator's qualified name
 and up to three functions, each called with the operator's own arguments:
 
-``launches(*args, **kwargs) -> list[Launch]``
+``launches(*args, **kwargs) -> list[Launch | ZeroFill]``
     Every kernel this call launches, in order: which kernel, grid, block,
     dynamic shared memory, and the value of each kernel parameter. Pure host
     code: it reads shapes, strides, addresses and whatever host state the
     operator itself reads, and launches nothing. This is the whole contract.
+    A contiguous zero-fill operation is declared with ``ZeroFill(dst, nbytes)``.
 
 ``key(*args, **kwargs) -> Hashable`` (optional)
     What besides the arguments' shapes and addresses the launch depends on --
@@ -75,6 +76,7 @@ __all__ = [
     "Declaration",
     "Launch",
     "Mismatch",
+    "ZeroFill",
     "launches_of",
     "lookup",
     "pack",
@@ -106,8 +108,25 @@ class Launch(NamedTuple):
     owner: Any = None
 
 
+class ZeroFill(NamedTuple):
+    """A contiguous CUDA zero-fill node, with an address and a byte count."""
+
+    dst: int
+    nbytes: int
+    owner: Any = None
+
+    @property
+    def args(self) -> tuple[bytes, bytes]:
+        return self.dst.to_bytes(8, "little"), self.nbytes.to_bytes(8, "little")
+
+    @property
+    def cluster(self) -> tuple[int, int, int]:
+        # No kernel can have this cluster shape; it identifies a zero-fill node.
+        return (0, 0, 0)
+
+
 class Declaration(NamedTuple):
-    launches: Callable[..., list[Launch]]
+    launches: Callable[..., list[Launch | ZeroFill]]
     key: Callable[..., Hashable] | None
     prepare: Callable[..., None] | None
     # Whether a declaration's parameter bytes can be compared with a
@@ -158,7 +177,7 @@ _registry: dict[str, Declaration] = {}
 
 def register(
     qualname: str,
-    launches: Callable[..., list[Launch]],
+    launches: Callable[..., list[Launch | ZeroFill]],
     *,
     key: Callable[..., Hashable] | None = None,
     prepare: Callable[..., None] | None = None,
@@ -189,7 +208,7 @@ def lookup(qualname: str) -> Declaration | None:
     return _registry.get(qualname)
 
 
-def launches_of(qualname: str, *args: Any, **kwargs: Any) -> list[Launch]:
+def launches_of(qualname: str, *args: Any, **kwargs: Any) -> list[Launch | ZeroFill]:
     """What a registered operator declares for these arguments.
 
     For an operator whose launches are those of another one it calls, so its
@@ -286,9 +305,23 @@ def read_node(node: Any) -> Recorded | None:
     )
 
 
+def read_zero_fill(node: Any) -> ZeroFill | None:
+    from cuda.bindings import driver as cu
+
+    from torch.cuda._utils import _check_cuda_bindings as ck
+
+    n = int(node)
+    if ck(cu.cuGraphNodeGetType(n)) != cu.CUgraphNodeType.CU_GRAPH_NODE_TYPE_MEMSET:
+        return None
+    params = ck(cu.cuGraphMemsetNodeGetParams(n))
+    if params.value != 0 or params.height != 1:
+        return None
+    return ZeroFill(int(params.dst), int(params.width) * int(params.elementSize))
+
+
 def _record_graph(
     fn: Callable[..., Any], args: Any, kwargs: Any
-) -> tuple[list[Recorded], Any]:
+) -> tuple[list[Recorded | ZeroFill], Any]:
     """Capture one call of `fn` on a side stream; its launches and the graph.
 
     Through torch's capture, so what the call allocates comes from a graph
@@ -317,14 +350,18 @@ def _record_graph(
     nodes = ck(cr.cudaGraphGetNodes(raw, n))[0] if n else []
     out = []
     for nd in _chain_order(nodes):
-        r = read_node(nd)
+        r = read_node(nd) or read_zero_fill(nd)
         if r is None:
-            raise Mismatch("the operator's capture holds a node that is not a kernel")
+            raise Mismatch(
+                "the operator's capture holds a node that is not a kernel or zero fill"
+            )
         out.append(r)
     return out, g
 
 
-def _record_raw(fn: Callable[..., Any], args: Any, kwargs: Any) -> list[Recorded]:
+def _record_raw(
+    fn: Callable[..., Any], args: Any, kwargs: Any
+) -> list[Recorded | ZeroFill]:
     """`_record_graph` for an operator that allocates nothing while it
     launches: a bare stream capture, read and destroyed at once. About a
     quarter of the cost, as there is no graph pool to set up and none to keep.
@@ -348,10 +385,10 @@ def _record_raw(fn: Callable[..., Any], args: Any, kwargs: Any) -> list[Recorded
         nodes = ck(cr.cudaGraphGetNodes(g, n))[0] if n else []
         out = []
         for nd in _chain_order(nodes):
-            r = read_node(nd)
+            r = read_node(nd) or read_zero_fill(nd)
             if r is None:
                 raise Mismatch(
-                    "the operator's capture holds a node that is not a kernel"
+                    "the operator's capture holds a node that is not a kernel or zero fill"
                 )
             out.append(r)
         return out
@@ -366,11 +403,13 @@ def _side_stream() -> Any:
     return torch.cuda.Stream()
 
 
-def record(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> list[Recorded]:
+def record(
+    fn: Callable[..., Any], *args: Any, **kwargs: Any
+) -> list[Recorded | ZeroFill]:
     """The kernel launches one call of `fn` makes, captured and not run.
 
-    Anything but a kernel node in the capture (a memset, a copy, an event) is
-    refused: a declaration only speaks for kernels.
+    Kernel and contiguous zero-fill nodes are supported. Other node types
+    (copies, events, nonzero fills) are refused.
     """
     return _record_graph(fn, args, kwargs)[0]
 
@@ -410,17 +449,31 @@ def _extent(t: Any) -> tuple[int, int]:
     return lo, lo + (span + 1) * t.element_size()
 
 
-def _bind_plan(template: list[Launch], old: list[Any]) -> list[Any] | None:
+class _BindingSources(NamedTuple):
+    extents: list[tuple[int, int]]
+    stores: list[tuple[int, int]]
+
+    @classmethod
+    def snapshot(cls, tensors: list[Any]) -> "_BindingSources":
+        extents = [_extent(t) for t in tensors]
+        stores = []
+        for t in tensors:
+            st = t.untyped_storage()
+            stores.append((st.data_ptr(), st.data_ptr() + st.nbytes()))
+        return cls(extents, stores)
+
+
+def _bind_plan(
+    template: list[Launch | ZeroFill], old: list[Any] | _BindingSources
+) -> list[Any] | None:
     """Where `template` holds an address inside one of `old`: per such word
     (launch, parameter, byte offset, which tensor, distance from its start).
     None when an address lies in the storage of one of them but in none of
     their extents: which tensor it follows is then not something this can
     tell, and such a template is not reused."""
-    ext = [_extent(t) for t in old]
-    stores = []
-    for t in old:
-        st = t.untyped_storage()
-        stores.append((st.data_ptr(), st.data_ptr() + st.nbytes()))
+    ext, stores = (
+        old if isinstance(old, _BindingSources) else _BindingSources.snapshot(old)
+    )
     plan = []
     for n, L in enumerate(template):
         for j, b in enumerate(L.args):
@@ -431,20 +484,45 @@ def _bind_plan(template: list[Launch], old: list[Any]) -> list[Any] | None:
                 hits = [(hi - lo, k) for k, (lo, hi) in enumerate(ext) if lo <= v < hi]
                 if hits:
                     k = min(hits)[1]
-                    plan.append((n, j, w, k, v - old[k].data_ptr()))
+                    plan.append((n, j, w, k, v - ext[k][0]))
                 elif any(lo <= v < hi for lo, hi in stores):
                     return None
     return plan
 
 
-def _rebind(template: list[Launch], plan: list[Any], new: list[Any]) -> list[Launch]:
+def _rebind(
+    template: list[Launch | ZeroFill], plan: list[Any], new: list[Any]
+) -> list[Launch | ZeroFill]:
     """`template` with the addresses `plan` names moved into `new`."""
     params = [[bytearray(b) for b in L.args] for L in template]
     for n, j, w, k, delta in plan:
         params[n][j][w : w + 8] = (new[k].data_ptr() + delta).to_bytes(8, "little")
     return [
-        L._replace(args=tuple(bytes(b) for b in ps)) for L, ps in zip(template, params)
+        L._replace(dst=int.from_bytes(ps[0], "little"))
+        if isinstance(L, ZeroFill)
+        else L._replace(args=tuple(bytes(b) for b in ps))
+        for L, ps in zip(template, params)
     ]
+
+
+class _LaunchTemplate:
+    """Bind on the first sharing hit; remember rejected plans to avoid rescans."""
+
+    def __init__(self, launches: list[Launch | ZeroFill], sources: list[Any]):
+        self.launches = launches
+        # Snapshot addresses before tensors can move or resize. Keep launch owners,
+        # but avoid retaining source tensors that graph trees track for liveness.
+        self.sources = _BindingSources.snapshot(sources)
+        self.pending = True
+        self.plan: list[Any] | None = None
+
+    def rebind(self, sources: list[Any]) -> list[Launch | ZeroFill] | None:
+        if self.pending:
+            self.plan = _bind_plan(self.launches, self.sources)
+            self.pending = False
+        if self.plan is None:
+            return None
+        return _rebind(self.launches, self.plan, sources)
 
 
 def recorded(
@@ -453,7 +531,7 @@ def recorded(
     template_key: Callable[..., Hashable] | None = None,
     sources: Callable[..., Any] | None = None,
     allocates: bool = True,
-) -> Callable[..., list[Launch]]:
+) -> Callable[..., list[Launch | ZeroFill]]:
     """A `launches` that is whatever one call of `fn` launches (see above).
 
     Recording costs the operator's host code and a capture, per call. With a
@@ -468,19 +546,21 @@ def recorded(
     while it launches (a GEMM writing into a given output), which lets the
     recording skip the graph pool.
     """
-    templates: dict[Hashable, Any] = {}
+    templates: dict[Hashable, _LaunchTemplate] = {}
 
-    def fresh(args: Any, kwargs: Any) -> list[Launch]:
+    def fresh(args: Any, kwargs: Any) -> list[Launch | ZeroFill]:
         if not allocates:
             rec, g = _record_raw(fn, args, kwargs), None
         else:
             rec, g = _record_graph(fn, args, kwargs)
         return [
-            Launch(r.func, r.grid, r.block, r.smem, tuple(r.params), r.cluster, g)
+            r._replace(owner=g)
+            if isinstance(r, ZeroFill)
+            else Launch(r.func, r.grid, r.block, r.smem, tuple(r.params), r.cluster, g)
             for r in rec
         ]
 
-    def launches(*args: Any, **kwargs: Any) -> list[Launch]:
+    def launches(*args: Any, **kwargs: Any) -> list[Launch | ZeroFill]:
         if template_key is None:
             return fresh(args, kwargs)
         src = _tensors(args, kwargs, sources(*args, **kwargs) if sources else ())
@@ -491,12 +571,15 @@ def recorded(
             tuple((tuple(t.shape), t.stride(), t.dtype) for t in src),
         )
         t = templates.get(tk)
-        if t is not None and t[1] is not None and len(src) == t[2]:
-            return _rebind(t[0], t[1], src)
+        if t is not None:
+            rebound = t.rebind(src)
+            if rebound is not None:
+                return rebound
         got = fresh(args, kwargs)
-        if len(templates) >= 256:
-            templates.clear()
-        templates[tk] = (got, _bind_plan(got, src), len(src))
+        if t is None:
+            if len(templates) >= 256:
+                templates.clear()
+            templates[tk] = _LaunchTemplate(got, src)
         return got
 
     launches.records = True  # type: ignore[attr-defined]
@@ -578,7 +661,9 @@ def _name(func: int) -> str:
 
 
 def check(
-    declared: list[Launch], recorded: list[Recorded], exact: bool = True
+    declared: list[Launch | ZeroFill],
+    recorded: list[Recorded | ZeroFill],
+    exact: bool = True,
 ) -> list[int]:
     """Compare a declaration with a recording of the same call; return the
     function handle of each launch. Raises `Mismatch` naming the first
@@ -590,6 +675,13 @@ def check(
         )
     funcs = []
     for n, (d, r) in enumerate(zip(declared, recorded)):
+        if isinstance(d, ZeroFill) or isinstance(r, ZeroFill):
+            if not isinstance(d, ZeroFill) or not isinstance(r, ZeroFill):
+                raise Mismatch(f"launch {n}: kernel and zero-fill node types differ")
+            if d.nbytes != r.nbytes or (exact and d.dst != r.dst):
+                raise Mismatch(f"launch {n}: zero fill declared {d}, launched {r}")
+            funcs.append(0)
+            continue
         if (
             isinstance(d.kernel, int)
             and d.kernel != r.func

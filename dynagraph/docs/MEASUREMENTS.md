@@ -1,6 +1,6 @@
 # Measurements so far
 
-Everything measured up to 2026-09-29, with setups and commands, so it can be reproduced, extended
+Measurements through 2026-10-15, with setups and commands, so they can be reproduced, extended
 or challenged. The working notes in `notes/` have the full history, including dead ends and fixed
 bugs. The code changed a lot during these two weeks, so each table says when it was measured, on
 which code and with which GEMM backend. Where a workload was not re-measured on the final code, the
@@ -8,9 +8,9 @@ latest numbers are given and marked as such.
 
 ## Conditions
 
-- 8x H100 80GB HBM3 (sm_90a). **All cards were power-capped at 550 W** for every number on this
-  page (700 W is the default; the cap was 600 W in October 2026), and were power-limited a large
-  fraction of the time.
+- 8x H100 80GB HBM3 (sm_90a). The September measurements below used a **550 W power cap**
+  and were power-limited a large fraction of the time. Later dated sections state their own
+  conditions; the cuBLAS bucket experiment on 2026-10-15 used 700 W.
 - Self-built PyTorch main `2.15.0a0+git71b3251` plus the `dynagraph` branch. CUDA 13.1, NVIDIA
   container `nvcr.io/nvidia/pytorch:26.02-py3`.
 - Shared machine. A card was considered free when no other process was on it, but the host CPU
@@ -313,3 +313,135 @@ See `notes/ELASTIC.md` and `notes/WORKLOAD2.md`.
   done.
 - **Graph memory.** DG versus buckets versus per-shape graphs at scale.
 - **DG on code with graph breaks between custom kernels** (SGLang-style serving code).
+
+## Per-GEMM cuBLAS buckets (2026-10-15)
+
+**Capture reduction works; a latency improvement over existing signature cloning is not
+reproducible on BERT. Leave the feature opt-in.** Bucketing improves new-shape median latency
+relative to DG without cloning, adds GPU work, and remains much slower than compile without
+CUDA graphs on new shapes. Whole-model power-of-two buckets also remain a stronger baseline
+for this bounded, one-dimensional shape space.
+
+Setup: otherwise idle GPU 3, H100 80GB HBM3, **700 W**, self-built torch
+`2.15.0a0+git2a6bdba` (HEAD `2a6bdbab528`, with the local bucket implementation), CUDA 13.1,
+Triton 3.6.0. BERT uses Transformers 5.10.4. No pretrained weights were downloaded. Other GPUs
+and the host were shared. Every A/B comparison was on this one card, with modes rotated and
+order reversed across shapes, synchronization before/after each timed call, and compilation
+excluded. Runtime new-shape verification was disabled for timing; every new output was checked
+against eager outside the timer. No DG fallback or timed-segment recompile occurred. Maximum
+relative L2 against eager was 0.0072 for the MLP and 0.0142 for BERT, including all compiled modes.
+
+Workloads:
+
+- MLP: 12 residual blocks, each LayerNorm(768), Linear(768,3072), GELU,
+  Linear(3072,768), residual. 24 cuBLAS sites. BF16, varying row count M.
+- BERT: HuggingFace `BertModel`, 12 layers, hidden size 768, intermediate size 3072,
+  no pooler or MLM head, random BF16 weights, batch 1. 72 cuBLAS sites and 12
+  `aten._scaled_dot_product_efficient_attention` sites. cuDNN SDPA disabled.
+- Warm at M/L=512, then 40 distinct integers sampled without replacement from [33,511],
+  seed 19 (actual range 44..504), followed by five passes over those shapes. The focused
+  BERT repeat uses the first 24 shapes, and finishes trees' second-visit recordings before
+  timing replay. Inputs already reside on the GPU.
+- `DG + clone` enables existing `dynagraph_clone_sites` without padding. Bucket modes enable
+  only the new bucket-site cloning. All DG variants use host updates and disable pointwise
+  autotuning. `whole-model pow2` uses one dynamic compile and upstream trees with
+  pre-padded inputs: **input-padding preparation is excluded**, an optimistic baseline.
+
+### MLP, 40 new shapes
+
+Median milliseconds; GPU time is direct replay of the prepared DG graph, excluding host updates
+and input staging. It includes the new feature's padding/output kernels. GPU samples cover the
+same eight shapes in every DG mode, so their medians are comparable to each other, not directly
+to the wall-clock medians over all 40 shapes.
+
+| Mode | New-shape wall | Replay wall | DG graph GPU |
+|---|---:|---:|---:|
+| compile, no graphs | 0.926 | 0.616 | - |
+| DG exact | 4.886 | 0.475 | 0.252 |
+| DG exact + clone | 3.814 | 0.468 | 0.254 |
+| DG bucket 32 | 3.450 | 0.536 | 0.303 |
+| DG bucket 64 | 3.288 | 0.518 | 0.301 |
+| DG bucket 128 | 3.148 | 0.513 | 0.295 |
+| DG bucket 256 | 3.323 | 0.514 | 0.332 |
+| whole-model pow2 | 0.691 | 0.451 | - |
+
+At width 128, six new cuBLAS captures serve the three previously unwarmed buckets (two GEMM
+signatures per bucket), versus 960 captures for exact DG. New-shape median is 36% lower than
+exact DG and 17% lower than DG + clone, but replay is 8% slower than exact DG and graph GPU
+execution is 17% slower. The paired per-shape median speedups are 1.49x and 1.16x, respectively.
+New-shape means: exact DG 6.476 ms, DG + clone 5.504 ms, bucket 128 4.051 ms.
+
+### BERT, focused repeat, 24 new shapes
+
+Wall-clock milliseconds. Capture counts cover only the new segment and exclude warmup.
+
+| Mode | New median | New mean | Warm replay median | cuBLAS captures |
+|---|---:|---:|---:|---:|
+| compile, no graphs | 3.209 | 3.169 | 2.553 | - |
+| DG exact | 21.523 | 31.592 | 1.548 | 1728 |
+| DG exact + clone | 16.502 | 52.504 | 1.423 | 72 |
+| DG bucket 128 | 18.095 | 20.232 | 1.575 | 9 |
+| whole-model pow2 | 1.925 | 4.734 | 1.288 | - |
+
+Bucket 128 makes 1,719 cuBLAS clones and nine cuBLAS captures (three signatures across three
+new buckets), a **99.5% capture reduction** versus exact DG. All three DG modes still capture
+**288 attention child graphs**, once per site per shape. Parent recaptures are 8 / 8 / 3 for
+exact / clone / bucket. The region is still harvested 24 times: this implementation removes
+cuBLAS capture on a hit, not the per-shape wrapper walk, cloning, topology queries or layout work.
+
+The bucket's new median is 16% lower than exact DG but **10% higher than DG + clone**. Paired
+per-shape median speedups are 1.26x versus exact DG and 0.96x versus DG + clone; it wins 18/24
+and 9/24 pairs, respectively. GPU graph time rises from 0.839 to 0.967 ms (**15%**), while replay
+rises 2% versus exact DG and 11% versus DG + clone.
+
+The initial 40-shape BERT sweep gave different latency ratios:
+
+| Mode | New median ms | New mean ms | Replay median ms |
+|---|---:|---:|---:|
+| eager | 4.391 | 5.557 | 4.511 |
+| compile | 2.971 | 4.211 | 2.966 |
+| trees, exact shapes | 9.464 | 9.511 | 1.844 |
+| DG exact | 22.547 | 27.592 | 2.132 |
+| DG exact + clone | 19.991 | 46.982 | 1.799 |
+| DG bucket 32 | 21.684 | 39.060 | 2.199 |
+| DG bucket 64 | 16.892 | 32.574 | 2.285 |
+| DG bucket 128 | 15.741 | 30.520 | 2.258 |
+| DG bucket 256 | 18.429 | 29.503 | 2.108 |
+| whole-model pow2 | 1.966 | 5.996 | 1.690 |
+
+Here bucket 128 improved the median over DG + clone, but made the mean worse than exact DG.
+The first replay pass for exact trees includes recording; its five-pass median mostly reflects
+warm hits, but its mean is not a steady-state number. The focused repeat removes that ambiguity.
+Large new-shape outliers persist: in the repeat a DG + clone call took 834 ms of wall and 835 ms
+of process CPU time; an exact-DG call took 144 ms wall and 28 ms CPU. These are not removed from
+the means, and their causes are not established. **Do not interpret the median improvement as
+an established throughput or tail-latency win.**
+
+### What remains expensive
+
+Unfiltered top-10 cProfile reports are saved beside the raw samples. On three new BERT shapes,
+bucket hits still perform 216 `_clone_child` calls, 216 `_call_signature` calls, 252 `_node_sig`
+calls, and 36 attention captures. Those operations, plus executing the intercepted wrapper,
+remain on the new-shape path. Extra padding/materialization raises GPU time. Reducing captures
+alone has not made the path competitive with ordinary compile or whole-model buckets here.
+These experiments cover inference and one dynamic axis; they do not establish training, SANA,
+unbounded-shape or multidimensional results.
+
+Reproduce with the built fork and matching C++ headers/libraries:
+
+```bash
+CUDA_VISIBLE_DEVICES=3 python dynagraph/microbench/cublas_buckets.py \
+  --workload mlp --output /tmp/cublas_buckets_mlp.json
+CUDA_VISIBLE_DEVICES=3 python dynagraph/microbench/cublas_buckets.py \
+  --workload bert --modes eager,compile,trees,dg,dg-clone,bucket32,bucket64,bucket128,bucket256,trees-pow2 \
+  --output /tmp/cublas_buckets_bert.json
+CUDA_VISIBLE_DEVICES=3 python dynagraph/microbench/cublas_buckets.py \
+  --workload bert --shapes 24 --modes compile,dg,dg-clone,bucket128,trees-pow2 \
+  --output /tmp/cublas_buckets_bert_repeat.json
+```
+
+[Raw samples, logs and profiles](../microbench/results/cublas_buckets_20261015/).
+The initial sweeps' generic `captures` counter includes parent recaptures made during harvest;
+the focused repeat separates `captures` (child), `cublas_captures` and `parent_captures`.
+`bucket_captures` is always cuBLAS-only. The final harness also warms replay twice for every
+mode; that clarification was added after the initial sweeps.
